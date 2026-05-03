@@ -11,7 +11,8 @@ pub enum JvmStackValue {
     Long(i64),
     Double(f64),
     ObjectRef(u32),
-    String(String), // Or a pointer to a Heap-allocated string
+    String(String),             // Or a pointer to a Heap-allocated string
+    Vector(Vec<JvmStackValue>), // For array representations
     Null,
 }
 
@@ -323,6 +324,57 @@ impl JVM {
                     stack.push(local_val);
                     pc += 1;
                 }
+                0x32 => {
+                    // aaload
+                    let index = match stack.pop().ok_or("aaload: Stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("aaload: index is not an int".into()),
+                    };
+
+                    let arrayref = stack.pop().ok_or("aaload: Stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => {
+                            return Err(
+                                format!("aaload: expected reference, got {:?}", arrayref).into()
+                            );
+                        }
+                    };
+
+                    // Ensure we are getting a reference from the heap, not moving it
+                    let heap_obj = jvm
+                        .heap
+                        .get(heap_idx)
+                        .ok_or("aaload: invalid heap reference")?;
+
+                    match heap_obj {
+                        HeapObject::Array { data, .. } => {
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!("java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds", index).into());
+                            }
+
+                            let value = data[index as usize].clone();
+
+                            // JVM Spec: aaload MUST push a reference.
+                            // Updated to include custom JVM String and Vector reference models
+                            match value {
+                                JvmStackValue::ObjectRef(_)
+                                | JvmStackValue::Null
+                                | JvmStackValue::String(_)
+                                | JvmStackValue::Vector(_) => stack.push(value),
+                                _ => {
+                                    return Err(
+                                        "aaload: component at index is not a reference".into()
+                                    );
+                                }
+                            }
+                        }
+                        _ => return Err("aaload: object is not an array".into()),
+                    }
+                    pc += 1;
+                }
                 0x3c => {
                     // istore_1
                     let val = stack.pop().ok_or("istore_1: Stack underflow")?;
@@ -503,6 +555,46 @@ impl JVM {
                         pc += 3;
                     }
                 }
+                0x9F..=0xA4 => {
+                    //if_icmp<cond>
+                    let opcode = bytecode[pc];
+
+                    let offset =
+                        (((bytecode[pc + 1] as i16) << 8) | (bytecode[pc + 2] as i16)) as i32;
+
+                    let val1 = match stack
+                        .pop()
+                        .ok_or("if_icmp<cond>: stack underflow for val1")?
+                    {
+                        JvmStackValue::Int(v) => v,
+                        _ => return Err("if_icmp<cond>: expected Int for val1".into()),
+                    };
+
+                    let val2 = match stack
+                        .pop()
+                        .ok_or("if_icmp<cond>: stack underflow for val2")?
+                    {
+                        JvmStackValue::Int(v) => v,
+                        _ => return Err("if_icmp<cond>: expected Int for val2".into()),
+                    };
+
+                    let condition_met = match opcode {
+                        0x9F => val1 == val2, // if_icmpeq
+                        0xA0 => val1 != val2, // if_icmpne
+                        0xA1 => val1 < val2,  // if_icmplt
+                        0xA2 => val1 >= val2, // if_icmpge
+                        0xA3 => val1 > val2,  // if_icmpgt
+                        0xA4 => val1 <= val2, // if_icmple
+                        _ => unreachable!(),
+                    };
+
+                    if condition_met {
+                        pc = (pc as i32 + offset) as usize;
+                        continue;
+                    } else {
+                        pc += 3;
+                    }
+                }
                 0xB2 => {
                     // getstatic
                     let idx_bytes = [bytecode[pc + 1], bytecode[pc + 2]];
@@ -600,12 +692,19 @@ impl JVM {
                         .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
                     if let HeapObject::Instance(obj) = obj {
-                        let field_value = obj.fields.get(&field_name).ok_or_else(|| {
+                        let res = obj.fields.get(&field_name).ok_or_else(|| {
                             format!(
                                 "Field '{}' not found in object of class '{}'",
                                 field_name, obj.class_name
                             )
-                        })?;
+                        });
+
+                        if let Err(e) = &res {
+                            return Err(e.clone());
+                        }
+
+                        let field_value = res.unwrap();
+
                         stack.push(field_value.clone());
                     } else {
                         return Err("getfield: Heap object is not an instance".into());
@@ -794,6 +893,39 @@ impl JVM {
 
                     pc += 3;
                 }
+                0xBC => {
+                    // newarray
+                    let atype = bytecode[pc + 1];
+
+                    let count = match stack.pop().ok_or("newarray: stack underflow")? {
+                        JvmStackValue::Int(c) => c,
+                        _ => return Err("newarray: expected Int for count".into()),
+                    };
+
+                    if count < 0 {
+                        return Err("java.lang.NegativeArraySizeException".into());
+                    }
+
+                    let default_value = match atype {
+                        4 | 5 | 8 | 9 | 10 => JvmStackValue::Int(0),
+                        6 => JvmStackValue::Float(0.0),
+                        7 => JvmStackValue::Double(0.0),
+                        11 => JvmStackValue::Long(0),
+                        _ => return Err(format!("newarray: invalid atype {}", atype).into()),
+                    };
+
+                    let array_obj = HeapObject::Array {
+                        element_type: format!("primitive_{}", atype),
+                        data: vec![default_value; count as usize],
+                    };
+
+                    jvm.heap.push(array_obj);
+                    let array_ref = (jvm.heap.len() - 1) as u32;
+
+                    stack.push(JvmStackValue::ObjectRef(array_ref));
+
+                    pc += 2; // newarray is a 2-byte instruction
+                }
                 0xBD => {
                     // anewarray
                     let cp_index =
@@ -816,7 +948,7 @@ impl JVM {
                     }
 
                     let array_obj = HeapObject::Array {
-                        element_type: component_type,
+                        element_type: component_type.clone(),
                         data: vec![JvmStackValue::Null; count as usize],
                     };
 
@@ -826,6 +958,30 @@ impl JVM {
                     stack.push(JvmStackValue::ObjectRef(array_ref));
 
                     pc += 3;
+                }
+                0xBE => {
+                    // arraylength
+                    let arrayref = stack.pop().ok_or("arraylength: stack underflow")?;
+
+                    println!("arraylength: arrayref = {:?}", arrayref);
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("arraylength: expected reference".into()),
+                    };
+
+                    match jvm.heap.get(heap_idx) {
+                        Some(HeapObject::Array { data, .. }) => {
+                            stack.push(JvmStackValue::Int(data.len() as i32));
+                        }
+                        Some(HeapObject::Instance(_)) => {
+                            return Err("IncompatibleClassChangeError: expected array".into());
+                        }
+                        None => return Err("arraylength: invalid heap reference".into()),
+                    }
+
+                    pc += 1;
                 }
                 0xB1 => {
                     // return
@@ -941,6 +1097,39 @@ impl JVM {
         )
     }
 
+    fn handle_vector_fns(
+        object_ref: &mut HeapObject,
+        method: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        let heap_obj = if let HeapObject::Instance(obj) = object_ref {
+            obj
+        } else {
+            return Err("Expected instance for Vector object".into());
+        };
+
+        let vector: &mut Vec<JvmStackValue> = {
+            if let JvmStackValue::Vector(vec) = heap_obj.fields.get_mut("container").unwrap() {
+                vec
+            } else {
+                return Err("Vector instance missing 'container' field".into());
+            }
+        };
+
+        match method {
+            "addElement" => {
+                let val = args[1].clone(); // args[0] is 'this'
+                vector.push(val);
+                Ok(None)
+            }
+            "size" => Ok(Some(JvmStackValue::Int(vector.len() as i32))),
+            _ => {
+                println!("Unknown Vector method: {}", method);
+                Ok(None)
+            }
+        }
+    }
+
     fn handle_native_printstream(method: &str, args: &[JvmStackValue]) {
         match method {
             "println" => {
@@ -991,6 +1180,29 @@ impl JVM {
         } else if class_name == "java/io/PrintStream" {
             JVM::handle_native_printstream(method_name, args);
             return Ok(());
+        } else if class_name == "java/util/Vector" {
+            let this_id = match objectref {
+                JvmStackValue::ObjectRef(id) => id,
+                _ => return Err("NullPointerException".into()),
+            };
+
+            let object_ref = jvm
+                .heap
+                .get_mut(this_id as usize)
+                .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+
+            let res = JVM::handle_vector_fns(object_ref, method_name, args);
+
+            if let Err(e) = res {
+                return Err(format!("Error handling Vector method: {}", e).into());
+            }
+
+            let return_value = res.unwrap();
+            if let Some(val) = return_value {
+                caller_stack.push(val);
+            }
+
+            return Ok(());
         }
 
         let class_data = jvm
@@ -1013,7 +1225,7 @@ impl JVM {
 
         let mut locals = vec![JvmStackValue::Null; code_attr.max_locals as usize];
 
-        locals[0] = objectref;
+        locals[0] = objectref.clone();
 
         let mut local_idx = 1;
         for arg in args {
@@ -1118,10 +1330,31 @@ impl JVM {
         let ConstantInfo::Utf8(name_utf8) = &pool[nt_info.name_index as usize - 1] else {
             panic!()
         };
-        name_utf8.utf8_string.clone()
+
+        let ConstantInfo::Utf8(desc_utf8) = &pool[nt_info.descriptor_index as usize - 1] else {
+            panic!()
+        };
+
+        let key = format!("{}:{}", name_utf8.utf8_string, desc_utf8.utf8_string);
+
+        return key;
     }
 
     pub fn allocate(&mut self, class_name: String) -> u32 {
+        if class_name == "java/util/Vector" {
+            let mut obj = JvmObject {
+                class_name: class_name.clone(),
+                fields: HashMap::new(),
+            };
+
+            obj.fields
+                .insert("container".to_string(), JvmStackValue::Vector(Vec::new()));
+
+            self.heap.push(HeapObject::Instance(obj));
+
+            return (self.heap.len() - 1) as u32;
+        }
+
         let mut fields = HashMap::new();
 
         // Walk up the inheritance tree to find all fields this object should have
@@ -1129,8 +1362,17 @@ impl JVM {
         while let Some(name) = current_class {
             if let Some(class_data) = self.classes.get(&name) {
                 for field_info in &class_data.fields {
+                    let descriptor =
+                        JVM::resolve_utf8(field_info.descriptor_index, &class_data.const_pool);
+                    let default_val = if descriptor.starts_with('L') || descriptor.starts_with('[')
+                    {
+                        JvmStackValue::Null
+                    } else {
+                        JvmStackValue::Int(0)
+                    };
                     let f_name = JVM::resolve_utf8(field_info.name_index, &class_data.const_pool);
-                    fields.insert(f_name, JvmStackValue::Int(0));
+                    let key = format!("{}:{}", f_name, descriptor);
+                    fields.insert(key, default_val);
                 }
                 current_class = JVM::get_super_class_name(class_data);
             } else {
