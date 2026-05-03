@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cafebabe = "0.9.0"
+classfile-parser = "0.3.8"
 zip = "8.6.0"

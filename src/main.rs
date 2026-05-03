@@ -1,4 +1,7 @@
+mod jvm;
 mod services;
+
+use jvm::JVM;
 
 use services::jar_extractor::JarExtractor;
 
@@ -12,5 +15,13 @@ fn main() {
     match data {
         Ok(result) => println!("Jar extraction successful: {}", result.data),
         Err(e) => println!("Jar extraction failed: {}", e.message),
+    }
+
+    let mut jvm = JVM::new();
+    let res = jvm.run_jar(jar_extractor.data.unwrap());
+
+    match res {
+        Ok(_) => println!("JVM execution successful"),
+        Err(e) => println!("JVM execution failed: {}", e),
     }
 }
