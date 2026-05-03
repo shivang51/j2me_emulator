@@ -1,4 +1,4 @@
-pub struct JarExtractor {
-    pub jar_path: String,
-    pub output_dir: String,
-}
+mod jar_extractor;
+mod jar_manifest;
+
+pub use jar_extractor::JarExtractor;
