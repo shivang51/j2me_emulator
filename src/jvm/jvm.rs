@@ -21,10 +21,19 @@ pub struct JvmObject {
     pub fields: HashMap<String, JvmStackValue>,
 }
 
+#[derive(Debug, Clone)]
+pub enum HeapObject {
+    Instance(JvmObject),
+    Array {
+        element_type: String,
+        data: Vec<JvmStackValue>,
+    },
+}
+
 #[derive(Debug)]
 pub struct JVM {
     pub static_fields: HashMap<String, JvmStackValue>,
-    pub heap: Vec<JvmObject>,
+    pub heap: Vec<HeapObject>,
     pub classes: HashMap<String, classfile_parser::ClassFile>,
 }
 
@@ -174,6 +183,11 @@ impl JVM {
             );
 
             match opcode {
+                0x01 => {
+                    // aconst_null
+                    stack.push(JvmStackValue::Null);
+                    pc += 1;
+                }
                 0x02 => {
                     // iconst_m1
                     stack.push(JvmStackValue::Int(-1));
@@ -309,6 +323,76 @@ impl JVM {
                     stack.push(local_val);
                     pc += 1;
                 }
+                0x3c => {
+                    // istore_1
+                    let val = stack.pop().ok_or("istore_1: Stack underflow")?;
+                    if locals.len() < 2 {
+                        locals.resize(2, JvmStackValue::Null);
+                    }
+                    locals[1] = val;
+                    pc += 1;
+                }
+                0x4b => {
+                    // astore_9
+                    let val = stack.pop().ok_or("astore_1: Stack underflow")?;
+                    if locals.len() < 1 {
+                        locals.resize(1, JvmStackValue::Null);
+                    }
+                    locals[0] = val;
+                    pc += 1;
+                }
+                0x4c => {
+                    // astore_1
+                    let val = stack.pop().ok_or("astore_0: Stack underflow")?;
+                    if locals.len() < 2 {
+                        locals.resize(2, JvmStackValue::Null);
+                    }
+                    locals[1] = val;
+                    pc += 1;
+                }
+                0x4d => {
+                    // astore_2
+                    let val = stack.pop().ok_or("astore_2: Stack underflow")?;
+                    if locals.len() < 3 {
+                        locals.resize(3, JvmStackValue::Null);
+                    }
+                    locals[2] = val;
+                    pc += 1;
+                }
+                0x53 => {
+                    // aastore
+                    let value = stack.pop().ok_or("aastore: stack underflow (value)")?;
+                    let index = match stack.pop().ok_or("aastore: stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("aastore: index is not an int".into()),
+                    };
+                    let arrayref = stack.pop().ok_or("aastore: stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("aastore: arrayref is not a reference".into()),
+                    };
+
+                    match jvm.heap.get_mut(heap_idx) {
+                        Some(HeapObject::Array { data, .. }) => {
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!(
+                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds for length {}",
+                    index, data.len()
+                ).into());
+                            }
+
+                            data[index as usize] = value;
+                        }
+                        Some(HeapObject::Instance(_)) => {
+                            return Err("aastore: object is not an array".into());
+                        }
+                        None => return Err("aastore: invalid heap reference".into()),
+                    }
+
+                    pc += 1;
+                }
                 0x59 => {
                     // dup - Duplicate the top value on the stack
 
@@ -390,41 +474,34 @@ impl JVM {
                     }
                     pc += 1;
                 }
-                0x3c => {
-                    // istore_1
-                    let val = stack.pop().ok_or("istore_1: Stack underflow")?;
-                    if locals.len() < 2 {
-                        locals.resize(2, JvmStackValue::Null);
+                0x99..=0x9E => {
+                    // ifeq, ifne, iflt, ifge, ifgt, ifle
+                    let opcode = bytecode[pc];
+
+                    let offset =
+                        (((bytecode[pc + 1] as i16) << 8) | (bytecode[pc + 2] as i16)) as i32;
+
+                    let val = match stack.pop().ok_or("if<cond>: stack underflow")? {
+                        JvmStackValue::Int(v) => v,
+                        _ => return Err("if<cond>: expected Int on stack".into()),
+                    };
+
+                    let condition_met = match opcode {
+                        0x99 => val == 0, // ifeq
+                        0x9A => val != 0, // ifne
+                        0x9B => val < 0,  // iflt
+                        0x9C => val >= 0, // ifge
+                        0x9D => val > 0,  // ifgt
+                        0x9E => val <= 0, // ifle
+                        _ => unreachable!(),
+                    };
+
+                    if condition_met {
+                        pc = (pc as i32 + offset) as usize;
+                        continue;
+                    } else {
+                        pc += 3;
                     }
-                    locals[1] = val;
-                    pc += 1;
-                }
-                0x4b => {
-                    // astore_9
-                    let val = stack.pop().ok_or("astore_1: Stack underflow")?;
-                    if locals.len() < 1 {
-                        locals.resize(1, JvmStackValue::Null);
-                    }
-                    locals[0] = val;
-                    pc += 1;
-                }
-                0x4c => {
-                    // astore_1
-                    let val = stack.pop().ok_or("astore_0: Stack underflow")?;
-                    if locals.len() < 2 {
-                        locals.resize(2, JvmStackValue::Null);
-                    }
-                    locals[1] = val;
-                    pc += 1;
-                }
-                0x4d => {
-                    // astore_2
-                    let val = stack.pop().ok_or("astore_2: Stack underflow")?;
-                    if locals.len() < 3 {
-                        locals.resize(3, JvmStackValue::Null);
-                    }
-                    locals[2] = val;
-                    pc += 1;
                 }
                 0xB2 => {
                     // getstatic
@@ -522,14 +599,18 @@ impl JVM {
                         .get(heap_idx)
                         .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
-                    let field_value = obj.fields.get(&field_name).ok_or_else(|| {
-                        format!(
-                            "Field '{}' not found in object of class '{}'",
-                            field_name, obj.class_name
-                        )
-                    })?;
+                    if let HeapObject::Instance(obj) = obj {
+                        let field_value = obj.fields.get(&field_name).ok_or_else(|| {
+                            format!(
+                                "Field '{}' not found in object of class '{}'",
+                                field_name, obj.class_name
+                            )
+                        })?;
+                        stack.push(field_value.clone());
+                    } else {
+                        return Err("getfield: Heap object is not an instance".into());
+                    }
 
-                    stack.push(field_value.clone());
                     pc += 3;
                 }
                 0xB5 => {
@@ -558,7 +639,11 @@ impl JVM {
                         .get_mut(heap_idx)
                         .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
-                    obj.fields.insert(field_name, value);
+                    if let HeapObject::Instance(obj) = obj {
+                        obj.fields.insert(field_name, value);
+                    } else {
+                        return Err("putfield: Heap object is not an instance".into());
+                    }
 
                     pc += 3;
                 }
@@ -596,10 +681,18 @@ impl JVM {
                     if let JvmStackValue::ObjectRef(999) = objectref {
                         JVM::handle_native_printstream(&method_name, &args);
                     } else {
-                        let actual_class_name = if let JvmStackValue::ObjectRef(id) = objectref {
-                            &jvm.heap[id as usize].class_name.clone()
+                        let actual_class_name = if let HeapObject::Instance(obj) = &jvm.heap
+                            [match objectref {
+                                JvmStackValue::ObjectRef(id) => id as usize,
+                                _ => {
+                                    return Err(
+                                        "invokevirtual: objectref is not a reference".into()
+                                    );
+                                }
+                            }] {
+                            obj.class_name.clone()
                         } else {
-                            &class_name // Fallback
+                            class_name
                         };
 
                         let res = JVM::execute_method(
@@ -701,6 +794,39 @@ impl JVM {
 
                     pc += 3;
                 }
+                0xBD => {
+                    // anewarray
+                    let cp_index =
+                        (((bytecode[pc + 1] as u16) << 8) | (bytecode[pc + 2] as u16)) as usize;
+
+                    let component_type = match &cp[cp_index - 1] {
+                        ConstantInfo::Class(class_info) => {
+                            JVM::resolve_utf8(class_info.name_index, cp)
+                        }
+                        _ => return Err("anewarray: expected Class constant".into()),
+                    };
+
+                    let count = match stack.pop().ok_or("anewarray: stack underflow")? {
+                        JvmStackValue::Int(c) => c,
+                        _ => return Err("anewarray: expected Int for count".into()),
+                    };
+
+                    if count < 0 {
+                        return Err("java.lang.NegativeArraySizeException".into());
+                    }
+
+                    let array_obj = HeapObject::Array {
+                        element_type: component_type,
+                        data: vec![JvmStackValue::Null; count as usize],
+                    };
+
+                    jvm.heap.push(array_obj);
+                    let array_ref = (jvm.heap.len() - 1) as u32;
+
+                    stack.push(JvmStackValue::ObjectRef(array_ref));
+
+                    pc += 3;
+                }
                 0xB1 => {
                     // return
                     println!("Execution finished normally.");
@@ -715,7 +841,7 @@ impl JVM {
                 }
                 _ => {
                     println!("Unknown Opcode: {:02X}", opcode);
-                    pc += 1;
+                    panic!("Unknown Opcode: {:02X}", opcode);
                 }
             }
         }
@@ -856,10 +982,21 @@ impl JVM {
         jvm: &mut JVM,
         caller_stack: &mut Vec<JvmStackValue>, // We need this to push the return value!
     ) -> Result<(), String> {
+        if class_name.starts_with("javax/microedition") {
+            println!(
+                "[-] Skipping native method call to {}.{}{}",
+                class_name, method_name, descriptor
+            );
+            return Ok(());
+        } else if class_name == "java/io/PrintStream" {
+            JVM::handle_native_printstream(method_name, args);
+            return Ok(());
+        }
+
         let class_data = jvm
             .classes
             .get(class_name)
-            .ok_or_else(|| format!("ClassDef not found in Universe: {}", class_name))?;
+            .ok_or_else(|| format!("ClassDef not found in VM: {}", class_name))?;
 
         let method =
             JVM::find_method_in_class(class_data, method_name, descriptor).ok_or_else(|| {
@@ -1001,10 +1138,10 @@ impl JVM {
             }
         }
 
-        let obj = JvmObject {
+        let obj = HeapObject::Instance(JvmObject {
             class_name,
             fields: fields,
-        };
+        });
         self.heap.push(obj);
         (self.heap.len() - 1) as u32 // The objectref
     }
