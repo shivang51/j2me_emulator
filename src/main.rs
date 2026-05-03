@@ -1,3 +1,5 @@
-fn main() {
-    println!("Hello, world!");
-}
+mod services;
+
+use services::jar_extractor::JarExtractor;
+
+fn main() {}
