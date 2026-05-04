@@ -583,6 +583,28 @@ impl JVM {
 
                     pc += 1;
                 }
+                0x84 => {
+                    // iinc
+                    let index = bytecode[pc + 1] as usize;
+                    let constant = bytecode[pc + 2] as i8 as i32;
+
+                    if index >= locals.len() {
+                        return Err(format!("iinc: invalid local index {}", index).into());
+                    }
+
+                    match &mut locals[index] {
+                        JvmStackValue::Int(value) => *value += constant,
+                        value => {
+                            return Err(format!(
+                                "iinc: expected Int in local {}, found {:?}",
+                                index, value
+                            )
+                            .into());
+                        }
+                    }
+
+                    pc += 3;
+                }
 
                 0x99..=0x9E => {
                     // ifeq, ifne, iflt, ifge, ifgt, ifle
@@ -1742,7 +1764,7 @@ impl JVM {
         )?;
 
         if let Some(val) = return_value {
-            stack.insert(0, val);
+            stack.push(val);
         }
 
         Ok(())
