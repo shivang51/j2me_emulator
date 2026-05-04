@@ -150,7 +150,20 @@ impl JVM {
                                     );
                                     let class_name = JVM::get_class_name(&class)?;
                                     let class_ref = self.allocate(class_name.to_string());
-                                    locals.push(JvmStackValue::ObjectRef(class_ref));
+                                    let objectref = JvmStackValue::ObjectRef(class_ref);
+                                    let mut constructor_stack = Vec::new();
+
+                                    JVM::execute_method(
+                                        objectref.clone(),
+                                        &class_name,
+                                        "<init>",
+                                        "()V",
+                                        &[],
+                                        self,
+                                        &mut constructor_stack,
+                                    )?;
+
+                                    locals.push(objectref);
                                 }
                                 let res = JVM::run_frame(&code_attr.code, pool, &mut locals, self);
 
@@ -335,6 +348,41 @@ impl JVM {
                     stack.push(local_val);
                     pc += 1;
                 }
+                0x2e => {
+                    // iaload
+                    let index = match stack.pop().ok_or("iaload: Stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("iaload: index is not an int".into()),
+                    };
+
+                    let arrayref = stack.pop().ok_or("iaload: Stack underflow (arrayref)")?;
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("iaload: arrayref is not a reference".into()),
+                    };
+
+                    match jvm.heap.get(heap_idx) {
+                        Some(HeapObject::Array { data, .. }) => {
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!(
+                                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds",
+                                    index
+                                ));
+                            }
+
+                            match &data[index as usize] {
+                                JvmStackValue::Int(value) => stack.push(JvmStackValue::Int(*value)),
+                                value => {
+                                    return Err(format!("iaload: expected Int, found {:?}", value));
+                                }
+                            }
+                        }
+                        _ => return Err("iaload: object is not an array".into()),
+                    }
+
+                    pc += 1;
+                }
                 0x32 => {
                     // aaload
                     let index = match stack.pop().ok_or("aaload: Stack underflow (index)")? {
@@ -430,6 +478,41 @@ impl JVM {
                         locals.resize(3, JvmStackValue::Null);
                     }
                     locals[2] = val;
+                    pc += 1;
+                }
+                0x4f => {
+                    // iastore
+                    let value = match stack.pop().ok_or("iastore: stack underflow (value)")? {
+                        JvmStackValue::Int(value) => value,
+                        value => return Err(format!("iastore: value is not an int: {:?}", value)),
+                    };
+                    let index = match stack.pop().ok_or("iastore: stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("iastore: index is not an int".into()),
+                    };
+                    let arrayref = stack.pop().ok_or("iastore: stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("iastore: arrayref is not a reference".into()),
+                    };
+
+                    match jvm.heap.get_mut(heap_idx) {
+                        Some(HeapObject::Array { data, .. }) => {
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!(
+                                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds for length {}",
+                                    index,
+                                    data.len()
+                                ));
+                            }
+
+                            data[index as usize] = JvmStackValue::Int(value);
+                        }
+                        _ => return Err("iastore: object is not an array".into()),
+                    }
+
                     pc += 1;
                 }
                 0x53 => {
@@ -732,7 +815,13 @@ impl JVM {
                     // ldc
 
                     let cp_index = bytecode[pc + 1] as usize;
-                    let entry = &cp.get(cp_index).expect("Invalid CP index for LDC");
+                    let entry = cp
+                        .get(
+                            cp_index
+                                .checked_sub(1)
+                                .ok_or_else(|| "Invalid CP index 0 for LDC".to_string())?,
+                        )
+                        .ok_or_else(|| format!("Invalid CP index for LDC: {}", cp_index))?;
 
                     stack.push(match entry {
                         ConstantInfo::Integer(int_info) => JvmStackValue::Int(int_info.value),
@@ -875,7 +964,21 @@ impl JVM {
                     if let JvmStackValue::ObjectRef(999) = objectref {
                         JVM::handle_native_printstream(&method_name, &args);
                     }
-                    if class_name == "java/lang/StringBuffer" {
+                    if class_name == "java/lang/String" {
+                        let res = JVM::execute_method(
+                            objectref,
+                            &class_name,
+                            &method_name,
+                            &descriptor,
+                            &args,
+                            jvm,
+                            &mut stack,
+                        );
+
+                        if let Err(e) = res {
+                            return Err(format!("Error executing method: {}", e).into());
+                        }
+                    } else if class_name == "java/lang/StringBuffer" {
                         if let JvmStackValue::ObjectRef(id) = &objectref {
                             let heap_obj = jvm.heap.get_mut(*id as usize).ok_or_else(|| {
                                 format!(
@@ -1402,6 +1505,21 @@ impl JVM {
 
                 return Ok(());
             }
+            if class_name == "javax/microedition/lcdui/Display" {
+                let return_value = javax::lcdui::display::handle_virtual_method(
+                    objectref,
+                    method_name,
+                    descriptor,
+                    args,
+                    jvm,
+                )?;
+
+                if let Some(val) = return_value {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
             println!(
                 "[-] Skipping native method call to {}.{}{}",
                 class_name, method_name, descriptor
@@ -1409,6 +1527,16 @@ impl JVM {
             return Ok(());
         } else if class_name == "java/io/PrintStream" {
             JVM::handle_native_printstream(method_name, args);
+            return Ok(());
+        } else if class_name == "java/lang/String" {
+            let return_value = JVM::handle_string_fns(objectref, method_name, descriptor, args)?;
+
+            if let Some(val) = return_value {
+                caller_stack.push(val);
+            }
+
+            return Ok(());
+        } else if class_name == "java/lang/Thread" && method_name == "<init>" {
             return Ok(());
         } else if class_name == "java/util/Vector" {
             let this_id = match objectref {
@@ -1466,23 +1594,34 @@ impl JVM {
             return Ok(());
         }
 
-        let class_data = jvm
-            .classes
-            .get(class_name)
-            .ok_or_else(|| format!("ClassDef not found in VM: {}", class_name))?;
+        let Some((_resolved_class_name, const_pool, code_attr)) =
+            JVM::find_method_code_in_hierarchy(jvm, class_name, method_name, descriptor)?
+        else {
+            if JVM::class_extends(jvm, class_name, "javax/microedition/lcdui/game/GameCanvas") {
+                let return_value = javax::lcdui::game::game_canvas::handle_virtual_method(
+                    method_name,
+                    descriptor,
+                )?;
 
-        let method =
-            JVM::find_method_in_class(class_data, method_name, descriptor).ok_or_else(|| {
-                format!(
-                    "Method not found: {}.{}{}",
-                    class_name, method_name, descriptor
-                )
-            })?;
+                if let Some(val) = return_value {
+                    caller_stack.push(val);
+                }
 
-        let code_attr =
-            JVM::get_code_attribute(&method, &class_data.const_pool).ok_or_else(|| {
-                "Method has no Code attribute (is it abstract or native?)".to_string()
-            })?;
+                return Ok(());
+            }
+
+            let is_thread_method = (method_name == "start" && descriptor == "()V")
+                || (method_name == "setPriority" && descriptor == "(I)V");
+
+            if JVM::class_extends(jvm, class_name, "java/lang/Thread") && is_thread_method {
+                return Ok(());
+            }
+
+            return Err(format!(
+                "Method not found: {}.{}{}",
+                class_name, method_name, descriptor
+            ));
+        };
 
         let mut locals = vec![JvmStackValue::Null; code_attr.max_locals as usize];
 
@@ -1502,12 +1641,7 @@ impl JVM {
             }
         }
 
-        let return_value = JVM::run_frame(
-            &code_attr.code,
-            &class_data.const_pool.clone(),
-            &mut locals,
-            jvm,
-        )?;
+        let return_value = JVM::run_frame(&code_attr.code, &const_pool, &mut locals, jvm)?;
 
         if let Some(val) = return_value {
             caller_stack.push(val);
@@ -1565,6 +1699,55 @@ impl JVM {
             }
         }
         None
+    }
+
+    fn find_method_code_in_hierarchy(
+        jvm: &JVM,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Result<Option<(String, Vec<ConstantInfo>, Code)>, String> {
+        let mut current_class = Some(class_name.to_string());
+
+        while let Some(name) = current_class {
+            let Some(class_data) = jvm.classes.get(&name) else {
+                return Ok(None);
+            };
+
+            if let Some(method) = JVM::find_method_in_class(class_data, method_name, descriptor) {
+                let code_attr = JVM::get_code_attribute(method, &class_data.const_pool)
+                    .ok_or_else(|| {
+                        format!(
+                            "Method has no Code attribute: {}.{}{}",
+                            name, method_name, descriptor
+                        )
+                    })?;
+
+                return Ok(Some((name, class_data.const_pool.clone(), code_attr)));
+            }
+
+            current_class = JVM::get_super_class_name(class_data);
+        }
+
+        Ok(None)
+    }
+
+    fn class_extends(jvm: &JVM, class_name: &str, target_class_name: &str) -> bool {
+        let mut current_class = Some(class_name.to_string());
+
+        while let Some(name) = current_class {
+            if name == target_class_name {
+                return true;
+            }
+
+            let Some(class_data) = jvm.classes.get(&name) else {
+                return false;
+            };
+
+            current_class = JVM::get_super_class_name(class_data);
+        }
+
+        false
     }
 
     pub fn get_class_name(class: &classfile_parser::ClassFile) -> Result<String, String> {
@@ -1739,6 +1922,161 @@ impl JVM {
         }
     }
 
+    fn handle_string_static_fns(
+        method: &str,
+        descriptor: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        match (method, descriptor) {
+            ("valueOf", "(I)Ljava/lang/String;") => match args.first() {
+                Some(JvmStackValue::Int(value)) => {
+                    Ok(Some(JvmStackValue::String(value.to_string())))
+                }
+                value => Err(format!("String.valueOf(I): invalid arg {:?}", value)),
+            },
+            ("valueOf", "(J)Ljava/lang/String;") => match args.first() {
+                Some(JvmStackValue::Long(value)) => {
+                    Ok(Some(JvmStackValue::String(value.to_string())))
+                }
+                value => Err(format!("String.valueOf(J): invalid arg {:?}", value)),
+            },
+            ("valueOf", "(Z)Ljava/lang/String;") => match args.first() {
+                Some(JvmStackValue::Int(value)) => Ok(Some(JvmStackValue::String(
+                    if *value == 0 { "false" } else { "true" }.to_string(),
+                ))),
+                value => Err(format!("String.valueOf(Z): invalid arg {:?}", value)),
+            },
+            ("valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => match args.first() {
+                Some(JvmStackValue::String(value)) => {
+                    Ok(Some(JvmStackValue::String(value.clone())))
+                }
+                Some(JvmStackValue::Null) => Ok(Some(JvmStackValue::String("null".to_string()))),
+                Some(value) => Ok(Some(JvmStackValue::String(format!("{:?}", value)))),
+                None => Err("String.valueOf(Object): missing arg".into()),
+            },
+            _ => Err(format!(
+                "Unsupported String static method: {}{}",
+                method, descriptor
+            )),
+        }
+    }
+
+    fn handle_string_fns(
+        objectref: JvmStackValue,
+        method: &str,
+        descriptor: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        let string = match objectref {
+            JvmStackValue::String(value) => value,
+            JvmStackValue::Null => return Err("String: NullPointerException".into()),
+            value => return Err(format!("String: expected string object, found {:?}", value)),
+        };
+
+        match (method, descriptor) {
+            ("concat", "(Ljava/lang/String;)Ljava/lang/String;") => {
+                let Some(JvmStackValue::String(suffix)) = args.first() else {
+                    return Err(format!("String.concat: invalid arg {:?}", args.first()));
+                };
+
+                Ok(Some(JvmStackValue::String(format!("{}{}", string, suffix))))
+            }
+            ("length", "()I") => Ok(Some(JvmStackValue::Int(string.chars().count() as i32))),
+            ("charAt", "(I)C") => {
+                let Some(JvmStackValue::Int(index)) = args.first() else {
+                    return Err(format!("String.charAt: invalid arg {:?}", args.first()));
+                };
+
+                let ch = string
+                    .chars()
+                    .nth(*index as usize)
+                    .ok_or_else(|| format!("StringIndexOutOfBoundsException: {}", index))?;
+                Ok(Some(JvmStackValue::Int(ch as i32)))
+            }
+            ("indexOf", "(I)I") => {
+                let Some(JvmStackValue::Int(ch)) = args.first() else {
+                    return Err(format!("String.indexOf(I): invalid arg {:?}", args.first()));
+                };
+
+                Ok(Some(JvmStackValue::Int(
+                    string
+                        .find(char::from_u32(*ch as u32).unwrap_or('\0'))
+                        .map_or(-1, |idx| string[..idx].chars().count() as i32),
+                )))
+            }
+            ("indexOf", "(II)I") => {
+                let (Some(JvmStackValue::Int(ch)), Some(JvmStackValue::Int(from_index))) =
+                    (args.first(), args.get(1))
+                else {
+                    return Err(format!("String.indexOf(II): invalid args {:?}", args));
+                };
+
+                let start_byte = string
+                    .char_indices()
+                    .nth((*from_index).max(0) as usize)
+                    .map_or(string.len(), |(idx, _)| idx);
+                let needle = char::from_u32(*ch as u32).unwrap_or('\0');
+
+                Ok(Some(JvmStackValue::Int(
+                    string[start_byte..]
+                        .find(needle)
+                        .map_or(-1, |idx| string[..start_byte + idx].chars().count() as i32),
+                )))
+            }
+            ("lastIndexOf", "(II)I") => {
+                let (Some(JvmStackValue::Int(ch)), Some(JvmStackValue::Int(from_index))) =
+                    (args.first(), args.get(1))
+                else {
+                    return Err(format!("String.lastIndexOf(II): invalid args {:?}", args));
+                };
+
+                let needle = char::from_u32(*ch as u32).unwrap_or('\0');
+                let max_chars = ((*from_index).max(0) as usize + 1).min(string.chars().count());
+                let prefix: String = string.chars().take(max_chars).collect();
+
+                Ok(Some(JvmStackValue::Int(
+                    prefix
+                        .rfind(needle)
+                        .map_or(-1, |idx| prefix[..idx].chars().count() as i32),
+                )))
+            }
+            ("substring", "(I)Ljava/lang/String;") => {
+                let Some(JvmStackValue::Int(begin)) = args.first() else {
+                    return Err(format!(
+                        "String.substring(I): invalid arg {:?}",
+                        args.first()
+                    ));
+                };
+
+                Ok(Some(JvmStackValue::String(
+                    string.chars().skip(*begin as usize).collect(),
+                )))
+            }
+            ("substring", "(II)Ljava/lang/String;") => {
+                let (Some(JvmStackValue::Int(begin)), Some(JvmStackValue::Int(end))) =
+                    (args.first(), args.get(1))
+                else {
+                    return Err(format!("String.substring(II): invalid args {:?}", args));
+                };
+
+                Ok(Some(JvmStackValue::String(
+                    string
+                        .chars()
+                        .skip(*begin as usize)
+                        .take((end - begin).max(0) as usize)
+                        .collect(),
+                )))
+            }
+            ("trim", "()Ljava/lang/String;") => {
+                Ok(Some(JvmStackValue::String(string.trim().to_string())))
+            }
+            _ => Err(format!(
+                "Unsupported String instance method: {}{}",
+                method, descriptor
+            )),
+        }
+    }
+
     fn execute_static_method(
         class_name: &str,
         method_name: &str,
@@ -1758,10 +2096,34 @@ impl JVM {
 
                 return Ok(());
             }
+            if class_name == "javax/microedition/lcdui/Display" {
+                let return_value = javax::lcdui::display::handle_static_method(
+                    method_name,
+                    descriptor,
+                    args,
+                    jvm,
+                )?;
+
+                if let Some(val) = return_value {
+                    stack.push(val);
+                }
+
+                return Ok(());
+            }
             panic!(
                 "[-] Skipping native static method call to {}.{}{} | args = {:?}",
                 class_name, method_name, descriptor, args
             );
+        } else if class_name == "java/lang/String" {
+            let return_value = JVM::handle_string_static_fns(method_name, descriptor, args)?;
+
+            if let Some(val) = return_value {
+                stack.push(val);
+            }
+
+            return Ok(());
+        } else if class_name == "java/lang/Thread" && method_name == "sleep" {
+            return Ok(());
         } else if class_name == "java/lang/System" && method_name == "currentTimeMillis" {
             panic!("System.currentTimeMillis is not supported in this JVM implementation");
         }
