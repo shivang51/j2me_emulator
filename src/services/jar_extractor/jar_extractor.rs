@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read};
+use std::{collections::HashMap, fs::File, io::Read};
 
 use crate::services::jar_extractor::jar_manifest::JarManifest;
 
@@ -12,6 +12,7 @@ pub struct JavaClass {
 pub struct JarFileData {
     pub manifest: JarManifest,
     pub classes: Vec<JavaClass>,
+    pub resources: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -68,10 +69,12 @@ impl JarExtractor {
         println!("Successfully read manifest");
 
         let classes = self.extract_classes(&mut archive);
+        let resources = self.extract_resources(&mut archive);
 
         self.data = Some(JarFileData {
             manifest: JarManifest::from_string(manifest_content.unwrap()),
-            classes: classes, // Placeholder for class extraction logic
+            classes,
+            resources,
         });
 
         return Result::Ok(JarExtractorResult {
@@ -96,6 +99,25 @@ impl JarExtractor {
         }
 
         return classes;
+    }
+
+    fn extract_resources(&self, archive: &mut zip::ZipArchive<File>) -> HashMap<String, Vec<u8>> {
+        let mut resources = HashMap::new();
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).unwrap();
+            let name = file.name().to_string();
+
+            if file.is_dir() || name.ends_with(".class") || name == "META-INF/MANIFEST.MF" {
+                continue;
+            }
+
+            let mut content = Vec::new();
+            file.read_to_end(&mut content).unwrap();
+            resources.insert(name, content);
+        }
+
+        resources
     }
 
     fn read_manifest(

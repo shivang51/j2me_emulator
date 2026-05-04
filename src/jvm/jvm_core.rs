@@ -36,6 +36,7 @@ pub struct JVM {
     pub static_fields: HashMap<String, JvmStackValue>,
     pub heap: Vec<HeapObject>,
     pub classes: HashMap<String, classfile_parser::ClassFile>,
+    pub resources: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -52,6 +53,7 @@ impl JVM {
             static_fields: HashMap::new(),
             heap: Vec::new(),
             classes: HashMap::new(),
+            resources: HashMap::new(),
         };
 
         jvm.static_fields.insert(
@@ -63,6 +65,9 @@ impl JVM {
     }
 
     pub fn run_jar(&mut self, data: JarFileData) -> Result<Option<JvmStackValue>, String> {
+        let main_class_name = data.manifest.main_class.replace('.', "/");
+        self.resources = data.resources;
+
         for class in data.classes {
             let res = classfile_parser::class_parser(&class.content);
             if let Err(e) = res {
@@ -80,7 +85,6 @@ impl JVM {
             }
         }
 
-        let main_class_name = data.manifest.main_class.replace('.', "/");
         println!("Running main class: {}", main_class_name);
 
         let main_class = self
@@ -1034,6 +1038,25 @@ impl JVM {
 
                     pc += 3;
                 }
+                0xC6 | 0xC7 => {
+                    // ifnull, ifnonnull
+                    let offset =
+                        (((bytecode[pc + 1] as i16) << 8) | (bytecode[pc + 2] as i16)) as i32;
+                    let value = stack.pop().ok_or("ifnull/ifnonnull: stack underflow")?;
+
+                    let is_null = matches!(value, JvmStackValue::Null);
+                    let should_branch = match opcode {
+                        0xC6 => is_null,
+                        0xC7 => !is_null,
+                        _ => unreachable!(),
+                    };
+
+                    if should_branch {
+                        pc = (pc as i32 + offset) as usize;
+                    } else {
+                        pc += 3;
+                    }
+                }
                 0xBB => {
                     // new (object creation)
 
@@ -1365,6 +1388,20 @@ impl JVM {
         caller_stack: &mut Vec<JvmStackValue>, // We need this to push the return value!
     ) -> Result<(), String> {
         if class_name.starts_with("javax/microedition") {
+            if class_name == "javax/microedition/lcdui/Image" {
+                let return_value = javax::lcdui::image::handle_virtual_method(
+                    objectref,
+                    method_name,
+                    descriptor,
+                    jvm,
+                )?;
+
+                if let Some(val) = return_value {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
             println!(
                 "[-] Skipping native method call to {}.{}{}",
                 class_name, method_name, descriptor
@@ -1712,17 +1749,14 @@ impl JVM {
     ) -> Result<(), String> {
         if class_name.starts_with("javax/microedition") {
             if class_name == "javax/microedition/lcdui/Image" {
-                if method_name == "createImage" {
-                    let image_obj = HeapObject::Instance(JvmObject {
-                        class_name: class_name.to_string(),
-                        fields: HashMap::new(),
-                    });
-                    jvm.heap.push(image_obj);
-                    let image_ref = (jvm.heap.len() - 1) as u32;
+                let return_value =
+                    javax::lcdui::image::handle_static_method(method_name, descriptor, args, jvm)?;
 
-                    stack.push(JvmStackValue::ObjectRef(image_ref));
-                    return Ok(());
+                if let Some(val) = return_value {
+                    stack.push(val);
                 }
+
+                return Ok(());
             }
             panic!(
                 "[-] Skipping native static method call to {}.{}{} | args = {:?}",
