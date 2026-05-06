@@ -39,6 +39,7 @@ pub enum HeapObject {
 
 #[derive(Debug)]
 pub struct JVM {
+    pub loaded_jar: Option<JarFileData>,
     pub static_fields: HashMap<String, JvmStackValue>,
     pub heap: Vec<HeapObject>,
     pub classes: HashMap<String, classfile_parser::ClassFile>,
@@ -56,6 +57,7 @@ pub struct Code {
 impl JVM {
     pub fn new() -> Self {
         let mut jvm = JVM {
+            loaded_jar: None,
             static_fields: HashMap::new(),
             heap: Vec::new(),
             classes: HashMap::new(),
@@ -71,8 +73,14 @@ impl JVM {
     }
 
     pub fn run_jar(&mut self, data: JarFileData) -> Result<Option<JvmStackValue>, String> {
+        self.loaded_jar = Some(data.clone());
+
         let main_class_name = data.manifest.main_class.replace('.', "/");
         self.resources = data.resources;
+
+        for (res_name, res_data) in &self.resources {
+            println!("Loaded resource: {} ({} bytes)", res_name, res_data.len());
+        }
 
         for class in data.classes {
             let res = classfile_parser::class_parser(&class.content);

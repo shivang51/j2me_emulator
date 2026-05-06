@@ -2,13 +2,13 @@ use std::{collections::HashMap, fs::File, io::Read};
 
 use crate::services::jar_extractor::jar_manifest::JarManifest;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JavaClass {
     pub name: String,
     pub content: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JarFileData {
     pub manifest: JarManifest,
     pub classes: Vec<JavaClass>,

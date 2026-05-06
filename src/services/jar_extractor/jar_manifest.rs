@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JarManifest {
     pub version: String,
     pub main_class: String,
