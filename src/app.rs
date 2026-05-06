@@ -130,6 +130,9 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                if let Some(jvm) = &mut self.jvm {
+                    let _ = jvm.paint();
+                }
                 self.draw();
                 if let Some(window) = &self.window {
                     window.request_redraw();

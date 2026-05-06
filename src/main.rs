@@ -28,6 +28,12 @@ fn main() {
         Err(e) => println!("JVM execution failed: {}", e),
     }
 
+    let res = jvm.paint();
+    match res {
+        Ok(_) => println!("Paint successful"),
+        Err(e) => println!("Paint failed: {}", e),
+    }
+
     let event_loop = EventLoop::new().unwrap();
 
     event_loop.set_control_flow(ControlFlow::Poll);

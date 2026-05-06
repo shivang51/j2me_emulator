@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::jvm::jvm_core::{HeapObject, JVM, JvmObject, JvmStackValue};
 
-const CLASS_NAME: &str = "javax/microedition/lcdui/Display";
+pub const CLASS_NAME: &str = "javax/microedition/lcdui/Display";
 const SINGLETON_FIELD: &str =
     "javax/microedition/lcdui/Display.singleton:Ljavax/microedition/lcdui/Display;";
 const CURRENT_FIELD: &str = "current:Ljavax/microedition/lcdui/Displayable;";
@@ -38,17 +38,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("getCurrent", "()Ljavax/microedition/lcdui/Displayable;") => {
-            let display = get_display_object(objectref, jvm)?;
-            let HeapObject::Instance(obj) = display else {
-                return Err("Display: expected instance object".into());
-            };
-
-            Ok(Some(
-                obj.fields
-                    .get(CURRENT_FIELD)
-                    .cloned()
-                    .unwrap_or(JvmStackValue::Null),
-            ))
+            return get_displayable_obj(objectref, jvm);
         }
         _ => Err(format!(
             "Unsupported Display instance method: {}{}",
@@ -57,7 +47,24 @@ pub fn handle_virtual_method(
     }
 }
 
-fn get_display(jvm: &mut JVM) -> JvmStackValue {
+pub fn get_displayable_obj(
+    objectref: JvmStackValue,
+    jvm: &mut JVM,
+) -> Result<Option<JvmStackValue>, String> {
+    let display = get_display_object(objectref, jvm)?;
+    let HeapObject::Instance(obj) = display else {
+        return Err("Display: expected instance object".into());
+    };
+
+    Ok(Some(
+        obj.fields
+            .get(CURRENT_FIELD)
+            .cloned()
+            .unwrap_or(JvmStackValue::Null),
+    ))
+}
+
+pub fn get_display(jvm: &mut JVM) -> JvmStackValue {
     if let Some(existing) = jvm.static_fields.get(SINGLETON_FIELD) {
         return existing.clone();
     }

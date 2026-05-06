@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::jvm::jvm_core::{HeapObject, JVM, JvmObject, JvmStackValue};
 
-const CLASS_NAME: &str = "javax/microedition/lcdui/Image";
+pub const CLASS_NAME: &str = "javax/microedition/lcdui/Image";
 
 pub fn handle_static_method(
     method_name: &str,

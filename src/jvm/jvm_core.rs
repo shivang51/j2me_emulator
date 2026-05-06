@@ -4,7 +4,7 @@ use classfile_parser::constant_info::{ConstantInfo, FieldRefConstant, MethodRefC
 
 use crate::{
     jvm::javax::{
-        lcdui::{display, game::game_canvas, image},
+        lcdui::{display, game::game_canvas, graphics, image},
         midlet,
     },
     services::jar_extractor::JarFileData,
@@ -209,10 +209,10 @@ impl JVM {
             let opcode = bytecode[pc];
 
             // debug-out -> wrote for easy searching this line
-            // println!(
-            //     "PC: {}, Opcode: {:02X}, Stack: {:?}, Locals: {:?}",
-            //     pc, opcode, stack, locals
-            // );
+            println!(
+                "PC: {}, Opcode: {:02X}, Stack: {:?}, Locals: {:?}",
+                pc, opcode, stack, locals
+            );
 
             match opcode {
                 0x01 => {
@@ -316,6 +316,36 @@ impl JVM {
                 0x1c => {
                     // iload_2
                     let local_val = locals[2].clone();
+                    stack.push(local_val);
+                    pc += 1;
+                }
+                0x1d => {
+                    // iload_3
+                    let local_val = locals[3].clone();
+                    stack.push(local_val);
+                    pc += 1;
+                }
+                0x1e => {
+                    // lload_0
+                    let local_val = locals[0].clone();
+                    stack.push(local_val);
+                    pc += 1;
+                }
+                0x1f => {
+                    // lload_1
+                    let local_val = locals[1].clone();
+                    stack.push(local_val);
+                    pc += 1;
+                }
+                0x20 => {
+                    // lload_2
+                    let local_val = locals[2].clone();
+                    stack.push(local_val);
+                    pc += 1;
+                }
+                0x21 => {
+                    // lload_3
+                    let local_val = locals[3].clone();
                     stack.push(local_val);
                     pc += 1;
                 }
@@ -1501,22 +1531,37 @@ impl JVM {
         jvm: &mut JVM,
         caller_stack: &mut Vec<JvmStackValue>, // We need this to push the return value!
     ) -> Result<(), String> {
+        println!(
+            "Executing method: {}.{}{} with args {:?}",
+            class_name, method_name, descriptor, args
+        );
         if class_name.starts_with("javax/microedition") {
-            if class_name == "javax/microedition/lcdui/Image" {
+            if class_name == image::CLASS_NAME {
                 let return_value =
-                    image::handle_virtual_method(objectref, method_name, descriptor, jvm)?;
+                    image::handle_virtual_method(objectref, method_name, descriptor, jvm);
 
-                if let Some(val) = return_value {
+                let res = match return_value {
+                    Ok(val) => val,
+                    Err(e) => {
+                        return Err(format!("Error handling Image method: {}", e).into());
+                    }
+                };
+
+                if let Some(val) = res {
                     caller_stack.push(val);
                 }
 
                 return Ok(());
             }
-            if class_name == "javax/microedition/lcdui/Display" {
+            if class_name == display::CLASS_NAME {
                 let return_value =
-                    display::handle_virtual_method(objectref, method_name, descriptor, args, jvm)?;
+                    display::handle_virtual_method(objectref, method_name, descriptor, args, jvm);
 
-                if let Some(val) = return_value {
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling Display method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
                     caller_stack.push(val);
                 }
 
@@ -1558,6 +1603,20 @@ impl JVM {
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling GameCanvas method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == graphics::CLASS_NAME {
+                let return_value =
+                    graphics::handle_virtual_method(&objectref, method_name, descriptor, args);
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling Graphics method: {}", e).into());
                 }
 
                 if let Some(val) = return_value.unwrap() {
@@ -1643,7 +1702,7 @@ impl JVM {
         let Some((_resolved_class_name, const_pool, code_attr)) =
             JVM::find_method_code_in_hierarchy(jvm, class_name, method_name, descriptor)?
         else {
-            if JVM::class_extends(jvm, class_name, "javax/microedition/lcdui/game/GameCanvas") {
+            if JVM::class_extends(jvm, class_name, game_canvas::CLASS_NAME) {
                 let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
                     jvm.heap.get_mut(id as usize).ok_or_else(|| {
                         format!(
@@ -1670,11 +1729,24 @@ impl JVM {
                 return Ok(());
             }
 
-            let is_thread_method = (method_name == "start" && descriptor == "()V")
-                || (method_name == "setPriority" && descriptor == "(I)V");
+            let is_thread_start = method_name == "start" && descriptor == "()V";
+            let is_thread_set_priority = method_name == "setPriority" && descriptor == "(I)V";
 
-            if JVM::class_extends(jvm, class_name, "java/lang/Thread") && is_thread_method {
-                return Ok(());
+            if JVM::class_extends(jvm, class_name, "java/lang/Thread") {
+                if is_thread_start {
+                    let res = JVM::execute_method(
+                        objectref,
+                        class_name,
+                        "run",
+                        "()V",
+                        &[],
+                        jvm,
+                        caller_stack,
+                    );
+                    return res;
+                } else if is_thread_set_priority {
+                    return Ok(());
+                }
             }
 
             return Err(format!(
@@ -2178,6 +2250,9 @@ impl JVM {
 
             return Ok(());
         } else if class_name == "java/lang/Thread" && method_name == "sleep" {
+            if let Some(JvmStackValue::Long(ms)) = stack.pop() {
+                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+            }
             return Ok(());
         } else if class_name == "java/lang/System" && method_name == "currentTimeMillis" {
             panic!("System.currentTimeMillis is not supported in this JVM implementation");
@@ -2219,5 +2294,37 @@ impl JVM {
         }
 
         Ok(())
+    }
+
+    pub fn paint(&mut self) -> Result<(), String> {
+        let disp = display::get_display(self);
+
+        let displayable_res = display::get_displayable_obj(disp, self)?;
+        let displayable_ref =
+            displayable_res.ok_or_else(|| "No displayable object set".to_string())?;
+
+        let class_name = if let JvmStackValue::ObjectRef(id) = displayable_ref {
+            if let HeapObject::Instance(inst) =
+                self.heap.get(id as usize).ok_or("Invalid heap reference")?
+            {
+                inst.class_name.clone()
+            } else {
+                return Err("Displayable is not an instance".into());
+            }
+        } else {
+            return Err("Displayable is not an object ref".into());
+        };
+
+        let graphics_handle = self.allocate(graphics::CLASS_NAME.to_string());
+
+        return JVM::execute_method(
+            displayable_ref,
+            &class_name,
+            "paint",
+            "(Ljavax/microedition/lcdui/Graphics;)V",
+            &[JvmStackValue::ObjectRef(graphics_handle)],
+            self,
+            &mut Vec::new(),
+        );
     }
 }
