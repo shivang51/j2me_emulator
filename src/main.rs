@@ -39,7 +39,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::default();
-    app.jvm = Some(Box::leak(Box::new(jvm)));
+    app.jvm = Some(jvm.clone());
     let res = event_loop.run_app(&mut app);
 
     if let Err(e) = res {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use classfile_parser::constant_info::{ConstantInfo, FieldRefConstant, MethodRefConstant};
 
@@ -9,6 +10,19 @@ use crate::{
     },
     services::jar_extractor::JarFileData,
 };
+
+fn is_debug_enabled() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var("JVM_DEBUG").is_ok())
+}
+
+macro_rules! jvm_debug {
+    ($($arg:tt)*) => {
+        if is_debug_enabled() {
+            println!($($arg)*);
+        }
+    };
+}
 
 #[derive(Debug, Clone)]
 pub enum JvmStackValue {
@@ -38,12 +52,29 @@ pub enum HeapObject {
 }
 
 #[derive(Debug)]
-pub struct JVM {
-    pub loaded_jar: Option<JarFileData>,
+pub struct JvmState {
     pub static_fields: HashMap<String, JvmStackValue>,
     pub heap: Vec<HeapObject>,
     pub classes: HashMap<String, classfile_parser::ClassFile>,
     pub resources: HashMap<String, Vec<u8>>,
+}
+
+pub type SharedJvmState = Arc<Mutex<JvmState>>;
+
+pub struct JVM {
+    pub loaded_jar: Option<JarFileData>,
+    pub state: SharedJvmState,
+    pub thread_handles: Arc<Mutex<HashMap<u32, std::thread::JoinHandle<()>>>>,
+}
+
+impl Clone for JVM {
+    fn clone(&self) -> Self {
+        JVM {
+            loaded_jar: self.loaded_jar.clone(),
+            state: Arc::clone(&self.state),
+            thread_handles: Arc::clone(&self.thread_handles),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -56,30 +87,37 @@ pub struct Code {
 
 impl JVM {
     pub fn new() -> Self {
-        let mut jvm = JVM {
-            loaded_jar: None,
+        let mut state = JvmState {
             static_fields: HashMap::new(),
             heap: Vec::new(),
             classes: HashMap::new(),
             resources: HashMap::new(),
         };
 
-        jvm.static_fields.insert(
+        state.static_fields.insert(
             "java/lang/System.out:Ljava/io/PrintStream;".to_string(),
-            JvmStackValue::ObjectRef(999), // Dummy reference for our native PrintStream
+            JvmStackValue::ObjectRef(999),
         );
 
-        return jvm;
+        JVM {
+            loaded_jar: None,
+            state: Arc::new(Mutex::new(state)),
+            thread_handles: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn run_jar(&mut self, data: JarFileData) -> Result<Option<JvmStackValue>, String> {
         self.loaded_jar = Some(data.clone());
 
         let main_class_name = data.manifest.main_class.replace('.', "/");
-        self.resources = data.resources;
 
-        for (res_name, res_data) in &self.resources {
-            println!("Loaded resource: {} ({} bytes)", res_name, res_data.len());
+        {
+            let mut state = self.state.lock().unwrap();
+            state.resources = data.resources;
+
+            for (res_name, res_data) in &state.resources {
+                println!("Loaded resource: {} ({} bytes)", res_name, res_data.len());
+            }
         }
 
         for class in data.classes {
@@ -101,27 +139,21 @@ impl JVM {
 
         println!("Running main class: {}", main_class_name);
 
-        let main_class = self
-            .classes
-            .get(&main_class_name)
-            .ok_or_else(|| format!("Main class not found: {}", main_class_name))?;
+        let main_class = {
+            let state = self.state.lock().unwrap();
+            state.classes
+                .get(&main_class_name)
+                .ok_or_else(|| format!("Main class not found: {}", main_class_name))?
+                .clone()
+        };
 
-        return self.execute_class(main_class.clone(), Some("startApp".into()));
+        return self.execute_class(main_class, Some("startApp".into()));
     }
 
-    pub fn add_class(&mut self, class: classfile_parser::ClassFile) -> Result<(), String> {
-        let res = JVM::get_class_name(&class);
-
-        if let Err(e) = res {
-            return Err(format!("Failed to get class name: {}", e));
-        }
-
-        let class_name = res.unwrap();
-
+    pub fn add_class(&self, class: classfile_parser::ClassFile) -> Result<(), String> {
+        let class_name = JVM::get_class_name(&class)?;
         println!("[JVM] Added class: {}", class_name);
-
-        self.classes.insert(class_name, class);
-
+        self.state.lock().unwrap().classes.insert(class_name, class);
         Ok(())
     }
 
@@ -129,7 +161,7 @@ impl JVM {
     // By default: main method is with name `main`,
     // but we can pass our own
     pub fn execute_class(
-        &mut self,
+        &self,
         class: classfile_parser::ClassFile,
         main_method_name: Option<String>,
     ) -> Result<Option<JvmStackValue>, String> {
@@ -147,7 +179,6 @@ impl JVM {
                         {
                             if att_name_info.utf8_string == "Code" {
                                 println!("Found Code attribute for main method!");
-                                // Extract bytecode and run interpreter
                                 let (_, code_attr) =
                                     classfile_parser::attribute_info::code_attribute_parser(
                                         att.info.as_slice(),
@@ -199,17 +230,15 @@ impl JVM {
         bytecode: &[u8],
         cp: &[ConstantInfo],
         locals: &mut Vec<JvmStackValue>,
-        jvm: &mut JVM,
+        jvm: &JVM,
     ) -> Result<Option<JvmStackValue>, String> {
         let mut pc = 0;
         let mut stack: Vec<JvmStackValue> = Vec::new();
 
         while pc < bytecode.len() {
-            // https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-6.html#jvms-6.5.ldc
             let opcode = bytecode[pc];
 
-            // debug-out -> wrote for easy searching this line
-            println!(
+            jvm_debug!(
                 "PC: {}, Opcode: {:02X}, Stack: {:?}, Locals: {:?}",
                 pc, opcode, stack, locals
             );
@@ -405,23 +434,26 @@ impl JVM {
                         _ => return Err("iaload: arrayref is not a reference".into()),
                     };
 
-                    match jvm.heap.get(heap_idx) {
-                        Some(HeapObject::Array { data, .. }) => {
-                            if index < 0 || index as usize >= data.len() {
-                                return Err(format!(
-                                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds",
-                                    index
-                                ));
-                            }
+                    {
+                        let state = jvm.state.lock().unwrap();
+                        match state.heap.get(heap_idx) {
+                            Some(HeapObject::Array { data, .. }) => {
+                                if index < 0 || index as usize >= data.len() {
+                                    return Err(format!(
+                                        "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds",
+                                        index
+                                    ));
+                                }
 
-                            match &data[index as usize] {
-                                JvmStackValue::Int(value) => stack.push(JvmStackValue::Int(*value)),
-                                value => {
-                                    return Err(format!("iaload: expected Int, found {:?}", value));
+                                match &data[index as usize] {
+                                    JvmStackValue::Int(value) => stack.push(JvmStackValue::Int(*value)),
+                                    value => {
+                                        return Err(format!("iaload: expected Int, found {:?}", value));
+                                    }
                                 }
                             }
+                            _ => return Err("iaload: object is not an array".into()),
                         }
-                        _ => return Err("iaload: object is not an array".into()),
                     }
 
                     pc += 1;
@@ -445,45 +477,45 @@ impl JVM {
                         }
                     };
 
-                    // Ensure we are getting a reference from the heap, not moving it
-                    let heap_obj = jvm
-                        .heap
-                        .get(heap_idx)
-                        .ok_or("aaload: invalid heap reference")?;
+                    {
+                        let state = jvm.state.lock().unwrap();
+                        let heap_obj = state
+                            .heap
+                            .get(heap_idx)
+                            .ok_or("aaload: invalid heap reference")?;
 
-                    println!(
-                        "aaload: arrayref points to heap index {}, heap object: {:?}",
-                        heap_idx, heap_obj
-                    );
+                        jvm_debug!(
+                            "aaload: arrayref points to heap index {}, heap object: {:?}",
+                            heap_idx, heap_obj
+                        );
 
-                    match heap_obj {
-                        HeapObject::Array { data, .. } => {
-                            if index < 0 || index as usize >= data.len() {
-                                return Err(format!("java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds", index).into());
-                            }
+                        match heap_obj {
+                            HeapObject::Array { data, .. } => {
+                                if index < 0 || index as usize >= data.len() {
+                                    return Err(format!("java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds", index).into());
+                                }
 
-                            println!(
-                                "aaload: Retrieved value from array at index {}: | data: {:?}",
-                                index, data,
-                            );
+                                jvm_debug!(
+                                    "aaload: Retrieved value from array at index {}: | data: {:?}",
+                                    index, data,
+                                );
 
-                            let value = data[index as usize].clone();
+                                let value = data[index as usize].clone();
 
-                            // JVM Spec: aaload MUST push a reference.
-                            // Updated to include custom JVM String and Vector reference models
-                            match value {
-                                JvmStackValue::ObjectRef(_)
-                                | JvmStackValue::Null
-                                | JvmStackValue::String(_)
-                                | JvmStackValue::Vector(_) => stack.push(value),
-                                _ => {
-                                    return Err(
-                                        "aaload: component at index is not a reference".into()
-                                    );
+                                match value {
+                                    JvmStackValue::ObjectRef(_)
+                                    | JvmStackValue::Null
+                                    | JvmStackValue::String(_)
+                                    | JvmStackValue::Vector(_) => stack.push(value),
+                                    _ => {
+                                        return Err(
+                                            "aaload: component at index is not a reference".into()
+                                        );
+                                    }
                                 }
                             }
+                            _ => return Err("aaload: object is not an array".into()),
                         }
-                        _ => return Err("aaload: object is not an array".into()),
                     }
                     pc += 1;
                 }
@@ -541,7 +573,7 @@ impl JVM {
                         _ => return Err("iastore: arrayref is not a reference".into()),
                     };
 
-                    match jvm.heap.get_mut(heap_idx) {
+                    match jvm.state.lock().unwrap().heap.get_mut(heap_idx) {
                         Some(HeapObject::Array { data, .. }) => {
                             if index < 0 || index as usize >= data.len() {
                                 return Err(format!(
@@ -573,7 +605,7 @@ impl JVM {
                         _ => return Err("aastore: arrayref is not a reference".into()),
                     };
 
-                    match jvm.heap.get_mut(heap_idx) {
+                    match jvm.state.lock().unwrap().heap.get_mut(heap_idx) {
                         Some(HeapObject::Array { data, .. }) => {
                             if index < 0 || index as usize >= data.len() {
                                 return Err(format!(
@@ -831,17 +863,19 @@ impl JVM {
 
                     let key = JVM::get_field_key(field_ref, cp);
 
-                    let val = jvm
-                        .static_fields
-                        .get(&key)
-                        .ok_or_else(|| format!("Static field not found: {}", key));
+                    let val = {
+                        let state = jvm.state.lock().unwrap();
+                        state.static_fields
+                            .get(&key)
+                            .cloned()
+                            .ok_or_else(|| format!("Static field not found: {}", key))
+                    };
 
                     if let Err(e) = &val {
                         println!("Error: {}", e);
-
-                        // print  all static fields available in the JVM for debugging
+                        let state = jvm.state.lock().unwrap();
                         println!("Available static fields:");
-                        for (k, v) in &jvm.static_fields {
+                        for (k, v) in &state.static_fields {
                             println!("{}: {:?}", k, v);
                             let k_matches = k == &key;
                             println!("match: {:?}", k_matches);
@@ -850,7 +884,7 @@ impl JVM {
                         return Err(e.clone());
                     }
 
-                    stack.push(val.unwrap().clone());
+                    stack.push(val.unwrap());
 
                     pc += 3;
                 }
@@ -913,29 +947,26 @@ impl JVM {
                         _ => return Err("getfield: objectref is not a reference".into()),
                     };
 
-                    let obj = jvm
-                        .heap
-                        .get(heap_idx)
-                        .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
+                    let field_value = {
+                        let state = jvm.state.lock().unwrap();
+                        let obj = state
+                            .heap
+                            .get(heap_idx)
+                            .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
-                    if let HeapObject::Instance(obj) = obj {
-                        let res = obj.fields.get(&field_name).ok_or_else(|| {
-                            format!(
-                                "Field '{}' not found in object of class '{}'",
-                                field_name, obj.class_name
-                            )
-                        });
-
-                        if let Err(e) = &res {
-                            return Err(e.clone());
+                        if let HeapObject::Instance(obj) = obj {
+                            obj.fields.get(&field_name).ok_or_else(|| {
+                                format!(
+                                    "Field '{}' not found in object of class '{}'",
+                                    field_name, obj.class_name
+                                )
+                            })?.clone()
+                        } else {
+                            return Err("getfield: Heap object is not an instance".into());
                         }
+                    };
 
-                        let field_value = res.unwrap();
-
-                        stack.push(field_value.clone());
-                    } else {
-                        return Err("getfield: Heap object is not an instance".into());
-                    }
+                    stack.push(field_value);
 
                     pc += 3;
                 }
@@ -960,15 +991,18 @@ impl JVM {
                         _ => return Err("putfield: objectref is not a reference".into()),
                     };
 
-                    let obj = jvm
-                        .heap
-                        .get_mut(heap_idx)
-                        .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
+                    {
+                        let mut state = jvm.state.lock().unwrap();
+                        let obj = state
+                            .heap
+                            .get_mut(heap_idx)
+                            .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
-                    if let HeapObject::Instance(obj) = obj {
-                        obj.fields.insert(field_name, value);
-                    } else {
-                        return Err("putfield: Heap object is not an instance".into());
+                        if let HeapObject::Instance(obj) = obj {
+                            obj.fields.insert(field_name, value);
+                        } else {
+                            return Err("putfield: Heap object is not an instance".into());
+                        }
                     }
 
                     pc += 3;
@@ -1023,21 +1057,17 @@ impl JVM {
                         }
                     } else if class_name == "java/lang/StringBuffer" {
                         if let JvmStackValue::ObjectRef(id) = &objectref {
-                            let heap_obj = jvm.heap.get_mut(*id as usize).ok_or_else(|| {
-                                format!(
-                                    "invokevirtual on java/lang/StringBuffer with id {}, but no object found in heap",
-                                    id
-                                )
-                            });
-
-                            if let Err(e) = &heap_obj {
-                                return Err(e.clone());
-                            }
-
                             args.insert(0, objectref.clone());
-
-                            let res =
-                                JVM::handle_str_buffer_fns(heap_obj.unwrap(), &method_name, &args);
+                            let res = {
+                                let mut state = jvm.state.lock().unwrap();
+                                let heap_obj = state.heap.get_mut(*id as usize).ok_or_else(|| {
+                                    format!(
+                                        "invokevirtual on java/lang/StringBuffer with id {}, but no object found in heap",
+                                        id
+                                    )
+                                })?;
+                                JVM::handle_str_buffer_fns(heap_obj, &method_name, &args)
+                            };
 
                             if let Err(e) = res {
                                 return Err(
@@ -1050,18 +1080,21 @@ impl JVM {
                             }
                         }
                     } else {
-                        let actual_class_name = if let HeapObject::Instance(obj) = &jvm.heap
-                            [match objectref {
-                                JvmStackValue::ObjectRef(id) => id as usize,
-                                _ => {
-                                    return Err(
-                                        "invokevirtual: objectref is not a reference".into()
-                                    );
-                                }
-                            }] {
-                            obj.class_name.clone()
-                        } else {
-                            class_name
+                        let actual_class_name = {
+                            let state = jvm.state.lock().unwrap();
+                            if let HeapObject::Instance(obj) = &state.heap
+                                [match objectref {
+                                    JvmStackValue::ObjectRef(id) => id as usize,
+                                    _ => {
+                                        return Err(
+                                            "invokevirtual: objectref is not a reference".into()
+                                        );
+                                    }
+                                }] {
+                                obj.class_name.clone()
+                            } else {
+                                class_name
+                            }
                         };
 
                         let res = JVM::execute_method(
@@ -1114,7 +1147,7 @@ impl JVM {
                     if class_name != "java/lang/Object" || method_name != "<init>" {
                         // Execute the targeted method.
                         // In a full VM, this creates a new Frame.
-                        println!(
+                        jvm_debug!(
                             "invokespecial executing: {}.{}{}",
                             class_name, method_name, descriptor
                         );
@@ -1218,8 +1251,6 @@ impl JVM {
 
                     let class_name = utf8_info.utf8_string.clone();
 
-                    // push on the Heap
-                    // Note: We don't call <init> here! That is a separate instruction.
                     let objectref = jvm.allocate(class_name);
 
                     stack.push(JvmStackValue::ObjectRef(objectref));
@@ -1252,8 +1283,11 @@ impl JVM {
                         data: vec![default_value; count as usize],
                     };
 
-                    jvm.heap.push(array_obj);
-                    let array_ref = (jvm.heap.len() - 1) as u32;
+                    let array_ref = {
+                        let mut state = jvm.state.lock().unwrap();
+                        state.heap.push(array_obj);
+                        (state.heap.len() - 1) as u32
+                    };
 
                     stack.push(JvmStackValue::ObjectRef(array_ref));
 
@@ -1280,7 +1314,7 @@ impl JVM {
                         return Err("java.lang.NegativeArraySizeException".into());
                     }
 
-                    println!(
+                    jvm_debug!(
                         "anewarray: component type = {} | count = {}",
                         component_type, count
                     );
@@ -1288,13 +1322,14 @@ impl JVM {
                     let mut default_val = JvmStackValue::Null;
 
                     if component_type.starts_with("javax/") {
+                        let mut state = jvm.state.lock().unwrap();
                         let obj = JvmObject {
                             class_name: component_type.clone(),
                             fields: HashMap::new(),
                         };
 
-                        jvm.heap.push(HeapObject::Instance(obj));
-                        let id = (jvm.heap.len() - 1) as u32;
+                        state.heap.push(HeapObject::Instance(obj));
+                        let id = (state.heap.len() - 1) as u32;
 
                         default_val = JvmStackValue::ObjectRef(id);
                     }
@@ -1304,8 +1339,11 @@ impl JVM {
                         data: vec![default_val; count as usize],
                     };
 
-                    jvm.heap.push(array_obj);
-                    let array_ref = (jvm.heap.len() - 1) as u32;
+                    let array_ref = {
+                        let mut state = jvm.state.lock().unwrap();
+                        state.heap.push(array_obj);
+                        (state.heap.len() - 1) as u32
+                    };
 
                     stack.push(JvmStackValue::ObjectRef(array_ref));
 
@@ -1315,7 +1353,7 @@ impl JVM {
                     // arraylength
                     let arrayref = stack.pop().ok_or("arraylength: stack underflow")?;
 
-                    println!("arraylength: arrayref = {:?}", arrayref);
+                    jvm_debug!("arraylength: arrayref = {:?}", arrayref);
 
                     let heap_idx = match arrayref {
                         JvmStackValue::ObjectRef(id) => id as usize,
@@ -1323,28 +1361,31 @@ impl JVM {
                         _ => return Err("arraylength: expected reference".into()),
                     };
 
-                    match jvm.heap.get(heap_idx) {
-                        Some(HeapObject::Array { data, .. }) => {
-                            stack.push(JvmStackValue::Int(data.len() as i32));
+                    {
+                        let state = jvm.state.lock().unwrap();
+                        match state.heap.get(heap_idx) {
+                            Some(HeapObject::Array { data, .. }) => {
+                                stack.push(JvmStackValue::Int(data.len() as i32));
+                            }
+                            Some(HeapObject::Instance(_)) => {
+                                return Err("IncompatibleClassChangeError: expected array".into());
+                            }
+                            None => return Err("arraylength: invalid heap reference".into()),
                         }
-                        Some(HeapObject::Instance(_)) => {
-                            return Err("IncompatibleClassChangeError: expected array".into());
-                        }
-                        None => return Err("arraylength: invalid heap reference".into()),
                     }
 
                     pc += 1;
                 }
                 0xB1 => {
                     // return
-                    println!("Execution finished normally.");
+                    jvm_debug!("Execution finished normally.");
                     return Ok(None);
                 }
                 0xAC | 0xAF => {
                     // ireturn
                     let val = stack.pop().ok_or("return: Stack underflow")?;
 
-                    println!("Execution finished with return value: {:?}", val);
+                    jvm_debug!("Execution finished with return value: {:?}", val);
                     return Ok(Some(val));
                 }
                 _ => {
@@ -1528,10 +1569,10 @@ impl JVM {
         method_name: &str,
         descriptor: &str,
         args: &[JvmStackValue],
-        jvm: &mut JVM,
-        caller_stack: &mut Vec<JvmStackValue>, // We need this to push the return value!
+        jvm: &JVM,
+        caller_stack: &mut Vec<JvmStackValue>,
     ) -> Result<(), String> {
-        println!(
+        jvm_debug!(
             "Executing method: {}.{}{} with args {:?}",
             class_name, method_name, descriptor, args
         );
@@ -1581,25 +1622,22 @@ impl JVM {
                 return Ok(());
             }
             if class_name == game_canvas::CLASS_NAME {
-                let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
-                    jvm.heap.get_mut(id as usize).ok_or_else(|| {
-                        format!(
-                            "GameCanvas method call with invalid object reference: {}",
-                            id
-                        )
-                    })?
-                } else {
-                    return Err("GameCanvas method call with non-reference object".into());
+                let return_value = {
+                    let mut state = jvm.state.lock().unwrap();
+                    let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
+                        state.heap.get_mut(id as usize).ok_or_else(|| {
+                            format!("GameCanvas method call with invalid object reference: {}", id)
+                        })?
+                    } else {
+                        return Err("GameCanvas method call with non-reference object".into());
+                    };
+                    let instance = if let HeapObject::Instance(inst) = obj_ref {
+                        inst
+                    } else {
+                        return Err("GameCanvas method call on non-instance object".into());
+                    };
+                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args)
                 };
-
-                let instance = if let HeapObject::Instance(inst) = obj_ref {
-                    inst
-                } else {
-                    return Err("GameCanvas method call on non-instance object".into());
-                };
-
-                let return_value =
-                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args);
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling GameCanvas method: {}", e).into());
@@ -1649,12 +1687,14 @@ impl JVM {
                 _ => return Err("Vector: NullPointerException".into()),
             };
 
-            let object_ref = jvm
-                .heap
-                .get_mut(this_id as usize)
-                .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
-
-            let res = JVM::handle_vector_fns(object_ref, method_name, args);
+            let res = {
+                let mut state = jvm.state.lock().unwrap();
+                let object_ref = state
+                    .heap
+                    .get_mut(this_id as usize)
+                    .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+                JVM::handle_vector_fns(object_ref, method_name, args)
+            };
 
             if let Err(e) = res {
                 return Err(format!("Error handling Vector method: {}", e).into());
@@ -1669,23 +1709,20 @@ impl JVM {
         } else if class_name == "java/lang/StringBuffer" {
             let this_id = match objectref {
                 JvmStackValue::ObjectRef(id) => id,
-                _ => return Err("Vector: NullPointerException".into()),
+                _ => return Err("StringBuffer: NullPointerException".into()),
             };
 
-            let object_ref = jvm
-                .heap
-                .get_mut(this_id as usize)
-                .ok_or_else(|| format!("Invalid heap reference: {}", this_id));
-
-            if let Err(e) = &object_ref {
-                return Err(e.clone());
-            }
-
             let mut call_args: Vec<JvmStackValue> = args.into();
-
             call_args.insert(0, objectref.clone());
 
-            let res = JVM::handle_str_buffer_fns(object_ref.unwrap(), method_name, &call_args);
+            let res = {
+                let mut state = jvm.state.lock().unwrap();
+                let object_ref = state
+                    .heap
+                    .get_mut(this_id as usize)
+                    .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+                JVM::handle_str_buffer_fns(object_ref, method_name, &call_args)
+            };
 
             if let Err(e) = res {
                 return Err(format!("Error handling StringBuffer method: {}", e).into());
@@ -1703,24 +1740,22 @@ impl JVM {
             JVM::find_method_code_in_hierarchy(jvm, class_name, method_name, descriptor)?
         else {
             if JVM::class_extends(jvm, class_name, game_canvas::CLASS_NAME) {
-                let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
-                    jvm.heap.get_mut(id as usize).ok_or_else(|| {
-                        format!(
-                            "GameCanvas method call with invalid object reference: {}",
-                            id
-                        )
-                    })?
-                } else {
-                    return Err("GameCanvas method call with non-reference object".into());
+                let return_value = {
+                    let mut state = jvm.state.lock().unwrap();
+                    let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
+                        state.heap.get_mut(id as usize).ok_or_else(|| {
+                            format!("GameCanvas method call with invalid object reference: {}", id)
+                        })?
+                    } else {
+                        return Err("GameCanvas method call with non-reference object".into());
+                    };
+                    let instance = if let HeapObject::Instance(inst) = obj_ref {
+                        inst
+                    } else {
+                        return Err("GameCanvas method call on non-instance object".into());
+                    };
+                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args)?
                 };
-
-                let instance = if let HeapObject::Instance(inst) = obj_ref {
-                    inst
-                } else {
-                    return Err("GameCanvas method call on non-instance object".into());
-                };
-                let return_value =
-                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args)?;
 
                 if let Some(val) = return_value {
                     caller_stack.push(val);
@@ -1731,19 +1766,64 @@ impl JVM {
 
             let is_thread_start = method_name == "start" && descriptor == "()V";
             let is_thread_set_priority = method_name == "setPriority" && descriptor == "(I)V";
+            let is_thread_join = method_name == "join" && descriptor == "()V";
+            let is_thread_is_alive = method_name == "isAlive" && descriptor == "()Z";
 
             if JVM::class_extends(jvm, class_name, "java/lang/Thread") {
                 if is_thread_start {
-                    let res = JVM::execute_method(
-                        objectref,
-                        class_name,
-                        "run",
-                        "()V",
-                        &[],
-                        jvm,
-                        caller_stack,
-                    );
-                    return res;
+                    // Spawn a real OS thread
+                    let jvm_clone = jvm.clone();
+                    let objectref_clone = objectref.clone();
+                    let class_name_owned = class_name.to_string();
+
+                    let obj_id = match &objectref {
+                        JvmStackValue::ObjectRef(id) => *id,
+                        _ => 0,
+                    };
+
+                    let handle = std::thread::spawn(move || {
+                        let result = JVM::execute_method(
+                            objectref_clone,
+                            &class_name_owned,
+                            "run",
+                            "()V",
+                            &[],
+                            &jvm_clone,
+                            &mut Vec::new(),
+                        );
+                        if let Err(e) = result {
+                            eprintln!("[JVM Thread Error] {}.run() failed: {}", class_name_owned, e);
+                        }
+                    });
+
+                    // Store handle for join()
+                    jvm.thread_handles.lock().unwrap().insert(obj_id, handle);
+
+                    return Ok(());
+                } else if is_thread_join {
+                    let obj_id = match &objectref {
+                        JvmStackValue::ObjectRef(id) => *id,
+                        _ => return Err("Thread.join: not an object ref".into()),
+                    };
+                    if let Some(handle) = jvm.thread_handles.lock().unwrap().remove(&obj_id) {
+                        handle.join().map_err(|_| "Thread.join: thread panicked".to_string())?;
+                    }
+                    return Ok(());
+                } else if is_thread_is_alive {
+                    let obj_id = match &objectref {
+                        JvmStackValue::ObjectRef(id) => *id,
+                        _ => return Err("Thread.isAlive: not an object ref".into()),
+                    };
+                    let is_alive = {
+                        let handles = jvm.thread_handles.lock().unwrap();
+                        if let Some(handle) = handles.get(&obj_id) {
+                            !handle.is_finished()
+                        } else {
+                            false
+                        }
+                    };
+                    caller_stack.push(JvmStackValue::Int(if is_alive { 1 } else { 0 }));
+                    return Ok(());
                 } else if is_thread_set_priority {
                     return Ok(());
                 }
@@ -1840,9 +1920,10 @@ impl JVM {
         descriptor: &str,
     ) -> Result<Option<(String, Vec<ConstantInfo>, Code)>, String> {
         let mut current_class = Some(class_name.to_string());
+        let state = jvm.state.lock().unwrap();
 
         while let Some(name) = current_class {
-            let Some(class_data) = jvm.classes.get(&name) else {
+            let Some(class_data) = state.classes.get(&name) else {
                 return Ok(None);
             };
 
@@ -1866,13 +1947,14 @@ impl JVM {
 
     fn class_extends(jvm: &JVM, class_name: &str, target_class_name: &str) -> bool {
         let mut current_class = Some(class_name.to_string());
+        let state = jvm.state.lock().unwrap();
 
         while let Some(name) = current_class {
             if name == target_class_name {
                 return true;
             }
 
-            let Some(class_data) = jvm.classes.get(&name) else {
+            let Some(class_data) = state.classes.get(&name) else {
                 return false;
             };
 
@@ -1916,7 +1998,7 @@ impl JVM {
         return key;
     }
 
-    pub fn allocate(&mut self, class_name: String) -> u32 {
+    pub fn allocate(&self, class_name: String) -> u32 {
         if class_name == "java/util/Vector" {
             let mut obj = JvmObject {
                 class_name: class_name.clone(),
@@ -1926,17 +2008,19 @@ impl JVM {
             obj.fields
                 .insert("container".to_string(), JvmStackValue::Vector(Vec::new()));
 
-            self.heap.push(HeapObject::Instance(obj));
+            let mut state = self.state.lock().unwrap();
+            state.heap.push(HeapObject::Instance(obj));
 
-            return (self.heap.len() - 1) as u32;
+            return (state.heap.len() - 1) as u32;
         }
 
         let mut fields = HashMap::new();
 
         // Walk up the inheritance tree to find all fields this object should have
         let mut current_class = Some(class_name.clone());
+        let state = self.state.lock().unwrap();
         while let Some(name) = current_class {
-            if let Some(class_data) = self.classes.get(&name) {
+            if let Some(class_data) = state.classes.get(&name) {
                 for field_info in &class_data.fields {
                     let descriptor =
                         JVM::resolve_utf8(field_info.descriptor_index, &class_data.const_pool);
@@ -1955,13 +2039,16 @@ impl JVM {
                 current_class = None;
             }
         }
+        drop(state); // Drop the lock before we mutate the heap
 
         let obj = HeapObject::Instance(JvmObject {
             class_name,
             fields: fields,
         });
-        self.heap.push(obj);
-        (self.heap.len() - 1) as u32 // The objectref
+        
+        let mut state = self.state.lock().unwrap();
+        state.heap.push(obj);
+        (state.heap.len() - 1) as u32 // The objectref
     }
 
     pub fn resolve_utf8(index: u16, pool: &[ConstantInfo]) -> String {
@@ -2214,7 +2301,7 @@ impl JVM {
         method_name: &str,
         descriptor: &str,
         args: &[JvmStackValue],
-        jvm: &mut JVM,
+        jvm: &JVM,
         stack: &mut Vec<JvmStackValue>, // We need this to push the return value!
     ) -> Result<(), String> {
         if class_name.starts_with("javax/microedition") {
@@ -2250,21 +2337,29 @@ impl JVM {
 
             return Ok(());
         } else if class_name == "java/lang/Thread" && method_name == "sleep" {
-            if let Some(JvmStackValue::Long(ms)) = stack.pop() {
-                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+            if let Some(JvmStackValue::Long(ms)) = args.first() {
+                std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
             }
             return Ok(());
         } else if class_name == "java/lang/System" && method_name == "currentTimeMillis" {
-            panic!("System.currentTimeMillis is not supported in this JVM implementation");
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            stack.push(JvmStackValue::Long(millis));
+            return Ok(());
         }
 
-        let class_data = jvm
-            .classes
-            .get(class_name)
-            .ok_or_else(|| format!("ClassDef not found in VM: {}", class_name))?;
+        let class_data = {
+            let state = jvm.state.lock().unwrap();
+            state.classes
+                .get(class_name)
+                .ok_or_else(|| format!("ClassDef not found in VM: {}", class_name))?
+                .clone()
+        };
 
         let method =
-            JVM::find_method_in_class(class_data, method_name, descriptor).ok_or_else(|| {
+            JVM::find_method_in_class(&class_data, method_name, descriptor).ok_or_else(|| {
                 format!(
                     "Static method not found: {}.{}{}",
                     class_name, method_name, descriptor
@@ -2296,7 +2391,7 @@ impl JVM {
         Ok(())
     }
 
-    pub fn paint(&mut self) -> Result<(), String> {
+    pub fn paint(&self) -> Result<(), String> {
         let disp = display::get_display(self);
 
         let displayable_res = display::get_displayable_obj(disp, self)?;
@@ -2304,8 +2399,9 @@ impl JVM {
             displayable_res.ok_or_else(|| "No displayable object set".to_string())?;
 
         let class_name = if let JvmStackValue::ObjectRef(id) = displayable_ref {
+            let state = self.state.lock().unwrap();
             if let HeapObject::Instance(inst) =
-                self.heap.get(id as usize).ok_or("Invalid heap reference")?
+                state.heap.get(id as usize).ok_or("Invalid heap reference")?
             {
                 inst.class_name.clone()
             } else {

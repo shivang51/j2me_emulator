@@ -12,7 +12,7 @@ use crate::jvm::JVM;
 pub struct App {
     window: Option<&'static Window>,
     pixels: Option<Pixels<'static>>,
-    pub jvm: Option<&'static mut JVM>,
+    pub jvm: Option<JVM>,
 }
 
 impl App {
@@ -29,15 +29,11 @@ impl App {
 
             let frame = pixels.frame_mut();
 
-            let resources = self
-                .jvm
-                .as_ref()
-                .unwrap()
-                .loaded_jar
-                .as_ref()
-                .unwrap()
-                .resources
-                .clone();
+            let resources = {
+                let jvm = self.jvm.as_ref().unwrap();
+                let state = jvm.state.lock().unwrap();
+                state.resources.clone()
+            };
 
             let mut p_x: u32 = 0;
             let mut p_y: u32 = 0;
@@ -64,11 +60,18 @@ impl App {
                 for (x, y, img_px) in img.pixels() {
                     let px = p_x + x;
                     let py = p_y + y;
+                    
+                    if px >= w || py >= h {
+                        continue;
+                    }
+                    
                     let px_idx = (py * w + px) as usize * 4;
-                    frame[px_idx] = img_px[0]; // R
-                    frame[px_idx + 1] = img_px[1]; // G
-                    frame[px_idx + 2] = img_px[2]; // B
-                    frame[px_idx + 3] = img_px[3]; // A
+                    if px_idx + 3 < frame.len() {
+                        frame[px_idx] = img_px[0]; // R
+                        frame[px_idx + 1] = img_px[1]; // G
+                        frame[px_idx + 2] = img_px[2]; // B
+                        frame[px_idx + 3] = img_px[3]; // A
+                    }
                 }
 
                 p_x += img.width() + 10;

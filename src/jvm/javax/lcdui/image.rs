@@ -8,7 +8,7 @@ pub fn handle_static_method(
     method_name: &str,
     descriptor: &str,
     args: &[JvmStackValue],
-    jvm: &mut JVM,
+    jvm: &JVM,
 ) -> Result<Option<JvmStackValue>, String> {
     match (method_name, descriptor) {
         ("createImage", "(Ljava/lang/String;)Ljavax/microedition/lcdui/Image;") => {
@@ -25,9 +25,19 @@ pub fn handle_virtual_method(
     objectref: JvmStackValue,
     method_name: &str,
     descriptor: &str,
-    jvm: &mut JVM,
+    jvm: &JVM,
 ) -> Result<Option<JvmStackValue>, String> {
-    let image = get_image_object(objectref, jvm)?;
+    let image_id = match objectref {
+        JvmStackValue::ObjectRef(id) => id,
+        JvmStackValue::Null => return Err("Image: NullPointerException".into()),
+        value => return Err(format!("Image: expected object reference, found {:?}", value)),
+    };
+
+    let state = jvm.state.lock().unwrap();
+    let image = state
+        .heap
+        .get(image_id as usize)
+        .ok_or_else(|| format!("Image: invalid heap reference: {}", image_id))?;
 
     match (method_name, descriptor) {
         ("getWidth", "()I") => get_int_field(image, &["width:I", "width:Int"]).map(Some),
@@ -39,7 +49,7 @@ pub fn handle_virtual_method(
     }
 }
 
-fn create_image(args: &[JvmStackValue], jvm: &mut JVM) -> Result<Option<JvmStackValue>, String> {
+fn create_image(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValue>, String> {
     let path = match args.get(0) {
         Some(JvmStackValue::String(path)) => path,
         Some(value) => {
@@ -52,11 +62,15 @@ fn create_image(args: &[JvmStackValue], jvm: &mut JVM) -> Result<Option<JvmStack
     };
 
     let resource_name = normalize_resource_path(path);
-    let (width, height) = jvm
-        .resources
-        .get(resource_name)
-        .and_then(|resource| png_dimensions(resource))
-        .unwrap_or((0, 0));
+    
+    let (width, height) = {
+        let state = jvm.state.lock().unwrap();
+        state
+            .resources
+            .get(resource_name)
+            .and_then(|resource| png_dimensions(resource))
+            .unwrap_or((0, 0))
+    };
 
     let mut fields = HashMap::new();
     fields.insert(
@@ -70,29 +84,14 @@ fn create_image(args: &[JvmStackValue], jvm: &mut JVM) -> Result<Option<JvmStack
         class_name: CLASS_NAME.to_string(),
         fields,
     });
-    jvm.heap.push(image_obj);
+    
+    let mut state = jvm.state.lock().unwrap();
+    state.heap.push(image_obj);
 
-    Ok(Some(JvmStackValue::ObjectRef((jvm.heap.len() - 1) as u32)))
+    Ok(Some(JvmStackValue::ObjectRef((state.heap.len() - 1) as u32)))
 }
 
-fn get_image_object(objectref: JvmStackValue, jvm: &mut JVM) -> Result<&mut HeapObject, String> {
-    let image_id = match objectref {
-        JvmStackValue::ObjectRef(id) => id,
-        JvmStackValue::Null => return Err("Image: NullPointerException".into()),
-        value => {
-            return Err(format!(
-                "Image: expected object reference, found {:?}",
-                value
-            ));
-        }
-    };
-
-    jvm.heap
-        .get_mut(image_id as usize)
-        .ok_or_else(|| format!("Image: invalid heap reference: {}", image_id))
-}
-
-fn get_int_field(image: &mut HeapObject, keys: &[&str]) -> Result<JvmStackValue, String> {
+fn get_int_field(image: &HeapObject, keys: &[&str]) -> Result<JvmStackValue, String> {
     let HeapObject::Instance(obj) = image else {
         return Err("Image: expected instance object".into());
     };
