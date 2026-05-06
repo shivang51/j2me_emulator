@@ -2,7 +2,13 @@ use std::collections::HashMap;
 
 use classfile_parser::constant_info::{ConstantInfo, FieldRefConstant, MethodRefConstant};
 
-use crate::{jvm::javax, services::jar_extractor::JarFileData};
+use crate::{
+    jvm::javax::{
+        lcdui::{display, game::game_canvas, image},
+        midlet,
+    },
+    services::jar_extractor::JarFileData,
+};
 
 #[derive(Debug, Clone)]
 pub enum JvmStackValue {
@@ -165,9 +171,8 @@ impl JVM {
 
                                     locals.push(objectref);
                                 }
-                                let res = JVM::run_frame(&code_attr.code, pool, &mut locals, self);
 
-                                return res;
+                                return JVM::run_frame(&code_attr.code, pool, &mut locals, self);
                             }
                         }
                     }
@@ -196,10 +201,10 @@ impl JVM {
             let opcode = bytecode[pc];
 
             // debug-out -> wrote for easy searching this line
-            println!(
-                "PC: {}, Opcode: {:02X}, Stack: {:?}, Locals: {:?}",
-                pc, opcode, stack, locals
-            );
+            // println!(
+            //     "PC: {}, Opcode: {:02X}, Stack: {:?}, Locals: {:?}",
+            //     pc, opcode, stack, locals
+            // );
 
             match opcode {
                 0x01 => {
@@ -1068,9 +1073,7 @@ impl JVM {
                         return Err("0xB7 - java.lang.NullPointerException".into());
                     }
 
-                    if class_name == "java/lang/Object" && method_name == "<init>" {
-                        println!("Skipping native java/lang/Object constructor");
-                    } else {
+                    if class_name != "java/lang/Object" || method_name != "<init>" {
                         // Execute the targeted method.
                         // In a full VM, this creates a new Frame.
                         println!(
@@ -1492,12 +1495,8 @@ impl JVM {
     ) -> Result<(), String> {
         if class_name.starts_with("javax/microedition") {
             if class_name == "javax/microedition/lcdui/Image" {
-                let return_value = javax::lcdui::image::handle_virtual_method(
-                    objectref,
-                    method_name,
-                    descriptor,
-                    jvm,
-                )?;
+                let return_value =
+                    image::handle_virtual_method(objectref, method_name, descriptor, jvm)?;
 
                 if let Some(val) = return_value {
                     caller_stack.push(val);
@@ -1506,13 +1505,8 @@ impl JVM {
                 return Ok(());
             }
             if class_name == "javax/microedition/lcdui/Display" {
-                let return_value = javax::lcdui::display::handle_virtual_method(
-                    objectref,
-                    method_name,
-                    descriptor,
-                    args,
-                    jvm,
-                )?;
+                let return_value =
+                    display::handle_virtual_method(objectref, method_name, descriptor, args, jvm)?;
 
                 if let Some(val) = return_value {
                     caller_stack.push(val);
@@ -1520,8 +1514,52 @@ impl JVM {
 
                 return Ok(());
             }
-            println!(
-                "[-] Skipping native method call to {}.{}{}",
+            if class_name == midlet::CLASS_NAME {
+                let return_value = midlet::handle_virtual_method(method_name, descriptor, args);
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling MIDlet method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == game_canvas::CLASS_NAME {
+                let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
+                    jvm.heap.get_mut(id as usize).ok_or_else(|| {
+                        format!(
+                            "GameCanvas method call with invalid object reference: {}",
+                            id
+                        )
+                    })?
+                } else {
+                    return Err("GameCanvas method call with non-reference object".into());
+                };
+
+                let instance = if let HeapObject::Instance(inst) = obj_ref {
+                    inst
+                } else {
+                    return Err("GameCanvas method call on non-instance object".into());
+                };
+
+                let return_value =
+                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args);
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling GameCanvas method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            panic!(
+                "[-] ExeVirtualMethod: Skipping virtual method call to {}.{}{}",
                 class_name, method_name, descriptor
             );
             return Ok(());
@@ -1598,10 +1636,24 @@ impl JVM {
             JVM::find_method_code_in_hierarchy(jvm, class_name, method_name, descriptor)?
         else {
             if JVM::class_extends(jvm, class_name, "javax/microedition/lcdui/game/GameCanvas") {
-                let return_value = javax::lcdui::game::game_canvas::handle_virtual_method(
-                    method_name,
-                    descriptor,
-                )?;
+                let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
+                    jvm.heap.get_mut(id as usize).ok_or_else(|| {
+                        format!(
+                            "GameCanvas method call with invalid object reference: {}",
+                            id
+                        )
+                    })?
+                } else {
+                    return Err("GameCanvas method call with non-reference object".into());
+                };
+
+                let instance = if let HeapObject::Instance(inst) = obj_ref {
+                    inst
+                } else {
+                    return Err("GameCanvas method call on non-instance object".into());
+                };
+                let return_value =
+                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args)?;
 
                 if let Some(val) = return_value {
                     caller_stack.push(val);
@@ -2087,8 +2139,7 @@ impl JVM {
     ) -> Result<(), String> {
         if class_name.starts_with("javax/microedition") {
             if class_name == "javax/microedition/lcdui/Image" {
-                let return_value =
-                    javax::lcdui::image::handle_static_method(method_name, descriptor, args, jvm)?;
+                let return_value = image::handle_static_method(method_name, descriptor, args, jvm)?;
 
                 if let Some(val) = return_value {
                     stack.push(val);
@@ -2097,12 +2148,8 @@ impl JVM {
                 return Ok(());
             }
             if class_name == "javax/microedition/lcdui/Display" {
-                let return_value = javax::lcdui::display::handle_static_method(
-                    method_name,
-                    descriptor,
-                    args,
-                    jvm,
-                )?;
+                let return_value =
+                    display::handle_static_method(method_name, descriptor, args, jvm)?;
 
                 if let Some(val) = return_value {
                     stack.push(val);
@@ -2111,7 +2158,7 @@ impl JVM {
                 return Ok(());
             }
             panic!(
-                "[-] Skipping native static method call to {}.{}{} | args = {:?}",
+                "[-] ExeStaticMethod - Skipping native static method call to {}.{}{} | args = {:?}",
                 class_name, method_name, descriptor, args
             );
         } else if class_name == "java/lang/String" {
