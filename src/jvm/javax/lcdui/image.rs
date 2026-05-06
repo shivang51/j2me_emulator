@@ -14,6 +14,9 @@ pub fn handle_static_method(
         ("createImage", "(Ljava/lang/String;)Ljavax/microedition/lcdui/Image;") => {
             create_image(args, jvm)
         }
+        ("createImage", "(II)Ljavax/microedition/lcdui/Image;") => {
+            create_image_ii(args, jvm)
+        }
         _ => Err(format!(
             "Unsupported Image static method: {}{}",
             method_name, descriptor
@@ -42,6 +45,10 @@ pub fn handle_virtual_method(
     match (method_name, descriptor) {
         ("getWidth", "()I") => get_int_field(image, &["width:I", "width:Int"]).map(Some),
         ("getHeight", "()I") => get_int_field(image, &["height:I", "height:Int"]).map(Some),
+        ("getGraphics", "()Ljavax/microedition/lcdui/Graphics;") => {
+            let handle = jvm.allocate("javax/microedition/lcdui/Graphics".to_string());
+            Ok(Some(JvmStackValue::ObjectRef(handle)))
+        }
         _ => Err(format!(
             "Unsupported Image instance method: {}{}",
             method_name, descriptor
@@ -120,4 +127,25 @@ fn png_dimensions(bytes: &[u8]) -> Option<(i32, i32)> {
     let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
 
     Some((width as i32, height as i32))
+}
+
+fn create_image_ii(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValue>, String> {
+    let width = match args.get(0) {
+        Some(JvmStackValue::Int(w)) => w,
+        _ => return Err("Image.createImage(II): missing/invalid width argument".into()),
+    };
+    let height = match args.get(1) {
+        Some(JvmStackValue::Int(h)) => h,
+        _ => return Err("Image.createImage(II): missing/invalid height argument".into()),
+    };
+
+    let mut state = jvm.state.lock().unwrap();
+    let instance = JvmObject {
+        class_name: CLASS_NAME.to_string(),
+        fields: HashMap::new(),
+    };
+    let image_id = state.heap.len() as u32;
+    state.heap.push(HeapObject::Instance(instance));
+
+    Ok(Some(JvmStackValue::ObjectRef(image_id)))
 }

@@ -141,7 +141,8 @@ impl JVM {
 
         let main_class = {
             let state = self.state.lock().unwrap();
-            state.classes
+            state
+                .classes
                 .get(&main_class_name)
                 .ok_or_else(|| format!("Main class not found: {}", main_class_name))?
                 .clone()
@@ -240,7 +241,10 @@ impl JVM {
 
             jvm_debug!(
                 "PC: {}, Opcode: {:02X}, Stack: {:?}, Locals: {:?}",
-                pc, opcode, stack, locals
+                pc,
+                opcode,
+                stack,
+                locals
             );
 
             match opcode {
@@ -446,9 +450,14 @@ impl JVM {
                                 }
 
                                 match &data[index as usize] {
-                                    JvmStackValue::Int(value) => stack.push(JvmStackValue::Int(*value)),
+                                    JvmStackValue::Int(value) => {
+                                        stack.push(JvmStackValue::Int(*value))
+                                    }
                                     value => {
-                                        return Err(format!("iaload: expected Int, found {:?}", value));
+                                        return Err(format!(
+                                            "iaload: expected Int, found {:?}",
+                                            value
+                                        ));
                                     }
                                 }
                             }
@@ -486,7 +495,8 @@ impl JVM {
 
                         jvm_debug!(
                             "aaload: arrayref points to heap index {}, heap object: {:?}",
-                            heap_idx, heap_obj
+                            heap_idx,
+                            heap_obj
                         );
 
                         match heap_obj {
@@ -497,7 +507,8 @@ impl JVM {
 
                                 jvm_debug!(
                                     "aaload: Retrieved value from array at index {}: | data: {:?}",
-                                    index, data,
+                                    index,
+                                    data,
                                 );
 
                                 let value = data[index as usize].clone();
@@ -509,7 +520,7 @@ impl JVM {
                                     | JvmStackValue::Vector(_) => stack.push(value),
                                     _ => {
                                         return Err(
-                                            "aaload: component at index is not a reference".into()
+                                            "aaload: component at index is not a reference".into(),
                                         );
                                     }
                                 }
@@ -865,7 +876,8 @@ impl JVM {
 
                     let val = {
                         let state = jvm.state.lock().unwrap();
-                        state.static_fields
+                        state
+                            .static_fields
                             .get(&key)
                             .cloned()
                             .ok_or_else(|| format!("Static field not found: {}", key))
@@ -955,12 +967,15 @@ impl JVM {
                             .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
                         if let HeapObject::Instance(obj) = obj {
-                            obj.fields.get(&field_name).ok_or_else(|| {
-                                format!(
-                                    "Field '{}' not found in object of class '{}'",
-                                    field_name, obj.class_name
-                                )
-                            })?.clone()
+                            obj.fields
+                                .get(&field_name)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "Field '{}' not found in object of class '{}'",
+                                        field_name, obj.class_name
+                                    )
+                                })?
+                                .clone()
                         } else {
                             return Err("getfield: Heap object is not an instance".into());
                         }
@@ -1082,15 +1097,14 @@ impl JVM {
                     } else {
                         let actual_class_name = {
                             let state = jvm.state.lock().unwrap();
-                            if let HeapObject::Instance(obj) = &state.heap
-                                [match objectref {
-                                    JvmStackValue::ObjectRef(id) => id as usize,
-                                    _ => {
-                                        return Err(
-                                            "invokevirtual: objectref is not a reference".into()
-                                        );
-                                    }
-                                }] {
+                            if let HeapObject::Instance(obj) = &state.heap[match objectref {
+                                JvmStackValue::ObjectRef(id) => id as usize,
+                                _ => {
+                                    return Err(
+                                        "invokevirtual: objectref is not a reference".into()
+                                    );
+                                }
+                            }] {
                                 obj.class_name.clone()
                             } else {
                                 class_name
@@ -1149,7 +1163,9 @@ impl JVM {
                         // In a full VM, this creates a new Frame.
                         jvm_debug!(
                             "invokespecial executing: {}.{}{}",
-                            class_name, method_name, descriptor
+                            class_name,
+                            method_name,
+                            descriptor
                         );
 
                         let res = JVM::execute_method(
@@ -1316,7 +1332,8 @@ impl JVM {
 
                     jvm_debug!(
                         "anewarray: component type = {} | count = {}",
-                        component_type, count
+                        component_type,
+                        count
                     );
 
                     let mut default_val = JvmStackValue::Null;
@@ -1381,12 +1398,72 @@ impl JVM {
                     jvm_debug!("Execution finished normally.");
                     return Ok(None);
                 }
+                0x85 => {
+                    // i2l
+                    let val = stack.pop().ok_or("i2l: stack underflow")?;
+                    if let JvmStackValue::Int(i) = val {
+                        stack.push(JvmStackValue::Long(i as i64));
+                    } else {
+                        return Err("i2l: expected Int".into());
+                    }
+                    pc += 1;
+                }
+                0x3D => {
+                    // istore_2
+                    let val = stack.pop().ok_or("istore_2: Stack underflow")?;
+                    if locals.len() < 3 {
+                        locals.resize(3, JvmStackValue::Null);
+                    }
+                    locals[2] = val;
+                    pc += 1;
+                }
+                0x71 => {
+                    // idiv
+                    let val2 = stack.pop().ok_or("idiv: stack underflow")?;
+                    let val1 = stack.pop().ok_or("idiv: stack underflow")?;
+                    if let (JvmStackValue::Int(v1), JvmStackValue::Int(v2)) = (val1, val2) {
+                        if v2 == 0 {
+                            return Err("idiv: division by zero".into());
+                        }
+                        stack.push(JvmStackValue::Int(v1 / v2));
+                    } else {
+                        return Err("idiv: expected Int".into());
+                    }
+                    pc += 1;
+                }
+                0x4E => {
+                    // astore_3
+                    let val = stack.pop().ok_or("astore_3: Stack underflow")?;
+                    if locals.len() < 4 {
+                        locals.resize(4, JvmStackValue::Null);
+                    }
+                    locals[3] = val;
+                    pc += 1;
+                }
+                0x15 => {
+                    // iload
+                    let index = bytecode[pc + 1] as usize;
+                    if index >= locals.len() {
+                        return Err(format!("iload: Invalid local index {}", index).into());
+                    }
+                    stack.push(locals[index].clone());
+                    pc += 2;
+                }
                 0xAC | 0xAF => {
                     // ireturn
                     let val = stack.pop().ok_or("return: Stack underflow")?;
 
                     jvm_debug!("Execution finished with return value: {:?}", val);
                     return Ok(Some(val));
+                }
+                0x37 => {
+                    // lstore_1
+                    let val = stack.pop().ok_or("lstore_1: stack underflow")?;
+                    if locals.len() < 2 {
+                        locals.resize(2, JvmStackValue::Null);
+                    }
+                    locals[1] = val;
+                    pc += 1;
                 }
                 _ => {
                     println!("Unknown Opcode: {:02X}", opcode);
@@ -1574,7 +1651,10 @@ impl JVM {
     ) -> Result<(), String> {
         jvm_debug!(
             "Executing method: {}.{}{} with args {:?}",
-            class_name, method_name, descriptor, args
+            class_name,
+            method_name,
+            descriptor,
+            args
         );
         if class_name.starts_with("javax/microedition") {
             if class_name == image::CLASS_NAME {
@@ -1626,7 +1706,10 @@ impl JVM {
                     let mut state = jvm.state.lock().unwrap();
                     let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
                         state.heap.get_mut(id as usize).ok_or_else(|| {
-                            format!("GameCanvas method call with invalid object reference: {}", id)
+                            format!(
+                                "GameCanvas method call with invalid object reference: {}",
+                                id
+                            )
                         })?
                     } else {
                         return Err("GameCanvas method call with non-reference object".into());
@@ -1744,7 +1827,10 @@ impl JVM {
                     let mut state = jvm.state.lock().unwrap();
                     let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
                         state.heap.get_mut(id as usize).ok_or_else(|| {
-                            format!("GameCanvas method call with invalid object reference: {}", id)
+                            format!(
+                                "GameCanvas method call with invalid object reference: {}",
+                                id
+                            )
                         })?
                     } else {
                         return Err("GameCanvas method call with non-reference object".into());
@@ -1792,7 +1878,10 @@ impl JVM {
                             &mut Vec::new(),
                         );
                         if let Err(e) = result {
-                            eprintln!("[JVM Thread Error] {}.run() failed: {}", class_name_owned, e);
+                            eprintln!(
+                                "[JVM Thread Error] {}.run() failed: {}",
+                                class_name_owned, e
+                            );
                         }
                     });
 
@@ -1806,7 +1895,9 @@ impl JVM {
                         _ => return Err("Thread.join: not an object ref".into()),
                     };
                     if let Some(handle) = jvm.thread_handles.lock().unwrap().remove(&obj_id) {
-                        handle.join().map_err(|_| "Thread.join: thread panicked".to_string())?;
+                        handle
+                            .join()
+                            .map_err(|_| "Thread.join: thread panicked".to_string())?;
                     }
                     return Ok(());
                 } else if is_thread_is_alive {
@@ -2045,7 +2136,7 @@ impl JVM {
             class_name,
             fields: fields,
         });
-        
+
         let mut state = self.state.lock().unwrap();
         state.heap.push(obj);
         (state.heap.len() - 1) as u32 // The objectref
@@ -2352,22 +2443,41 @@ impl JVM {
 
         let class_data = {
             let state = jvm.state.lock().unwrap();
-            state.classes
+            state
+                .classes
                 .get(class_name)
                 .ok_or_else(|| format!("ClassDef not found in VM: {}", class_name))?
                 .clone()
         };
 
-        let method =
-            JVM::find_method_in_class(&class_data, method_name, descriptor).ok_or_else(|| {
-                format!(
-                    "Static method not found: {}.{}{}",
-                    class_name, method_name, descriptor
-                )
-            })?;
+        let mut current_class_data = class_data.clone();
+        let mut method_opt =
+            JVM::find_method_in_class(&current_class_data, method_name, descriptor).cloned();
 
-        let code_attr =
-            JVM::get_code_attribute(&method, &class_data.const_pool).ok_or_else(|| {
+        while method_opt.is_none() {
+            let super_name = JVM::get_super_class_name(&current_class_data);
+            if let Some(s_name) = super_name {
+                let state = jvm.state.lock().unwrap();
+                if let Some(s_data) = state.classes.get(&s_name) {
+                    current_class_data = s_data.clone();
+                    method_opt =
+                        JVM::find_method_in_class(&current_class_data, method_name, descriptor)
+                            .cloned();
+                    continue;
+                }
+            }
+            break;
+        }
+
+        let method = method_opt.ok_or_else(|| {
+            format!(
+                "Method not found: {}.{}{}",
+                class_name, method_name, descriptor
+            )
+        })?;
+
+        let code_attr = JVM::get_code_attribute(&method, &current_class_data.const_pool)
+            .ok_or_else(|| {
                 "Static method has no Code attribute (is it abstract or native?)".to_string()
             })?;
 
@@ -2400,8 +2510,10 @@ impl JVM {
 
         let class_name = if let JvmStackValue::ObjectRef(id) = displayable_ref {
             let state = self.state.lock().unwrap();
-            if let HeapObject::Instance(inst) =
-                state.heap.get(id as usize).ok_or("Invalid heap reference")?
+            if let HeapObject::Instance(inst) = state
+                .heap
+                .get(id as usize)
+                .ok_or("Invalid heap reference")?
             {
                 inst.class_name.clone()
             } else {
