@@ -20,6 +20,8 @@ fn is_debug_enabled() -> bool {
 macro_rules! jvm_debug {
     ($($arg:tt)*) => {
         if is_debug_enabled() {
+            let thread_id = std::thread::current().id();
+            print!("[{:?}] ", thread_id);
             println!($($arg)*);
         }
     };
@@ -234,7 +236,6 @@ impl JVM {
                         }
                     }
                 }
-                println!("Method name: {}", name_info.utf8_string);
             }
         }
 
@@ -255,6 +256,11 @@ impl JVM {
 
         while pc < bytecode.len() {
             let opcode = bytecode[pc];
+
+            // Yield once in a while to let other threads (like the UI thread) get the state lock
+            if pc % 10 == 0 {
+                std::thread::yield_now();
+            }
 
             // debug-out added this line for easy finding this line ;)
             jvm_debug!(
@@ -1790,22 +1796,22 @@ impl JVM {
             if class_name == game_canvas::CLASS_NAME || class_name == "javax/microedition/lcdui/Canvas" {
                 let return_value = {
                     let mut state = jvm.state.lock().unwrap();
-                    let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
-                        state.heap.get_mut(id as usize).ok_or_else(|| {
-                            format!(
-                                "Canvas/GameCanvas method call with invalid object reference: {}",
-                                id
-                            )
-                        })?
+                    let heap_idx = if let JvmStackValue::ObjectRef(id) = objectref {
+                        id as usize
                     } else {
                         return Err("Canvas/GameCanvas method call with non-reference object".into());
                     };
-                    let instance = if let HeapObject::Instance(inst) = obj_ref {
-                        inst
+                    
+                    // Temporarily replace the object with a dummy to avoid multiple mutable borrows
+                    let mut obj = std::mem::replace(&mut state.heap[heap_idx], HeapObject::Array { element_type: "".into(), data: vec![] });
+                    let res = if let HeapObject::Instance(ref mut inst) = obj {
+                        game_canvas::handle_virtual_method(inst, method_name, descriptor, args, &mut state)
                     } else {
-                        return Err("Canvas/GameCanvas method call on non-instance object".into());
+                        Err("Canvas/GameCanvas method call on non-instance object or invalid ref".into())
                     };
-                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args, jvm)
+                    // Put it back!
+                    state.heap[heap_idx] = obj;
+                    res
                 };
 
                 if let Err(e) = &return_value {
@@ -1922,22 +1928,20 @@ impl JVM {
                 || JVM::class_extends(jvm, class_name, "javax/microedition/lcdui/Canvas") {
                 let return_value = {
                     let mut state = jvm.state.lock().unwrap();
-                    let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
-                        state.heap.get_mut(id as usize).ok_or_else(|| {
-                            format!(
-                                "Canvas/GameCanvas method call with invalid object reference: {}",
-                                id
-                            )
-                        })?
+                    let heap_idx = if let JvmStackValue::ObjectRef(id) = objectref {
+                        id as usize
                     } else {
                         return Err("Canvas/GameCanvas method call with non-reference object".into());
                     };
-                    let instance = if let HeapObject::Instance(inst) = obj_ref {
-                        inst
+                    
+                    let mut obj = std::mem::replace(&mut state.heap[heap_idx], HeapObject::Array { element_type: "".into(), data: vec![] });
+                    let res = if let HeapObject::Instance(ref mut inst) = obj {
+                        game_canvas::handle_virtual_method(inst, method_name, descriptor, args, &mut state)
                     } else {
-                        return Err("Canvas/GameCanvas method call on non-instance object".into());
+                        Err("Canvas/GameCanvas method call on non-instance object or invalid ref".into())
                     };
-                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args, jvm)?
+                    state.heap[heap_idx] = obj;
+                    res?
                 };
 
                 if let Some(val) = return_value {
@@ -1951,6 +1955,7 @@ impl JVM {
             let is_thread_set_priority = method_name == "setPriority" && descriptor == "(I)V";
             let is_thread_join = method_name == "join" && descriptor == "()V";
             let is_thread_is_alive = method_name == "isAlive" && descriptor == "()Z";
+            let is_thread_yield = method_name == "yield" && descriptor == "()V";
 
             if JVM::class_extends(jvm, class_name, "java/lang/Thread") {
                 if is_thread_start {
@@ -1987,14 +1992,16 @@ impl JVM {
                     jvm.thread_handles.lock().unwrap().insert(obj_id, handle);
 
                     return Ok(());
+                } else if is_thread_yield {
+                    return Ok(());
                 } else if is_thread_join {
                     let obj_id = match &objectref {
                         JvmStackValue::ObjectRef(id) => *id,
                         _ => return Err("Thread.join: not an object ref".into()),
                     };
-                    if let Some(handle) = jvm.thread_handles.lock().unwrap().remove(&obj_id) {
-                        handle
-                            .join()
+                    let handle = jvm.thread_handles.lock().unwrap().remove(&obj_id);
+                    if let Some(h) = handle {
+                        h.join()
                             .map_err(|_| "Thread.join: thread panicked".to_string())?;
                     }
                     return Ok(());
@@ -2192,56 +2199,54 @@ impl JVM {
     }
 
     pub fn allocate(&self, class_name: String) -> u32 {
-        if class_name == "java/util/Vector" {
-            let mut obj = JvmObject {
-                class_name: class_name.clone(),
-                fields: HashMap::new(),
-            };
-
-            obj.fields
-                .insert("container".to_string(), JvmStackValue::Vector(Vec::new()));
-
-            let mut state = self.state.lock().unwrap();
-            state.heap.push(HeapObject::Instance(obj));
-
-            return (state.heap.len() - 1) as u32;
-        }
-
-        let mut fields = HashMap::new();
-
-        // Walk up the inheritance tree to find all fields this object should have
-        let mut current_class = Some(class_name.clone());
-        let state = self.state.lock().unwrap();
-        while let Some(name) = current_class {
-            if let Some(class_data) = state.classes.get(&name) {
-                for field_info in &class_data.fields {
-                    let descriptor =
-                        JVM::resolve_utf8(field_info.descriptor_index, &class_data.const_pool);
-                    let default_val = if descriptor.starts_with('L') || descriptor.starts_with('[')
-                    {
-                        JvmStackValue::Null
-                    } else {
-                        JvmStackValue::Int(0)
-                    };
-                    let f_name = JVM::resolve_utf8(field_info.name_index, &class_data.const_pool);
-                    let key = format!("{}:{}", f_name, descriptor);
-                    fields.insert(key, default_val);
-                }
-                current_class = JVM::get_super_class_name(class_data);
+        let fields = {
+            let mut fields = HashMap::new();
+            if class_name == "java/util/Vector" {
+                fields.insert("container".to_string(), JvmStackValue::Vector(Vec::new()));
             } else {
-                current_class = None;
+                let mut current_class = Some(class_name.clone());
+                let state = self.state.lock().unwrap();
+                while let Some(name) = current_class {
+                    if let Some(class_data) = state.classes.get(&name) {
+                        for field_info in &class_data.fields {
+                            let descriptor = JVM::resolve_utf8(
+                                field_info.descriptor_index,
+                                &class_data.const_pool,
+                            );
+                            let default_val =
+                                if descriptor.starts_with('L') || descriptor.starts_with('[') {
+                                    JvmStackValue::Null
+                                } else {
+                                    JvmStackValue::Int(0)
+                                };
+                            let f_name =
+                                JVM::resolve_utf8(field_info.name_index, &class_data.const_pool);
+                            let key = format!("{}:{}", f_name, descriptor);
+                            fields.insert(key, default_val);
+                        }
+                        current_class = JVM::get_super_class_name(class_data);
+                    } else {
+                        current_class = None;
+                    }
+                }
             }
-        }
-        drop(state); // Drop the lock before we mutate the heap
-
-        let obj = HeapObject::Instance(JvmObject {
-            class_name,
-            fields: fields,
-        });
+            fields
+        };
 
         let mut state = self.state.lock().unwrap();
-        state.heap.push(obj);
-        (state.heap.len() - 1) as u32 // The objectref
+        JVM::allocate_internal(&mut state, class_name, fields)
+    }
+
+    pub fn allocate_internal(
+        state: &mut JvmState,
+        class_name: String,
+        fields: HashMap<String, JvmStackValue>,
+    ) -> u32 {
+        state.heap.push(HeapObject::Instance(JvmObject {
+            class_name,
+            fields,
+        }));
+        (state.heap.len() - 1) as u32
     }
 
     pub fn resolve_utf8(index: u16, pool: &[ConstantInfo]) -> String {
@@ -2628,19 +2633,26 @@ impl JVM {
     }
 
     pub fn paint(&self) -> Result<(), String> {
-        let disp = display::get_display(self);
+        static IS_PAINTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if IS_PAINTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
 
-        let displayable_res = display::get_displayable_obj(disp, self)?;
+        let res = self.paint_internal();
+        IS_PAINTING.store(false, std::sync::atomic::Ordering::SeqCst);
+        res
+    }
+
+    fn paint_internal(&self) -> Result<(), String> {
+        let disp = display::get_display_safe(self)?;
+
+        let displayable_res = display::get_displayable_obj_safe(disp, self)?;
         let displayable_ref =
             displayable_res.ok_or_else(|| "No displayable object set".to_string())?;
 
         let class_name = if let JvmStackValue::ObjectRef(id) = displayable_ref {
-            let state = self.state.lock().unwrap();
-            if let HeapObject::Instance(inst) = state
-                .heap
-                .get(id as usize)
-                .ok_or("Invalid heap reference")?
-            {
+            let state = self.state.try_lock().map_err(|_| "JVM state busy (paint)")?;
+            if let Some(HeapObject::Instance(inst)) = state.heap.get(id as usize) {
                 inst.class_name.clone()
             } else {
                 return Err("Displayable is not an instance".into());
@@ -2649,7 +2661,11 @@ impl JVM {
             return Err("Displayable is not an object ref".into());
         };
 
-        let graphics_handle = self.allocate(graphics::CLASS_NAME.to_string());
+        let fields = HashMap::new();
+        let graphics_handle = {
+            let mut state = self.state.try_lock().map_err(|_| "JVM state busy (allocate)")?;
+            JVM::allocate_internal(&mut state, graphics::CLASS_NAME.to_string(), fields)
+        };
 
         return JVM::execute_method(
             displayable_ref,

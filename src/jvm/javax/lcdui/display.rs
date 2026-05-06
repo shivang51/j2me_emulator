@@ -51,13 +51,23 @@ pub fn get_displayable_obj(
     objectref: JvmStackValue,
     jvm: &JVM,
 ) -> Result<Option<JvmStackValue>, String> {
+    get_displayable_obj_safe(objectref, jvm)
+}
+
+pub fn get_displayable_obj_safe(
+    objectref: JvmStackValue,
+    jvm: &JVM,
+) -> Result<Option<JvmStackValue>, String> {
     let display_id = match objectref {
         JvmStackValue::ObjectRef(id) => id,
         JvmStackValue::Null => return Err("Display: NullPointerException".into()),
         value => return Err(format!("Display: expected object reference, found {:?}", value)),
     };
 
-    let state = jvm.state.lock().unwrap();
+    let state = jvm
+        .state
+        .try_lock()
+        .map_err(|_| "JVM state busy (get_displayable_obj)")?;
     let display = state
         .heap
         .get(display_id as usize)
@@ -77,7 +87,7 @@ pub fn get_displayable_obj(
 
 pub fn get_display(jvm: &JVM) -> JvmStackValue {
     let mut state = jvm.state.lock().unwrap();
-    
+
     if let Some(existing) = state.static_fields.get(SINGLETON_FIELD) {
         return existing.clone();
     }
@@ -91,10 +101,37 @@ pub fn get_display(jvm: &JVM) -> JvmStackValue {
     }));
 
     let objectref = JvmStackValue::ObjectRef((state.heap.len() - 1) as u32);
-    state.static_fields
+    state
+        .static_fields
         .insert(SINGLETON_FIELD.to_string(), objectref.clone());
 
     objectref
+}
+
+pub fn get_display_safe(jvm: &JVM) -> Result<JvmStackValue, String> {
+    let mut state = jvm
+        .state
+        .try_lock()
+        .map_err(|_| "JVM state busy (get_display)")?;
+
+    if let Some(existing) = state.static_fields.get(SINGLETON_FIELD) {
+        return Ok(existing.clone());
+    }
+
+    let mut fields = HashMap::new();
+    fields.insert(CURRENT_FIELD.to_string(), JvmStackValue::Null);
+
+    state.heap.push(HeapObject::Instance(JvmObject {
+        class_name: CLASS_NAME.to_string(),
+        fields,
+    }));
+
+    let objectref = JvmStackValue::ObjectRef((state.heap.len() - 1) as u32);
+    state
+        .static_fields
+        .insert(SINGLETON_FIELD.to_string(), objectref.clone());
+
+    Ok(objectref)
 }
 
 fn set_current(

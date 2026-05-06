@@ -33,8 +33,14 @@ pub struct App {
 
 impl App {
     fn draw(&mut self) {
+        let now = std::time::Instant::now();
         if let Some(jvm) = &mut self.jvm {
-            let _ = jvm.paint();
+            println!("[{:?}] [App] Calling jvm.paint()", now);
+            let res = jvm.paint();
+            if let Err(e) = res {
+                println!("[{:?}] [App] jvm.paint() failed: {}", std::time::Instant::now(), e);
+            }
+            println!("[{:?}] [App] jvm.paint() returned after {:?}", std::time::Instant::now(), now.elapsed());
         }
 
         let mut draw_state = DRAW_STATE.lock().unwrap();
@@ -66,29 +72,33 @@ impl ApplicationHandler for App {
 
         self.window = Some(window_ref);
 
-        let mut draw_state = DRAW_STATE.lock().unwrap();
-        draw_state.pixels = Some(Pixels::new(size.width, size.height, surface).unwrap());
+        if size.width > 0 && size.height > 0 {
+            let mut draw_state = DRAW_STATE.lock().unwrap();
+            draw_state.pixels = Some(Pixels::new(size.width, size.height, surface).unwrap());
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
-                event_loop.exit();
+                std::process::exit(0);
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
             }
             WindowEvent::Resized(new_size) => {
-                println!("Window resized to {}x{}", new_size.width, new_size.height);
-                let mut draw_state = DRAW_STATE.lock().unwrap();
-                if let Some(pixels) = &mut draw_state.pixels {
-                    pixels
-                        .resize_surface(new_size.width, new_size.height)
-                        .unwrap();
-                }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                if new_size.width > 0 && new_size.height > 0 {
+                    println!("Window resized to {}x{}", new_size.width, new_size.height);
+                    let mut draw_state = DRAW_STATE.lock().unwrap();
+                    if let Some(pixels) = &mut draw_state.pixels {
+                        pixels
+                            .resize_surface(new_size.width, new_size.height)
+                            .unwrap();
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
             _ => {}
