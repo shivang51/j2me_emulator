@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::panic;
 use std::sync::{Arc, Mutex};
 
 use classfile_parser::constant_info::{ConstantInfo, FieldRefConstant, MethodRefConstant};
@@ -97,6 +98,18 @@ impl JVM {
         state.static_fields.insert(
             "java/lang/System.out:Ljava/io/PrintStream;".to_string(),
             JvmStackValue::ObjectRef(999),
+        );
+
+        // creating java/lang/runtime instance
+
+        let runtime_instance = JvmObject {
+            class_name: "java/lang/Runtime".to_string(),
+            fields: HashMap::new(),
+        };
+        state.heap.push(HeapObject::Instance(runtime_instance));
+        state.static_fields.insert(
+            "java/lang/Runtime.getRuntime:()Ljava/lang/Runtime;".to_string(),
+            JvmStackValue::ObjectRef(0),
         );
 
         JVM {
@@ -239,6 +252,7 @@ impl JVM {
         while pc < bytecode.len() {
             let opcode = bytecode[pc];
 
+            // debug-out added this line for easy finding this line ;)
             jvm_debug!(
                 "PC: {}, Opcode: {:02X}, Stack: {:?}, Locals: {:?}",
                 pc,
@@ -734,6 +748,25 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x69 => {
+                    // lmul
+                    let val2 = stack.pop().ok_or("lmul: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("lmul: Stack underflow for val1")?;
+
+                    if let (JvmStackValue::Long(l1), JvmStackValue::Long(l2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Long(l1 * l2));
+                    } else {
+                        return Err(format!(
+                            "lmul: Expected two Longs on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+
+                    pc += 1;
+                }
                 0x6c => {
                     // idiv
                     let val2 = stack.pop().ok_or("idiv: Stack underflow for val2")?;
@@ -749,6 +782,28 @@ impl JVM {
                     } else {
                         return Err(format!(
                             "idiv: Expected two Ints on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+
+                    pc += 1;
+                }
+                0x6d => {
+                    //ldiv
+                    let val2 = stack.pop().ok_or("ldiv: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("ldiv: Stack underflow for val1")?;
+
+                    if let (JvmStackValue::Long(l1), JvmStackValue::Long(l2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        if l2 == 0 {
+                            return Err("java.lang.ArithmeticException: Division by zero".into());
+                        }
+                        stack.push(JvmStackValue::Long(l1 / l2));
+                    } else {
+                        return Err(format!(
+                            "ldiv: Expected two Longs on stack, found {:?} and {:?}",
                             val1, val2
                         )
                         .into());
@@ -778,7 +833,32 @@ impl JVM {
 
                     pc += 3;
                 }
+                0x94 => {
+                    // lcmp
+                    let val2 = stack.pop().ok_or("lcmp: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("lcmp: Stack underflow for val1")?;
 
+                    if let (JvmStackValue::Long(l1), JvmStackValue::Long(l2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        let result = if l1 < l2 {
+                            -1
+                        } else if l1 > l2 {
+                            1
+                        } else {
+                            0
+                        };
+                        stack.push(JvmStackValue::Int(result));
+                    } else {
+                        return Err(format!(
+                            "lcmp: Expected two Longs on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+
+                    pc += 1;
+                }
                 0x99..=0x9E => {
                     // ifeq, ifne, iflt, ifge, ifgt, ifle
                     let opcode = bytecode[pc];
@@ -1418,17 +1498,25 @@ impl JVM {
                     pc += 1;
                 }
                 0x71 => {
-                    // idiv
-                    let val2 = stack.pop().ok_or("idiv: stack underflow")?;
-                    let val1 = stack.pop().ok_or("idiv: stack underflow")?;
-                    if let (JvmStackValue::Int(v1), JvmStackValue::Int(v2)) = (val1, val2) {
-                        if v2 == 0 {
-                            return Err("idiv: division by zero".into());
+                    // lrem
+                    let val2 = stack.pop().ok_or("lrem: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("lrem: Stack underflow for val1")?;
+
+                    if let (JvmStackValue::Long(l1), JvmStackValue::Long(l2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        if l2 == 0 {
+                            return Err("java.lang.ArithmeticException: Division by zero".into());
                         }
-                        stack.push(JvmStackValue::Int(v1 / v2));
+                        stack.push(JvmStackValue::Long(l1 % l2));
                     } else {
-                        return Err("idiv: expected Int".into());
+                        return Err(format!(
+                            "lrem: Expected two Longs on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
                     }
+
                     pc += 1;
                 }
                 0x4E => {
@@ -1817,6 +1905,16 @@ impl JVM {
             }
 
             return Ok(());
+        } else if class_name == "java/lang/Runtime" {
+            let res = JVM::handle_runtime_fns(method_name, descriptor, args);
+            if let Err(e) = res {
+                return Err(format!("Error handling Runtime method: {}", e).into());
+            }
+            if let Some(val) = res.unwrap() {
+                caller_stack.push(val);
+            }
+
+            return Ok(());
         }
 
         let Some((_resolved_class_name, const_pool, code_attr)) =
@@ -1882,6 +1980,7 @@ impl JVM {
                                 "[JVM Thread Error] {}.run() failed: {}",
                                 class_name_owned, e
                             );
+                            panic!("Thread execution failed");
                         }
                     });
 
@@ -1921,7 +2020,7 @@ impl JVM {
             }
 
             return Err(format!(
-                "Method not found: {}.{}{}",
+                "[ExecMethod] Method not found: {}.{}{}",
                 class_name, method_name, descriptor
             ));
         };
@@ -2439,6 +2538,18 @@ impl JVM {
                 .as_millis() as i64;
             stack.push(JvmStackValue::Long(millis));
             return Ok(());
+        } else if class_name == "java/lang/Runtime" {
+            let res = JVM::handle_runtime_fns(method_name, descriptor, args);
+
+            if let Err(e) = &res {
+                return Err(format!("Error handling Runtime method: {}", e).into());
+            }
+
+            if let Some(val) = res.unwrap() {
+                stack.push(val);
+            }
+
+            return Ok(());
         }
 
         let class_data = {
@@ -2534,5 +2645,34 @@ impl JVM {
             self,
             &mut Vec::new(),
         );
+    }
+
+    fn handle_runtime_fns(
+        method: &str,
+        descriptor: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        match (method, descriptor) {
+            ("getRuntime", "()Ljava/lang/Runtime;") => {
+                // We can return any dummy objectref here, since we handle all Runtime methods natively
+                Ok(Some(JvmStackValue::ObjectRef(0)))
+            }
+            ("freeMemory", "()J") => {
+                // Return a dummy value, since we don't actually track memory usage
+                Ok(Some(JvmStackValue::Long(1024 * 1024 * 100))) // 100 MB free
+            }
+            ("totalMemory", "()J") => {
+                // Return a dummy value, since we don't actually track memory usage
+                Ok(Some(JvmStackValue::Long(1024 * 1024 * 200))) // 200 MB total
+            }
+            ("maxMemory", "()J") => {
+                // Return a dummy value, since we don't actually track memory usage
+                Ok(Some(JvmStackValue::Long(1024 * 1024 * 500))) // 500 MB max
+            }
+            _ => Err(format!(
+                "Unsupported Runtime method: {}{}",
+                method, descriptor
+            )),
+        }
     }
 }

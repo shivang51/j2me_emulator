@@ -25,6 +25,7 @@ pub fn handle_virtual_method(
         }
         ("getWidth", "()I") => Ok(Some(JvmStackValue::Int(DEFAULT_WIDTH))),
         ("getHeight", "()I") => Ok(Some(JvmStackValue::Int(DEFAULT_HEIGHT))),
+        ("getKeyStates", "()I") => Ok(Some(JvmStackValue::Int(0))), // No keys pressed
         ("setFullScreenMode", "(Z)V") => Ok(None),
         _ => Err(format!(
             "Unsupported GameCanvas instance method: {}{}",
