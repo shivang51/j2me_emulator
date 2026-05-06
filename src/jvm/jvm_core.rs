@@ -201,7 +201,8 @@ impl JVM {
                                         format!("Failed to parse Code attribute: {:?}", e)
                                     })?;
 
-                                let mut locals: Vec<JvmStackValue> = vec![];
+                                let mut locals =
+                                   vec![JvmStackValue::Null; code_attr.max_locals as usize];
                                 if main_name != "main" {
                                     println!(
                                         "Executing entry point method '{}' instead of 'main'",
@@ -222,10 +223,13 @@ impl JVM {
                                         &mut constructor_stack,
                                     )?;
 
-                                    locals.push(objectref);
+                                    if !locals.is_empty() {
+                                        locals[0] = objectref;
+                                    }
                                 }
 
                                 return JVM::run_frame(&code_attr.code, pool, &mut locals, self);
+
                             }
                         }
                     }
@@ -1290,23 +1294,17 @@ impl JVM {
                     }
 
                     args.reverse(); // Restore original argument order
-                    if class_name == "java/lang/System" && method_name == "currentTimeMillis" {
-                        panic!(
-                            "System.currentTimeMillis is not supported in this JVM implementation"
-                        );
-                    } else {
-                        let res = JVM::execute_static_method(
-                            &class_name,
-                            &method_name,
-                            &descriptor,
-                            &args,
-                            jvm,
-                            &mut stack,
-                        );
+                    let res = JVM::execute_static_method(
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                        &args,
+                        jvm,
+                        &mut stack,
+                    );
 
-                        if let Err(e) = res {
-                            return Err(format!("Error executing static method: {}", e).into());
-                        }
+                    if let Err(e) = res {
+                        return Err(format!("Error executing static method: {}", e).into());
                     }
 
                     pc += 3;
@@ -1789,29 +1787,29 @@ impl JVM {
 
                 return Ok(());
             }
-            if class_name == game_canvas::CLASS_NAME {
+            if class_name == game_canvas::CLASS_NAME || class_name == "javax/microedition/lcdui/Canvas" {
                 let return_value = {
                     let mut state = jvm.state.lock().unwrap();
                     let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
                         state.heap.get_mut(id as usize).ok_or_else(|| {
                             format!(
-                                "GameCanvas method call with invalid object reference: {}",
+                                "Canvas/GameCanvas method call with invalid object reference: {}",
                                 id
                             )
                         })?
                     } else {
-                        return Err("GameCanvas method call with non-reference object".into());
+                        return Err("Canvas/GameCanvas method call with non-reference object".into());
                     };
                     let instance = if let HeapObject::Instance(inst) = obj_ref {
                         inst
                     } else {
-                        return Err("GameCanvas method call on non-instance object".into());
+                        return Err("Canvas/GameCanvas method call on non-instance object".into());
                     };
-                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args)
+                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args, jvm)
                 };
 
                 if let Err(e) = &return_value {
-                    return Err(format!("Error handling GameCanvas method: {}", e).into());
+                    return Err(format!("Error handling Canvas/GameCanvas method: {}", e).into());
                 }
 
                 if let Some(val) = return_value.unwrap() {
@@ -1920,25 +1918,26 @@ impl JVM {
         let Some((_resolved_class_name, const_pool, code_attr)) =
             JVM::find_method_code_in_hierarchy(jvm, class_name, method_name, descriptor)?
         else {
-            if JVM::class_extends(jvm, class_name, game_canvas::CLASS_NAME) {
+            if JVM::class_extends(jvm, class_name, game_canvas::CLASS_NAME) 
+                || JVM::class_extends(jvm, class_name, "javax/microedition/lcdui/Canvas") {
                 let return_value = {
                     let mut state = jvm.state.lock().unwrap();
                     let obj_ref = if let JvmStackValue::ObjectRef(id) = objectref {
                         state.heap.get_mut(id as usize).ok_or_else(|| {
                             format!(
-                                "GameCanvas method call with invalid object reference: {}",
+                                "Canvas/GameCanvas method call with invalid object reference: {}",
                                 id
                             )
                         })?
                     } else {
-                        return Err("GameCanvas method call with non-reference object".into());
+                        return Err("Canvas/GameCanvas method call with non-reference object".into());
                     };
                     let instance = if let HeapObject::Instance(inst) = obj_ref {
                         inst
                     } else {
-                        return Err("GameCanvas method call on non-instance object".into());
+                        return Err("Canvas/GameCanvas method call on non-instance object".into());
                     };
-                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args)?
+                    game_canvas::handle_virtual_method(instance, method_name, descriptor, args, jvm)?
                 };
 
                 if let Some(val) = return_value {
@@ -2027,11 +2026,15 @@ impl JVM {
 
         let mut locals = vec![JvmStackValue::Null; code_attr.max_locals as usize];
 
-        locals[0] = objectref.clone();
+        if !locals.is_empty() {
+            locals[0] = objectref.clone();
+        }
 
         let mut local_idx = 1;
         for arg in args {
-            locals[local_idx] = arg.clone();
+            if local_idx < locals.len() {
+                locals[local_idx] = arg.clone();
+            }
 
             match arg {
                 JvmStackValue::Long(_) | JvmStackValue::Double(_) => {
@@ -2594,8 +2597,20 @@ impl JVM {
 
         let mut locals = vec![JvmStackValue::Null; code_attr.max_locals as usize];
 
-        for (i, arg) in args.iter().enumerate() {
-            locals[i] = arg.clone();
+        let mut local_idx = 0;
+        for arg in args {
+            if local_idx < locals.len() {
+                locals[local_idx] = arg.clone();
+            }
+
+            match arg {
+                JvmStackValue::Long(_) | JvmStackValue::Double(_) => {
+                    local_idx += 2;
+                }
+                _ => {
+                    local_idx += 1;
+                }
+            }
         }
 
         let return_value = JVM::run_frame(
