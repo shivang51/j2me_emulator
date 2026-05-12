@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use image::GenericImageView;
 use parking_lot::Mutex;
-use pixels::wgpu::Color;
+use pixels::wgpu::{self, Color};
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -11,19 +11,19 @@ use winit::window::{Window, WindowId};
 
 use crate::jvm::JVM;
 
-struct DrawState {
+pub struct DrawState {
     pub pixels: Option<Pixels<'static>>,
 }
 
 impl DrawState {
-    pub fn clear(&mut self) {
+    pub fn clear_color(&mut self, color: wgpu::Color) {
         if let Some(pixels) = &mut self.pixels {
-            pixels.clear_color(Color::BLACK);
+            pixels.clear_color(color);
         }
     }
 }
 
-static DRAW_STATE: LazyLock<Mutex<DrawState>> =
+pub static DRAW_STATE: LazyLock<Mutex<DrawState>> =
     LazyLock::new(|| Mutex::new(DrawState { pixels: None }));
 
 #[derive(Default)]

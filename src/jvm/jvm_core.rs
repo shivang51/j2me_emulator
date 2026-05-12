@@ -1,7 +1,7 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::panic;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use classfile_parser::constant_info::{ConstantInfo, FieldRefConstant, MethodRefConstant};
 
@@ -272,6 +272,8 @@ impl JVM {
                 stack,
                 locals
             );
+
+            // https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-6.html
 
             match opcode {
                 0x01 => {
@@ -754,6 +756,24 @@ impl JVM {
                     } else {
                         return Err(format!(
                             "isub: Expected two Ints on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
+                0x65 => {
+                    // lsub
+                    let val2 = stack.pop().ok_or("lsub: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("lsub: Stack underflow for val1")?;
+
+                    if let (JvmStackValue::Long(l1), JvmStackValue::Long(l2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Long(l1 - l2));
+                    } else {
+                        return Err(format!(
+                            "lsub: Expected two Longs on stack, found {:?} and {:?}",
                             val1, val2
                         )
                         .into());
@@ -1503,6 +1523,28 @@ impl JVM {
                     locals[2] = val;
                     pc += 1;
                 }
+                0x70 => {
+                    // irem
+                    let val2 = stack.pop().ok_or("irem: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("irem: Stack underflow for val1")?;
+
+                    if let (JvmStackValue::Int(i1), JvmStackValue::Int(i2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        if i2 == 0 {
+                            return Err("java.lang.ArithmeticException: Division by zero".into());
+                        }
+                        stack.push(JvmStackValue::Int(i1 % i2));
+                    } else {
+                        return Err(format!(
+                            "irem: Expected two Ints on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+
+                    pc += 1;
+                }
                 0x71 => {
                     // lrem
                     let val2 = stack.pop().ok_or("lrem: Stack underflow for val2")?;
@@ -1542,6 +1584,67 @@ impl JVM {
                     }
                     stack.push(locals[index].clone());
                     pc += 2;
+                }
+                0x16 => {
+                    // lload
+                    let index = bytecode[pc + 1] as usize;
+                    if index >= locals.len() {
+                        return Err(format!("lload: Invalid local index {}", index).into());
+                    }
+                    stack.push(locals[index].clone());
+                    pc += 2;
+                }
+                0xAA => {
+                    // tableswitch
+                    let opcode_pc = pc;
+                    let aligned_pc = (pc + 4) & !3;
+
+                    if aligned_pc + 12 > bytecode.len() {
+                        return Err("tableswitch: bytecode truncated".into());
+                    }
+
+                    let default_offset = i32::from_be_bytes([
+                        bytecode[aligned_pc],
+                        bytecode[aligned_pc + 1],
+                        bytecode[aligned_pc + 2],
+                        bytecode[aligned_pc + 3],
+                    ]);
+                    let low = i32::from_be_bytes([
+                        bytecode[aligned_pc + 4],
+                        bytecode[aligned_pc + 5],
+                        bytecode[aligned_pc + 6],
+                        bytecode[aligned_pc + 7],
+                    ]);
+                    let high = i32::from_be_bytes([
+                        bytecode[aligned_pc + 8],
+                        bytecode[aligned_pc + 9],
+                        bytecode[aligned_pc + 10],
+                        bytecode[aligned_pc + 11],
+                    ]);
+
+                    let index = match stack.pop().ok_or("tableswitch: stack underflow")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("tableswitch: expected Int on stack".into()),
+                    };
+
+                    let offset = if index < low || index > high {
+                        default_offset
+                    } else {
+                        let table_index = (index - low) as usize;
+                        let entry_pc = aligned_pc + 12 + table_index * 4;
+                        if entry_pc + 4 > bytecode.len() {
+                            return Err("tableswitch: jump table truncated".into());
+                        }
+                        i32::from_be_bytes([
+                            bytecode[entry_pc],
+                            bytecode[entry_pc + 1],
+                            bytecode[entry_pc + 2],
+                            bytecode[entry_pc + 3],
+                        ])
+                    };
+
+                    pc = (opcode_pc as i32 + offset) as usize;
+                    continue;
                 }
                 0xAC | 0xAF => {
                     // ireturn
@@ -2691,9 +2794,7 @@ impl JVM {
             displayable_res.ok_or_else(|| "No displayable object set".to_string())?;
 
         let class_name = if let JvmStackValue::ObjectRef(id) = displayable_ref {
-            let state = self
-                .state
-                .lock();
+            let state = self.state.lock();
             if let Some(HeapObject::Instance(inst)) = state.heap.get(id as usize) {
                 inst.class_name.clone()
             } else {
@@ -2705,9 +2806,7 @@ impl JVM {
 
         let fields = HashMap::new();
         let graphics_handle = {
-            let mut state = self
-                .state
-                .lock();
+            let mut state = self.state.lock();
             JVM::allocate_internal(&mut state, graphics::CLASS_NAME.to_string(), fields)
         };
 

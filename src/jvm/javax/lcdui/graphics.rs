@@ -1,4 +1,6 @@
-use crate::jvm::jvm_core::JvmStackValue;
+use pixels::wgpu;
+
+use crate::{app::DRAW_STATE, jvm::jvm_core::JvmStackValue};
 
 pub const CLASS_NAME: &str = "javax/microedition/lcdui/Graphics";
 
@@ -19,6 +21,30 @@ pub fn handle_virtual_method(
                 "[+] Graphics.setColor called with color #{:06X}",
                 color & 0xFFFFFF
             );
+
+            return Ok(None);
+        }
+        ("setColor", "(III)V") => {
+            let mut color = wgpu::Color::WHITE;
+            color.r = match args.get(0) {
+                Some(JvmStackValue::Int(c)) => *c as f64,
+                _ => return Err("Graphics.setColor(III)V: expected int argument".into()),
+            };
+
+            color.g = match args.get(1) {
+                Some(JvmStackValue::Int(c)) => *c as f64,
+                _ => return Err("Graphics.setColor(III)V: expected int argument".into()),
+            };
+
+            color.b = match args.get(2) {
+                Some(JvmStackValue::Int(c)) => *c as f64,
+                _ => return Err("Graphics.setColor(III)V: expected int argument".into()),
+            };
+
+            eprintln!("Settin color to ({},{},{})", color.r, color.g, color.b);
+            let mut draw_state = DRAW_STATE.lock();
+
+            draw_state.clear_color(color);
 
             return Ok(None);
         }

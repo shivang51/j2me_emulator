@@ -14,9 +14,7 @@ pub fn handle_static_method(
         ("createImage", "(Ljava/lang/String;)Ljavax/microedition/lcdui/Image;") => {
             create_image(args, jvm)
         }
-        ("createImage", "(II)Ljavax/microedition/lcdui/Image;") => {
-            create_image_ii(args, jvm)
-        }
+        ("createImage", "(II)Ljavax/microedition/lcdui/Image;") => create_image_ii(args, jvm),
         _ => Err(format!(
             "Unsupported Image static method: {}{}",
             method_name, descriptor
@@ -33,7 +31,12 @@ pub fn handle_virtual_method(
     let image_id = match objectref {
         JvmStackValue::ObjectRef(id) => id,
         JvmStackValue::Null => return Err("Image: NullPointerException".into()),
-        value => return Err(format!("Image: expected object reference, found {:?}", value)),
+        value => {
+            return Err(format!(
+                "Image: expected object reference, found {:?}",
+                value
+            ));
+        }
     };
 
     let mut state = jvm.state.lock();
@@ -73,7 +76,7 @@ fn create_image(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValu
     };
 
     let resource_name = normalize_resource_path(path);
-    
+
     let (width, height) = {
         let state = jvm.state.lock();
         state
@@ -95,11 +98,13 @@ fn create_image(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValu
         class_name: CLASS_NAME.to_string(),
         fields,
     });
-    
+
     let mut state = jvm.state.lock();
     state.heap.push(image_obj);
 
-    Ok(Some(JvmStackValue::ObjectRef((state.heap.len() - 1) as u32)))
+    Ok(Some(JvmStackValue::ObjectRef(
+        (state.heap.len() - 1) as u32,
+    )))
 }
 
 fn get_int_field(image: &HeapObject, keys: &[&str]) -> Result<JvmStackValue, String> {
@@ -144,10 +149,19 @@ fn create_image_ii(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackV
     };
 
     let mut state = jvm.state.lock();
-    let instance = JvmObject {
+    let mut instance = JvmObject {
         class_name: CLASS_NAME.to_string(),
         fields: HashMap::new(),
     };
+
+    instance
+        .fields
+        .insert("width:I".to_string(), JvmStackValue::Int(*width));
+
+    instance
+        .fields
+        .insert("height:I".to_string(), JvmStackValue::Int(*height));
+
     let image_id = state.heap.len() as u32;
     state.heap.push(HeapObject::Instance(instance));
 
