@@ -1,8 +1,7 @@
 use std::sync::LazyLock;
 
-use image::GenericImageView;
 use parking_lot::Mutex;
-use pixels::wgpu::{self, Color};
+use pixels::wgpu::Color;
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -13,18 +12,17 @@ use crate::jvm::JVM;
 
 pub struct DrawState {
     pub pixels: Option<Pixels<'static>>,
+    pub width: u32,
+    pub height: u32,
 }
 
-impl DrawState {
-    pub fn clear_color(&mut self, color: wgpu::Color) {
-        if let Some(pixels) = &mut self.pixels {
-            pixels.clear_color(color);
-        }
-    }
-}
-
-pub static DRAW_STATE: LazyLock<Mutex<DrawState>> =
-    LazyLock::new(|| Mutex::new(DrawState { pixels: None }));
+pub static DRAW_STATE: LazyLock<Mutex<DrawState>> = LazyLock::new(|| {
+    Mutex::new(DrawState {
+        pixels: None,
+        width: 0,
+        height: 0,
+    })
+});
 
 #[derive(Default)]
 pub struct App {
@@ -34,27 +32,22 @@ pub struct App {
 
 impl App {
     fn draw(&mut self) {
-        let now = std::time::Instant::now();
+        {
+            let mut draw_state = DRAW_STATE.lock();
+            if let Some(pixels) = &mut draw_state.pixels {
+                pixels.clear_color(Color::BLACK);
+            }
+        }
+
         if let Some(jvm) = &mut self.jvm {
-            println!("[{:?}] [App] Calling jvm.paint()", now);
             let res = jvm.paint();
             if let Err(e) = res {
-                println!(
-                    "[{:?}] [App] jvm.paint() failed: {}",
-                    std::time::Instant::now(),
-                    e
-                );
+                eprintln!("[App] jvm.paint() failed: {}", e);
             }
-            println!(
-                "[{:?}] [App] jvm.paint() returned after {:?}",
-                std::time::Instant::now(),
-                now.elapsed()
-            );
         }
 
         let mut draw_state = DRAW_STATE.lock();
         if let Some(pixels) = &mut draw_state.pixels {
-            pixels.clear_color(Color::BLACK);
             pixels.render().unwrap();
         }
     }
@@ -84,6 +77,8 @@ impl ApplicationHandler for App {
         if size.width > 0 && size.height > 0 {
             let mut draw_state = DRAW_STATE.lock();
             draw_state.pixels = Some(Pixels::new(size.width, size.height, surface).unwrap());
+            draw_state.width = size.width;
+            draw_state.height = size.height;
         }
     }
 
@@ -95,6 +90,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
@@ -104,6 +102,8 @@ impl ApplicationHandler for App {
                         pixels
                             .resize_surface(new_size.width, new_size.height)
                             .unwrap();
+                        draw_state.width = new_size.width;
+                        draw_state.height = new_size.height;
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();

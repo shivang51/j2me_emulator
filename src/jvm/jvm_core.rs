@@ -1511,6 +1511,25 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x78 => {
+                    // ishl
+                    let val2 = stack.pop().ok_or("ishl: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("ishl: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Int(v1), JvmStackValue::Int(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        let s = (v2 & 0x1f) as u32;
+                        stack.push(JvmStackValue::Int(v1.wrapping_shl(s)));
+                    } else {
+                        return Err(format!(
+                            "ishl: expected two Ints, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x15 | 0x16 | 0x17 | 0x18 | 0x19 => {
                     // iload, lload, fload, dload, aload
                     let index = bytecode[pc + 1] as usize;
@@ -1930,7 +1949,7 @@ impl JVM {
             }
             if class_name == graphics::CLASS_NAME {
                 let return_value =
-                    graphics::handle_virtual_method(&objectref, method_name, descriptor, args);
+                    graphics::handle_virtual_method(&objectref, method_name, descriptor, args, jvm);
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling Graphics method: {}", e).into());

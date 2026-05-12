@@ -2,6 +2,8 @@ mod app;
 mod jvm;
 mod services;
 
+use std::time::Duration;
+
 use app::App;
 use jvm::JVM;
 
@@ -30,7 +32,8 @@ fn main() {
 
     let event_loop = EventLoop::new().unwrap();
 
-    event_loop.set_control_flow(ControlFlow::Wait);
+    let flow = ControlFlow::wait_duration(Duration::from_micros(16));
+    event_loop.set_control_flow(flow);
 
     let mut app = App::default();
     app.jvm = Some(jvm.clone());
