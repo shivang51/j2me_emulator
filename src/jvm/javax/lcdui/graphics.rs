@@ -412,8 +412,10 @@ fn fill_triangle(mut x1: i32, mut y1: i32, mut x2: i32, mut y2: i32, mut x3: i32
 }
 
 fn fill_bottom_flat_triangle(x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32, dw: i32, dh: i32, frame: &mut [u8], color: [u8; 4]) {
-    let invslope1 = (x2 - x1) as f32 / (y2 - y1) as f32;
-    let invslope2 = (x3 - x1) as f32 / (y3 - y1) as f32;
+    let dy = (y2 - y1) as f32;
+    if dy == 0.0 { return; }
+    let invslope1 = (x2 - x1) as f32 / dy;
+    let invslope2 = (x3 - x1) as f32 / dy;
 
     let mut curx1 = x1 as f32;
     let mut curx2 = x1 as f32;
@@ -426,16 +428,18 @@ fn fill_bottom_flat_triangle(x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i3
 }
 
 fn fill_top_flat_triangle(x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32, dw: i32, dh: i32, frame: &mut [u8], color: [u8; 4]) {
-    let invslope1 = (x3 - x1) as f32 / (y3 - y1) as f32;
-    let invslope2 = (x3 - x2) as f32 / (y3 - y2) as f32;
+    let dy = (y3 - y1) as f32;
+    if dy == 0.0 { return; }
+    let invslope1 = (x3 - x1) as f32 / dy;
+    let invslope2 = (x3 - x2) as f32 / dy;
 
-    let mut curx1 = x3 as f32;
-    let mut curx2 = x3 as f32;
+    let mut curx1 = x1 as f32;
+    let mut curx2 = x2 as f32;
 
-    for scanline_y in (y1..=y3).rev() {
+    for scanline_y in y1..=y3 {
         draw_horizontal_line(curx1 as i32, curx2 as i32, scanline_y, dw, dh, frame, color);
-        curx1 -= invslope1;
-        curx2 -= invslope2;
+        curx1 += invslope1;
+        curx2 += invslope2;
     }
 }
 
@@ -443,6 +447,7 @@ fn draw_horizontal_line(mut x1: i32, mut x2: i32, y: i32, dw: i32, dh: i32, fram
     if y < 0 || y >= dh { return; }
     if x1 > x2 { std::mem::swap(&mut x1, &mut x2); }
     
+    // Add 1 to x2 to make it inclusive if needed, but J2ME fill usually includes the last pixel
     for x in x1..=x2 {
         if x < 0 || x >= dw { continue; }
         let offset = ((y * dw + x) * 4) as usize;

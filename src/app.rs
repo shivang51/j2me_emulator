@@ -74,11 +74,14 @@ impl ApplicationHandler for App {
 
         self.window = Some(window_ref);
 
+        let internal_width = 128;
+        let internal_height = 128;
+
         if size.width > 0 && size.height > 0 {
             let mut draw_state = DRAW_STATE.lock();
-            draw_state.pixels = Some(Pixels::new(size.width, size.height, surface).unwrap());
-            draw_state.width = size.width;
-            draw_state.height = size.height;
+            draw_state.pixels = Some(Pixels::new(internal_width, internal_height, surface).unwrap());
+            draw_state.width = internal_width;
+            draw_state.height = internal_height;
         }
     }
 
@@ -102,8 +105,6 @@ impl ApplicationHandler for App {
                         pixels
                             .resize_surface(new_size.width, new_size.height)
                             .unwrap();
-                        draw_state.width = new_size.width;
-                        draw_state.height = new_size.height;
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
