@@ -6,6 +6,8 @@ use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Window, WindowId};
 
 use crate::jvm::JVM;
@@ -15,6 +17,24 @@ pub struct DrawState {
     pub width: u32,
     pub height: u32,
 }
+
+pub struct InputState {
+    pub space_pressed: bool,
+    pub up_pressed: bool,
+    pub down_pressed: bool,
+    pub left_pressed: bool,
+    pub right_pressed: bool,
+}
+
+pub static INPUT_STATE: LazyLock<Mutex<InputState>> = LazyLock::new(|| {
+    Mutex::new(InputState {
+        space_pressed: false,
+        up_pressed: false,
+        down_pressed: false,
+        left_pressed: false,
+        right_pressed: false,
+    })
+});
 
 pub static DRAW_STATE: LazyLock<Mutex<DrawState>> = LazyLock::new(|| {
     Mutex::new(DrawState {
@@ -32,17 +52,18 @@ pub struct App {
 
 impl App {
     fn draw(&mut self) {
-        {
-            let mut draw_state = DRAW_STATE.lock();
-            if let Some(pixels) = &mut draw_state.pixels {
-                pixels.clear_color(Color::BLACK);
-            }
-        }
-
+        // {
+        //     let mut draw_state = DRAW_STATE.lock();
+        //     if let Some(pixels) = &mut draw_state.pixels {
+        //         pixels.clear_color(Color::BLACK);
+        //     }
+        // }
+        //
         if let Some(jvm) = &mut self.jvm {
             let res = jvm.paint();
             if let Err(e) = res {
                 eprintln!("[App] jvm.paint() failed: {}", e);
+                panic!("JVM paint failed");
             }
         }
 
@@ -79,13 +100,14 @@ impl ApplicationHandler for App {
 
         if size.width > 0 && size.height > 0 {
             let mut draw_state = DRAW_STATE.lock();
-            draw_state.pixels = Some(Pixels::new(internal_width, internal_height, surface).unwrap());
+            draw_state.pixels =
+                Some(Pixels::new(internal_width, internal_height, surface).unwrap());
             draw_state.width = internal_width;
             draw_state.height = internal_height;
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
@@ -109,6 +131,34 @@ impl ApplicationHandler for App {
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let keycode = if let PhysicalKey::Code(code) = event.physical_key {
+                    code
+                } else {
+                    return;
+                };
+
+                let is_pressed = event.state == winit::event::ElementState::Pressed;
+
+                match keycode {
+                    KeyCode::Space => {
+                        INPUT_STATE.lock().space_pressed = is_pressed;
+                    }
+                    KeyCode::ArrowUp => {
+                        INPUT_STATE.lock().up_pressed = is_pressed;
+                    }
+                    KeyCode::ArrowDown => {
+                        INPUT_STATE.lock().down_pressed = is_pressed;
+                    }
+                    KeyCode::ArrowLeft => {
+                        INPUT_STATE.lock().left_pressed = is_pressed;
+                    }
+                    KeyCode::ArrowRight => {
+                        INPUT_STATE.lock().right_pressed = is_pressed;
+                    }
+                    _ => {}
                 }
             }
             _ => {}

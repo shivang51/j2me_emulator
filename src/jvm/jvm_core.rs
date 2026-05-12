@@ -500,7 +500,7 @@ impl JVM {
                     } else {
                         opcode - 0x47
                     };
-                    
+
                     let val = stack.pop().ok_or("store_n: stack underflow")?;
                     let idx = index as usize;
                     if locals.len() <= idx {
@@ -551,6 +551,17 @@ impl JVM {
                         }
                         _ => return Err("iastore: object is not an array".into()),
                     }
+
+                    pc += 1;
+                }
+                0x5a => {
+                    // dup_x1
+                    let value1 = stack.pop().ok_or("dup_x1: stack underflow (value1)")?;
+                    let value2 = stack.pop().ok_or("dup_x1: stack underflow (value2)")?;
+
+                    stack.push(value1.clone());
+                    stack.push(value2);
+                    stack.push(value1);
 
                     pc += 1;
                 }
@@ -807,6 +818,16 @@ impl JVM {
                     }
 
                     pc += 3;
+                }
+                0x88 => {
+                    // l2i
+                    let val = stack.pop().ok_or("l2i: Stack underflow")?;
+                    if let JvmStackValue::Long(l) = val.clone() {
+                        stack.push(JvmStackValue::Int(l as i32));
+                    } else {
+                        return Err(format!("l2i: Expected Long on stack, found {:?}", val).into());
+                    }
+                    pc += 1;
                 }
                 0x94 => {
                     // lcmp
@@ -1530,6 +1551,25 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x7E => {
+                    // iand
+                    let val2 = stack.pop().ok_or("iand: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("iand: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Int(v1), JvmStackValue::Int(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        let s = v1 & v2;
+                        stack.push(JvmStackValue::Int(s));
+                    } else {
+                        return Err(format!(
+                            "iand: expected two Ints, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1
+                }
                 0x15 | 0x16 | 0x17 | 0x18 | 0x19 => {
                     // iload, lload, fload, dload, aload
                     let index = bytecode[pc + 1] as usize;
@@ -1924,7 +1964,7 @@ impl JVM {
                             method_name,
                             descriptor,
                             args,
-                            &mut state,
+                            &jvm,
                         )
                     } else {
                         Err(
@@ -2073,7 +2113,7 @@ impl JVM {
                             method_name,
                             descriptor,
                             args,
-                            &mut state,
+                            &jvm,
                         )
                     } else {
                         Err(
@@ -2628,6 +2668,17 @@ impl JVM {
             ("trim", "()Ljava/lang/String;") => {
                 Ok(Some(JvmStackValue::String(string.trim().to_string())))
             }
+            ("endsWith", "(Ljava/lang/String;)Z") => {
+                let Some(JvmStackValue::String(suffix)) = args.first() else {
+                    return Err(format!("String.endsWith: invalid arg {:?}", args.first()));
+                };
+
+                Ok(Some(JvmStackValue::Int(if string.ends_with(suffix) {
+                    1
+                } else {
+                    0
+                })))
+            }
             _ => Err(format!(
                 "Unsupported String instance method: {}{}",
                 method, descriptor
@@ -2790,44 +2841,9 @@ impl JVM {
             return Ok(());
         }
 
-        let res = self.paint_internal();
+        let res = game_canvas::paint(&self);
         IS_PAINTING.store(false, std::sync::atomic::Ordering::SeqCst);
         res
-    }
-
-    fn paint_internal(&self) -> Result<(), String> {
-        let disp = display::get_display_safe(self)?;
-
-        let displayable_res = display::get_displayable_obj_safe(disp, self)?;
-        let displayable_ref =
-            displayable_res.ok_or_else(|| "No displayable object set".to_string())?;
-
-        let class_name = if let JvmStackValue::ObjectRef(id) = displayable_ref {
-            let state = self.state.lock();
-            if let Some(HeapObject::Instance(inst)) = state.heap.get(id as usize) {
-                inst.class_name.clone()
-            } else {
-                return Err("Displayable is not an instance".into());
-            }
-        } else {
-            return Err("Displayable is not an object ref".into());
-        };
-
-        let fields = HashMap::new();
-        let graphics_handle = {
-            let mut state = self.state.lock();
-            JVM::allocate_internal(&mut state, graphics::CLASS_NAME.to_string(), fields)
-        };
-
-        return JVM::execute_method(
-            displayable_ref,
-            &class_name,
-            "paint",
-            "(Ljavax/microedition/lcdui/Graphics;)V",
-            &[JvmStackValue::ObjectRef(graphics_handle)],
-            self,
-            &mut Vec::new(),
-        );
     }
 
     fn handle_math_fns(

@@ -111,14 +111,14 @@ pub fn handle_virtual_method(
             fill_triangle(x1, y1, x2, y2, x3, y3, color);
             Ok(None)
         }
-        // ("drawString", "(Ljava/lang/String;III)V") => Ok(None),
-        // ("drawSubstring", "(Ljava/lang/String;IIIII)V") => Ok(None),
-        // ("setFont", "(Ljavax/microedition/lcdui/Font;)V") => Ok(None),
-        // ("setClip", "(IIII)V") => Ok(None),
-        // ("clipRect", "(IIII)V") => Ok(None),
-        // ("translate", "(II)V") => Ok(None),
-        ("getClipX", "()I") => Ok(Some(JvmStackValue::Int(0))),
-        ("getClipY", "()I") => Ok(Some(JvmStackValue::Int(0))),
+        ("drawString", "(Ljava/lang/String;III)V") => todo!("Graphics.drawString"),
+        ("drawSubstring", "(Ljava/lang/String;IIIII)V") => todo!("Graphics.drawSubstring"),
+        ("setFont", "(Ljavax/microedition/lcdui/Font;)V") => todo!("Graphics.setFont"),
+        ("setClip", "(IIII)V") => todo!("Graphics.setClip"),
+        ("clipRect", "(IIII)V") => todo!("Graphics.clipRect"),
+        ("translate", "(II)V") => todo!("Graphics.translate"),
+        ("getClipX", "()I") => todo!("Graphics.getClipX"),
+        ("getClipY", "()I") => todo!("Graphics.getClipY"),
         ("getClipWidth", "()I") => {
             let draw_state = DRAW_STATE.lock();
             Ok(Some(JvmStackValue::Int(draw_state.width as i32)))
