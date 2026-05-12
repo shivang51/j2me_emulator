@@ -705,6 +705,24 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x68 => {
+                    // imul
+                    let val2 = stack.pop().ok_or("imul: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("imul: Stack underflow for val1")?;
+
+                    if let (JvmStackValue::Int(i1), JvmStackValue::Int(i2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Int(i1.wrapping_mul(i2)));
+                    } else {
+                        return Err(format!(
+                            "imul: Expected two Ints on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x69 => {
                     // lmul
                     let val2 = stack.pop().ok_or("lmul: Stack underflow for val2")?;
@@ -1483,6 +1501,16 @@ impl JVM {
 
                     pc += 1;
                 }
+                0x74 => {
+                    // ineg
+                    let val = stack.pop().ok_or("ineg: stack underflow")?;
+                    if let JvmStackValue::Int(i) = val {
+                        stack.push(JvmStackValue::Int(i.wrapping_neg()));
+                    } else {
+                        return Err(format!("ineg: expected Int, found {:?}", val).into());
+                    }
+                    pc += 1;
+                }
                 0x15 | 0x16 | 0x17 | 0x18 | 0x19 => {
                     // iload, lload, fload, dload, aload
                     let index = bytecode[pc + 1] as usize;
@@ -1540,6 +1568,59 @@ impl JVM {
                             bytecode[entry_pc + 3],
                         ])
                     };
+
+                    pc = (opcode_pc as i32 + offset) as usize;
+                    continue;
+                }
+                0xAB => {
+                    // lookupswitch
+                    let opcode_pc = pc;
+                    let aligned_pc = (pc + 4) & !3;
+
+                    if aligned_pc + 8 > bytecode.len() {
+                        return Err("lookupswitch: bytecode truncated".into());
+                    }
+
+                    let default_offset = i32::from_be_bytes([
+                        bytecode[aligned_pc],
+                        bytecode[aligned_pc + 1],
+                        bytecode[aligned_pc + 2],
+                        bytecode[aligned_pc + 3],
+                    ]);
+                    let npairs = i32::from_be_bytes([
+                        bytecode[aligned_pc + 4],
+                        bytecode[aligned_pc + 5],
+                        bytecode[aligned_pc + 6],
+                        bytecode[aligned_pc + 7],
+                    ]);
+
+                    let key = match stack.pop().ok_or("lookupswitch: stack underflow")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("lookupswitch: expected Int on stack".into()),
+                    };
+
+                    let mut offset = default_offset;
+                    for i in 0..npairs {
+                        let pair_pc = aligned_pc + 8 + (i as usize * 8);
+                        if pair_pc + 8 > bytecode.len() {
+                            return Err("lookupswitch: pairs truncated".into());
+                        }
+                        let match_val = i32::from_be_bytes([
+                            bytecode[pair_pc],
+                            bytecode[pair_pc + 1],
+                            bytecode[pair_pc + 2],
+                            bytecode[pair_pc + 3],
+                        ]);
+                        if match_val == key {
+                            offset = i32::from_be_bytes([
+                                bytecode[pair_pc + 4],
+                                bytecode[pair_pc + 5],
+                                bytecode[pair_pc + 6],
+                                bytecode[pair_pc + 7],
+                            ]);
+                            break;
+                        }
+                    }
 
                     pc = (opcode_pc as i32 + offset) as usize;
                     continue;
