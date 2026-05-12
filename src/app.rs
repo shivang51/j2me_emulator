@@ -1,6 +1,7 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 use image::GenericImageView;
+use parking_lot::Mutex;
 use pixels::wgpu::Color;
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
@@ -38,12 +39,20 @@ impl App {
             println!("[{:?}] [App] Calling jvm.paint()", now);
             let res = jvm.paint();
             if let Err(e) = res {
-                println!("[{:?}] [App] jvm.paint() failed: {}", std::time::Instant::now(), e);
+                println!(
+                    "[{:?}] [App] jvm.paint() failed: {}",
+                    std::time::Instant::now(),
+                    e
+                );
             }
-            println!("[{:?}] [App] jvm.paint() returned after {:?}", std::time::Instant::now(), now.elapsed());
+            println!(
+                "[{:?}] [App] jvm.paint() returned after {:?}",
+                std::time::Instant::now(),
+                now.elapsed()
+            );
         }
 
-        let mut draw_state = DRAW_STATE.lock().unwrap();
+        let mut draw_state = DRAW_STATE.lock();
         if let Some(pixels) = &mut draw_state.pixels {
             pixels.clear_color(Color::BLACK);
             pixels.render().unwrap();
@@ -73,7 +82,7 @@ impl ApplicationHandler for App {
         self.window = Some(window_ref);
 
         if size.width > 0 && size.height > 0 {
-            let mut draw_state = DRAW_STATE.lock().unwrap();
+            let mut draw_state = DRAW_STATE.lock();
             draw_state.pixels = Some(Pixels::new(size.width, size.height, surface).unwrap());
         }
     }
@@ -90,7 +99,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
                     println!("Window resized to {}x{}", new_size.width, new_size.height);
-                    let mut draw_state = DRAW_STATE.lock().unwrap();
+                    let mut draw_state = DRAW_STATE.lock();
                     if let Some(pixels) = &mut draw_state.pixels {
                         pixels
                             .resize_surface(new_size.width, new_size.height)

@@ -36,7 +36,7 @@ pub fn handle_virtual_method(
         value => return Err(format!("Image: expected object reference, found {:?}", value)),
     };
 
-    let state = jvm.state.lock().unwrap();
+    let mut state = jvm.state.lock();
     let image = state
         .heap
         .get(image_id as usize)
@@ -46,7 +46,11 @@ pub fn handle_virtual_method(
         ("getWidth", "()I") => get_int_field(image, &["width:I", "width:Int"]).map(Some),
         ("getHeight", "()I") => get_int_field(image, &["height:I", "height:Int"]).map(Some),
         ("getGraphics", "()Ljavax/microedition/lcdui/Graphics;") => {
-            let handle = jvm.allocate("javax/microedition/lcdui/Graphics".to_string());
+            let handle = JVM::allocate_internal(
+                &mut state,
+                "javax/microedition/lcdui/Graphics".to_string(),
+                HashMap::new(),
+            );
             Ok(Some(JvmStackValue::ObjectRef(handle)))
         }
         _ => Err(format!(
@@ -71,7 +75,7 @@ fn create_image(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValu
     let resource_name = normalize_resource_path(path);
     
     let (width, height) = {
-        let state = jvm.state.lock().unwrap();
+        let state = jvm.state.lock();
         state
             .resources
             .get(resource_name)
@@ -92,7 +96,7 @@ fn create_image(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValu
         fields,
     });
     
-    let mut state = jvm.state.lock().unwrap();
+    let mut state = jvm.state.lock();
     state.heap.push(image_obj);
 
     Ok(Some(JvmStackValue::ObjectRef((state.heap.len() - 1) as u32)))
@@ -139,7 +143,7 @@ fn create_image_ii(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackV
         _ => return Err("Image.createImage(II): missing/invalid height argument".into()),
     };
 
-    let mut state = jvm.state.lock().unwrap();
+    let mut state = jvm.state.lock();
     let instance = JvmObject {
         class_name: CLASS_NAME.to_string(),
         fields: HashMap::new(),

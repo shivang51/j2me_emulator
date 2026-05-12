@@ -66,8 +66,7 @@ pub fn get_displayable_obj_safe(
 
     let state = jvm
         .state
-        .try_lock()
-        .map_err(|_| "JVM state busy (get_displayable_obj)")?;
+        .lock();
     let display = state
         .heap
         .get(display_id as usize)
@@ -86,7 +85,7 @@ pub fn get_displayable_obj_safe(
 }
 
 pub fn get_display(jvm: &JVM) -> JvmStackValue {
-    let mut state = jvm.state.lock().unwrap();
+    let mut state = jvm.state.lock();
 
     if let Some(existing) = state.static_fields.get(SINGLETON_FIELD) {
         return existing.clone();
@@ -111,8 +110,7 @@ pub fn get_display(jvm: &JVM) -> JvmStackValue {
 pub fn get_display_safe(jvm: &JVM) -> Result<JvmStackValue, String> {
     let mut state = jvm
         .state
-        .try_lock()
-        .map_err(|_| "JVM state busy (get_display)")?;
+        .lock();
 
     if let Some(existing) = state.static_fields.get(SINGLETON_FIELD) {
         return Ok(existing.clone());
@@ -150,7 +148,7 @@ fn set_current(
         value => return Err(format!("Display: expected object reference, found {:?}", value)),
     };
 
-    let mut state = jvm.state.lock().unwrap();
+    let mut state = jvm.state.lock();
     let display = state
         .heap
         .get_mut(display_id as usize)
