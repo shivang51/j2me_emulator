@@ -32,7 +32,7 @@ fn main() {
 
     let event_loop = EventLoop::new().unwrap();
 
-    let flow = ControlFlow::wait_duration(Duration::from_micros(16));
+    let flow = ControlFlow::wait_duration(Duration::from_millis(41));
     event_loop.set_control_flow(flow);
 
     let mut app = App::default();
