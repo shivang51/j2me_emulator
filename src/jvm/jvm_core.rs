@@ -362,94 +362,25 @@ impl JVM {
                     }
                     pc += 3;
                 }
-                0x1a => {
-                    // iload_0
-                    let local_val = locals[0].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x1b => {
-                    // iload_1
-                    let local_val = locals[1].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x1c => {
-                    // iload_2
-                    let local_val = locals[2].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x1d => {
-                    // iload_3
-                    let local_val = locals[3].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x1e => {
-                    // lload_0
-                    let local_val = locals[0].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x1f => {
-                    // lload_1
-                    let local_val = locals[1].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x20 => {
-                    // lload_2
-                    let local_val = locals[2].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x21 => {
-                    // lload_3
-                    let local_val = locals[3].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x27 => {
-                    // dload_1
-                    let local_val = locals[1].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x28 => {
-                    // dload_2
-                    let local_val = locals[2].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x29 => {
-                    // dload_3
-                    let local_val = locals[3].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x2a => {
-                    // aload_0
-                    let local_val = locals[0].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x2b => {
-                    // aload_1
-                    let local_val = locals[1].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x2c => {
-                    // aload_2
-                    let local_val = locals[2].clone();
-                    stack.push(local_val);
-                    pc += 1;
-                }
-                0x2d => {
-                    // aload_3
-                    let local_val = locals[3].clone();
-                    stack.push(local_val);
+                0x1a..=0x2d => {
+                    // load_n (iload_n, lload_n, fload_n, dload_n, aload_n)
+                    let index = if opcode <= 0x1d {
+                        opcode - 0x1a
+                    } else if opcode <= 0x21 {
+                        opcode - 0x1e
+                    } else if opcode <= 0x25 {
+                        opcode - 0x22
+                    } else if opcode <= 0x29 {
+                        opcode - 0x26
+                    } else {
+                        opcode - 0x2a
+                    } as usize;
+
+                    if index >= locals.len() {
+                        stack.push(JvmStackValue::Null);
+                    } else {
+                        stack.push(locals[index].clone());
+                    }
                     pc += 1;
                 }
                 0x2e => {
@@ -558,40 +489,34 @@ impl JVM {
                     }
                     pc += 1;
                 }
-                0x3c => {
-                    // istore_1
-                    let val = stack.pop().ok_or("istore_1: Stack underflow")?;
-                    if locals.len() < 2 {
-                        locals.resize(2, JvmStackValue::Null);
+                0x3b..=0x4a => {
+                    // istore_n, lstore_n, fstore_n, dstore_n
+                    let index = if opcode <= 0x3e {
+                        opcode - 0x3b
+                    } else if opcode <= 0x42 {
+                        opcode - 0x3f
+                    } else if opcode <= 0x46 {
+                        opcode - 0x43
+                    } else {
+                        opcode - 0x47
+                    };
+                    
+                    let val = stack.pop().ok_or("store_n: stack underflow")?;
+                    let idx = index as usize;
+                    if locals.len() <= idx {
+                        locals.resize(idx + 1, JvmStackValue::Null);
                     }
-                    locals[1] = val;
+                    locals[idx] = val;
                     pc += 1;
                 }
-                0x4b => {
-                    // astore_9
-                    let val = stack.pop().ok_or("astore_1: Stack underflow")?;
-                    if locals.len() < 1 {
-                        locals.resize(1, JvmStackValue::Null);
+                0x4b..=0x4e => {
+                    // astore_n
+                    let idx = (opcode - 0x4b) as usize;
+                    let val = stack.pop().ok_or("astore_n: stack underflow")?;
+                    if locals.len() <= idx {
+                        locals.resize(idx + 1, JvmStackValue::Null);
                     }
-                    locals[0] = val;
-                    pc += 1;
-                }
-                0x4c => {
-                    // astore_1
-                    let val = stack.pop().ok_or("astore_0: Stack underflow")?;
-                    if locals.len() < 2 {
-                        locals.resize(2, JvmStackValue::Null);
-                    }
-                    locals[1] = val;
-                    pc += 1;
-                }
-                0x4d => {
-                    // astore_2
-                    let val = stack.pop().ok_or("astore_2: Stack underflow")?;
-                    if locals.len() < 3 {
-                        locals.resize(3, JvmStackValue::Null);
-                    }
-                    locals[2] = val;
+                    locals[idx] = val;
                     pc += 1;
                 }
                 0x4f => {
@@ -1514,15 +1439,6 @@ impl JVM {
                     }
                     pc += 1;
                 }
-                0x3D => {
-                    // istore_2
-                    let val = stack.pop().ok_or("istore_2: Stack underflow")?;
-                    if locals.len() < 3 {
-                        locals.resize(3, JvmStackValue::Null);
-                    }
-                    locals[2] = val;
-                    pc += 1;
-                }
                 0x70 => {
                     // irem
                     let val2 = stack.pop().ok_or("irem: Stack underflow for val2")?;
@@ -1567,29 +1483,11 @@ impl JVM {
 
                     pc += 1;
                 }
-                0x4E => {
-                    // astore_3
-                    let val = stack.pop().ok_or("astore_3: Stack underflow")?;
-                    if locals.len() < 4 {
-                        locals.resize(4, JvmStackValue::Null);
-                    }
-                    locals[3] = val;
-                    pc += 1;
-                }
-                0x15 => {
-                    // iload
+                0x15 | 0x16 | 0x17 | 0x18 | 0x19 => {
+                    // iload, lload, fload, dload, aload
                     let index = bytecode[pc + 1] as usize;
                     if index >= locals.len() {
-                        return Err(format!("iload: Invalid local index {}", index).into());
-                    }
-                    stack.push(locals[index].clone());
-                    pc += 2;
-                }
-                0x16 => {
-                    // lload
-                    let index = bytecode[pc + 1] as usize;
-                    if index >= locals.len() {
-                        return Err(format!("lload: Invalid local index {}", index).into());
+                        return Err(format!("load: Invalid local index {}", index).into());
                     }
                     stack.push(locals[index].clone());
                     pc += 2;
@@ -1653,14 +1551,15 @@ impl JVM {
                     jvm_debug!("Execution finished with return value: {:?}", val);
                     return Ok(Some(val));
                 }
-                0x37 => {
-                    // lstore_1
-                    let val = stack.pop().ok_or("lstore_1: stack underflow")?;
-                    if locals.len() < 2 {
-                        locals.resize(2, JvmStackValue::Null);
+                0x36 | 0x37 | 0x38 | 0x39 | 0x3a => {
+                    // istore, lstore, fstore, dstore, astore
+                    let index = bytecode[pc + 1] as usize;
+                    let val = stack.pop().ok_or("store: stack underflow")?;
+                    if locals.len() <= index {
+                        locals.resize(index + 1, JvmStackValue::Null);
                     }
-                    locals[1] = val;
-                    pc += 1;
+                    locals[index] = val;
+                    pc += 2;
                 }
                 _ => {
                     println!("Unknown Opcode: {:02X}", opcode);
