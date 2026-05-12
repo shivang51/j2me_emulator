@@ -2587,6 +2587,16 @@ impl JVM {
                 .as_millis() as i64;
             stack.push(JvmStackValue::Long(millis));
             return Ok(());
+        } else if class_name == "java/lang/Math" {
+            let res = JVM::handle_math_fns(method_name, descriptor, args);
+            if let Err(e) = res {
+                return Err(format!("Error handling Math method: {}", e).into());
+            }
+            if let Some(val) = res.unwrap() {
+                stack.push(val);
+            }
+
+            return Ok(());
         } else if class_name == "java/lang/Runtime" {
             let res = JVM::handle_runtime_fns(method_name, descriptor, args);
 
@@ -2718,6 +2728,122 @@ impl JVM {
             self,
             &mut Vec::new(),
         );
+    }
+
+    fn handle_math_fns(
+        method: &str,
+        descriptor: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        match (method, descriptor) {
+            ("abs", "(I)I") => {
+                if let Some(JvmStackValue::Int(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Int(v.abs())))
+                } else {
+                    Err("Math.abs(I)I: missing arg".into())
+                }
+            }
+            ("abs", "(J)J") => {
+                if let Some(JvmStackValue::Long(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Long(v.abs())))
+                } else {
+                    Err("Math.abs(J)J: missing arg".into())
+                }
+            }
+            ("abs", "(F)F") => {
+                if let Some(JvmStackValue::Float(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Float(v.abs())))
+                } else {
+                    Err("Math.abs(F)F: missing arg".into())
+                }
+            }
+            ("abs", "(D)D") => {
+                if let Some(JvmStackValue::Double(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Double(v.abs())))
+                } else {
+                    Err("Math.abs(D)D: missing arg".into())
+                }
+            }
+            ("min", "(II)I") => {
+                if let (Some(JvmStackValue::Int(v1)), Some(JvmStackValue::Int(v2))) =
+                    (args.get(0), args.get(1))
+                {
+                    Ok(Some(JvmStackValue::Int((*v1).min(*v2))))
+                } else {
+                    Err("Math.min(II)I: missing arg".into())
+                }
+            }
+            ("min", "(JJ)J") => {
+                if let (Some(JvmStackValue::Long(v1)), Some(JvmStackValue::Long(v2))) =
+                    (args.get(0), args.get(1))
+                {
+                    Ok(Some(JvmStackValue::Long((*v1).min(*v2))))
+                } else {
+                    Err("Math.min(JJ)J: missing arg".into())
+                }
+            }
+            ("max", "(II)I") => {
+                if let (Some(JvmStackValue::Int(v1)), Some(JvmStackValue::Int(v2))) =
+                    (args.get(0), args.get(1))
+                {
+                    Ok(Some(JvmStackValue::Int((*v1).max(*v2))))
+                } else {
+                    Err("Math.max(II)I: missing arg".into())
+                }
+            }
+            ("max", "(JJ)J") => {
+                if let (Some(JvmStackValue::Long(v1)), Some(JvmStackValue::Long(v2))) =
+                    (args.get(0), args.get(1))
+                {
+                    Ok(Some(JvmStackValue::Long((*v1).max(*v2))))
+                } else {
+                    Err("Math.max(JJ)J: missing arg".into())
+                }
+            }
+            ("sqrt", "(D)D") => {
+                if let Some(JvmStackValue::Double(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Double(v.sqrt())))
+                } else {
+                    Err("Math.sqrt(D)D: missing arg".into())
+                }
+            }
+            ("sin", "(D)D") => {
+                if let Some(JvmStackValue::Double(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Double(v.sin())))
+                } else {
+                    Err("Math.sin(D)D: missing arg".into())
+                }
+            }
+            ("cos", "(D)D") => {
+                if let Some(JvmStackValue::Double(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Double(v.cos())))
+                } else {
+                    Err("Math.cos(D)D: missing arg".into())
+                }
+            }
+            ("tan", "(D)D") => {
+                if let Some(JvmStackValue::Double(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Double(v.tan())))
+                } else {
+                    Err("Math.tan(D)D: missing arg".into())
+                }
+            }
+            ("ceil", "(D)D") => {
+                if let Some(JvmStackValue::Double(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Double(v.ceil())))
+                } else {
+                    Err("Math.ceil(D)D: missing arg".into())
+                }
+            }
+            ("floor", "(D)D") => {
+                if let Some(JvmStackValue::Double(v)) = args.get(0) {
+                    Ok(Some(JvmStackValue::Double(v.floor())))
+                } else {
+                    Err("Math.floor(D)D: missing arg".into())
+                }
+            }
+            _ => Err(format!("Unsupported Math method: {}{}", method, descriptor)),
+        }
     }
 
     fn handle_runtime_fns(
