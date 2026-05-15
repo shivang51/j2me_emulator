@@ -1,13 +1,16 @@
 use std::sync::LazyLock;
+use std::time::Duration;
 
-use egui_winit::winit;
+use egui_wgpu::RendererOptions;
+use egui_winit::egui::FullOutput;
 use egui_winit::winit::application::ApplicationHandler;
 use egui_winit::winit::event::WindowEvent;
 use egui_winit::winit::event_loop::ActiveEventLoop;
 use egui_winit::winit::keyboard::{KeyCode, PhysicalKey};
 use egui_winit::winit::window::{Window, WindowId};
+use egui_winit::{egui, winit};
 use parking_lot::Mutex;
-use pixels::{Pixels, SurfaceTexture};
+use pixels::{Pixels, SurfaceTexture, wgpu};
 
 use crate::jvm::JVM;
 use crate::jvm::javax::lcdui::game::game_canvas::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
@@ -55,30 +58,209 @@ pub static DRAW_STATE: LazyLock<Mutex<DrawState>> = LazyLock::new(|| {
 #[derive(Default)]
 pub struct App {
     window: Option<&'static Window>,
+    egui_state: Option<egui_winit::State>,
+    egui_renderer: Option<egui_wgpu::Renderer>,
     pub jvm: Option<JVM>,
 }
 
 impl App {
     fn draw(&mut self) {
-        // {
-        //     let mut draw_state = DRAW_STATE.lock();
-        //     if let Some(pixels) = &mut draw_state.pixels {
-        //         pixels.clear_color(Color::BLACK);
-        //     }
-        // }
-        //
         if let Some(jvm) = &mut self.jvm {
             let res = jvm.paint();
             if let Err(e) = res {
                 eprintln!("[App] jvm.paint() failed: {}", e);
-                panic!("JVM paint failed");
             }
         }
 
+        let full_output = self.draw_ui();
+        let window = self.window.unwrap();
+        let egui_renderer = self.egui_renderer.as_mut().unwrap();
+        let egui_state = self.egui_state.as_mut().unwrap();
+
+        let paint_jobs = egui_state
+            .egui_ctx()
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+
         let mut draw_state = DRAW_STATE.lock();
         if let Some(pixels) = &mut draw_state.pixels {
-            pixels.render().unwrap();
+            for (id, delta) in &full_output.textures_delta.set {
+                egui_renderer.update_texture(pixels.device(), pixels.queue(), *id, delta);
+            }
+
+            let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [window.inner_size().width, window.inner_size().height],
+                pixels_per_point: full_output.pixels_per_point,
+            };
+            pixels
+                .render_with(|encoder, render_target, context| {
+                    context.scaling_renderer.render(encoder, render_target);
+
+                    egui_renderer.update_buffers(
+                        pixels.device(),
+                        pixels.queue(),
+                        encoder,
+                        &paint_jobs,
+                        &screen_descriptor,
+                    );
+
+                    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("egui_render_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: render_target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+
+                    unsafe {
+                        let rpass_static: &mut wgpu::RenderPass<'static> =
+                            std::mem::transmute(&mut rpass);
+                        egui_renderer.render(rpass_static, &paint_jobs, &screen_descriptor);
+                    }
+
+                    Ok(())
+                })
+                .unwrap();
         }
+
+        for id in full_output.textures_delta.free {
+            egui_renderer.free_texture(&id);
+        }
+
+        if let Some(repaint_after) = full_output
+            .viewport_output
+            .get(&egui::viewport::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+        {
+            if repaint_after == Duration::ZERO {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn draw_ui(&mut self) -> FullOutput {
+        let egui_state = self.egui_state.as_mut().unwrap();
+        let raw_input = egui_state.take_egui_input(self.window.unwrap());
+        egui_state.egui_ctx().run_ui(raw_input, |ctx| {
+            egui::Panel::top("menu_bar").show_inside(ctx, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Open .jar").clicked() {
+                            ui.close();
+                        }
+                        if ui.button("Exit").clicked() {
+                            std::process::exit(0);
+                        }
+                    });
+                    ui.menu_button("Emulation", |ui| {
+                        if ui.button("Reset").clicked() { /* Reset JVM */ }
+                    });
+                });
+            });
+
+            egui::Panel::right("Right")
+                .resizable(true)
+                .show_inside(ctx, |ui| {
+                    ui.heading("Keypad");
+                    ui.add_space(10.0);
+
+                    let buttons = [
+                        ["1", "2", "3"],
+                        ["4", "5", "6"],
+                        ["7", "8", "9"],
+                        ["*", "0", "#"],
+                    ];
+
+                    egui::Grid::new("phone_grid")
+                        .spacing([10.0, 10.0])
+                        .show(ui, |ui| {
+                            for row in buttons {
+                                for label in row {
+                                    if ui
+                                        .add(egui::Button::new(label).min_size([45.0, 45.0].into()))
+                                        .clicked()
+                                    {
+                                        println!("Key {} pressed", label);
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("A").clicked() {
+                            println!("A clicked");
+                        }
+                        if ui.button("B").clicked() {
+                            println!("B clicked");
+                        }
+                    });
+                });
+
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show_inside(ctx, |ui| {
+                    ui.allocate_space(ui.available_size());
+                });
+
+            egui::Window::new("Debug Stats")
+                .min_size([240.0, 120.0])
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.label(format!("Resolution: {}x{}", DEFAULT_WIDTH, DEFAULT_HEIGHT));
+                    if ui.button("Dump Heap").clicked() {
+                        println!("Dumping heap...");
+                    }
+                });
+        })
+    }
+
+    fn add_egui_fonts(ctx: &egui::Context) {
+        let builtin_fonts = egui::FontDefinitions::builtin_font_names();
+
+        println!("[+] Built-in fonts: {:?}", builtin_fonts);
+
+        if builtin_fonts.len() != 0 {
+            return;
+        }
+
+        let mut fonts = egui::FontDefinitions::default();
+        let font_candidates = ["/usr/share/fonts/TTF/Segoe-UI-Variable-Static-Display.ttf"];
+
+        if let Some(font_path) = font_candidates
+            .iter()
+            .find(|path| std::path::Path::new(path).exists())
+        {
+            if let Ok(font_bytes) = std::fs::read(font_path) {
+                fonts.font_data.insert(
+                    "segoe_ui".to_owned(),
+                    std::sync::Arc::new(egui::FontData::from_owned(font_bytes)),
+                );
+
+                if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional)
+                {
+                    proportional.insert(0, "segoe_ui".to_owned());
+                }
+
+                if let Some(monospace) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                    monospace.insert(0, "segoe_ui".to_owned());
+                }
+            }
+        }
+
+        ctx.set_fonts(fonts);
     }
 }
 
@@ -90,7 +272,7 @@ impl ApplicationHandler for App {
         let window_ref: &'static Window = Box::leak(Box::new(window));
         let size = window_ref.inner_size();
         let surface = SurfaceTexture::new(size.width, size.height, window_ref);
-        if let Some(jar) = &self.jvm.as_ref().unwrap().loaded_jar {
+        if let Some(jar) = self.jvm.as_ref().and_then(|j| j.loaded_jar.as_ref()) {
             window_ref.set_title(&format!("{} - J2ME", jar.manifest.name));
         }
 
@@ -101,21 +283,54 @@ impl ApplicationHandler for App {
             size.height
         );
 
-        self.window = Some(window_ref);
+        let egui_ctx = egui::Context::default();
+        egui_ctx.set_theme(egui::Theme::Dark);
+
+        App::add_egui_fonts(&egui_ctx);
+
+        let egui_state = egui_winit::State::new(
+            egui_ctx,
+            egui::viewport::ViewportId::ROOT,
+            &window_ref,
+            Some(window_ref.scale_factor() as f32),
+            None,
+            None,
+        );
 
         let internal_width = DEFAULT_WIDTH as u32;
         let internal_height = DEFAULT_HEIGHT as u32;
 
         if size.width > 0 && size.height > 0 {
             let mut draw_state = DRAW_STATE.lock();
-            draw_state.pixels =
-                Some(Pixels::new(internal_width, internal_height, surface).unwrap());
+            let pixels = Pixels::new(internal_width, internal_height, surface).unwrap();
+
+            let egui_renderer = egui_wgpu::Renderer::new(
+                pixels.device(),
+                pixels.render_texture_format(),
+                RendererOptions::default(),
+            );
+
+            draw_state.pixels = Some(pixels);
             draw_state.width = internal_width;
             draw_state.height = internal_height;
+            self.egui_renderer = Some(egui_renderer);
         }
+
+        self.window = Some(window_ref);
+        self.egui_state = Some(egui_state);
+
+        window_ref.request_redraw();
     }
 
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let window = self.window.unwrap();
+        let egui_state = self.egui_state.as_mut().unwrap();
+
+        let response = egui_state.on_window_event(window, &event);
+        if response.consumed {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
@@ -123,9 +338,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                window.request_redraw();
             }
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
@@ -136,9 +349,7 @@ impl ApplicationHandler for App {
                             .resize_surface(new_size.width, new_size.height)
                             .unwrap();
                     }
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                    window.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
