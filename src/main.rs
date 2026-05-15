@@ -2,8 +2,6 @@ mod app;
 mod jvm;
 mod services;
 
-use std::time::Duration;
-
 use app::App;
 use jvm::JVM;
 

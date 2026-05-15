@@ -1,13 +1,11 @@
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
-use pixels::wgpu::Color;
 use pixels::{Pixels, SurfaceTexture};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Window, WindowId};
 
 use crate::jvm::JVM;

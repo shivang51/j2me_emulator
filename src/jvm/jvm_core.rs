@@ -334,8 +334,7 @@ impl JVM {
             let opcode = bytecode[pc];
 
             op_count += 1;
-            // Yield once in a while to let other threads (like the UI thread) get the state lock
-            if op_count % 10 == 0 {
+            if op_count % 1000 == 0 {
                 std::thread::yield_now();
             }
 
