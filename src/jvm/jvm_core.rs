@@ -1003,6 +1003,24 @@ impl JVM {
 
                     pc += 1;
                 }
+                0x80 => {
+                    //ior
+                    let val2 = stack.pop().ok_or("ior: Stack underflow for val2")?;
+                    let val1 = stack.pop().ok_or("ior: Stack underflow for val1")?;
+
+                    if let (JvmStackValue::Int(i1), JvmStackValue::Int(i2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Int(i1 | i2));
+                    } else {
+                        return Err(format!(
+                            "ior: Expected two Ints on stack, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x84 => {
                     // iinc
                     let index = bytecode[pc + 1] as usize;
@@ -1185,6 +1203,36 @@ impl JVM {
                     }
 
                     stack.push(val.unwrap());
+
+                    pc += 3;
+                }
+                0xB3 => {
+                    // putstatic
+                    let idx_bytes = [bytecode[pc + 1], bytecode[pc + 2]];
+                    let cp_idx = u16::from_be_bytes(idx_bytes);
+
+                    let ConstantInfo::FieldRef(field_ref) = &cp[cp_idx as usize - 1] else {
+                        return Err(format!(
+                            "Expected FieldRef at CP index {}, found {:?}",
+                            cp_idx,
+                            cp[cp_idx as usize - 1]
+                        ));
+                    };
+
+                    let key = JVM::get_field_key(field_ref, cp);
+                    let class_name = key
+                        .rsplit_once('.')
+                        .map(|(class_name, _)| class_name.to_string())
+                        .ok_or_else(|| format!("Invalid static field key: {}", key))?;
+
+                    jvm.ensure_class_initialized(&class_name)?;
+
+                    let value = stack.pop().ok_or("putstatic: Stack underflow")?;
+
+                    {
+                        let mut state = jvm.state.lock();
+                        state.static_fields.insert(key, value);
+                    }
 
                     pc += 3;
                 }
