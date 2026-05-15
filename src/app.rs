@@ -60,6 +60,7 @@ pub struct App {
     window: Option<&'static Window>,
     egui_state: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    game_texture: Option<egui::TextureHandle>,
     pub jvm: Option<JVM>,
 }
 
@@ -83,17 +84,36 @@ impl App {
 
         let mut draw_state = DRAW_STATE.lock();
         if let Some(pixels) = &mut draw_state.pixels {
-            for (id, delta) in &full_output.textures_delta.set {
-                egui_renderer.update_texture(pixels.device(), pixels.queue(), *id, delta);
-            }
-
             let screen_descriptor = egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [window.inner_size().width, window.inner_size().height],
                 pixels_per_point: full_output.pixels_per_point,
             };
             pixels
                 .render_with(|encoder, render_target, context| {
-                    context.scaling_renderer.render(encoder, render_target);
+                    let _ = context;
+
+                    {
+                        let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("clear_pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: render_target,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                    }
+
+                    for (id, delta) in &full_output.textures_delta.set {
+                        egui_renderer.update_texture(pixels.device(), pixels.queue(), *id, delta);
+                    }
 
                     egui_renderer.update_buffers(
                         pixels.device(),
@@ -147,6 +167,26 @@ impl App {
     }
 
     fn draw_ui(&mut self) -> FullOutput {
+        {
+            let ctx = self.egui_state.as_ref().unwrap().egui_ctx();
+            let mut draw_state = DRAW_STATE.lock();
+            let width = draw_state.width;
+            let height = draw_state.height;
+
+            if let Some(pixels) = &mut draw_state.pixels {
+                let frame = pixels.frame();
+                let size = [width as usize, height as usize];
+                let image = egui::ColorImage::from_rgba_unmultiplied(size, frame);
+
+                if let Some(handle) = &mut self.game_texture {
+                    handle.set(image, egui::TextureOptions::NEAREST);
+                } else {
+                    self.game_texture =
+                        Some(ctx.load_texture("game_screen", image, egui::TextureOptions::NEAREST));
+                }
+            }
+        }
+
         let egui_state = self.egui_state.as_mut().unwrap();
         let raw_input = egui_state.take_egui_input(self.window.unwrap());
         egui_state.egui_ctx().run_ui(raw_input, |ctx| {
@@ -212,7 +252,25 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show_inside(ctx, |ui| {
-                    ui.allocate_space(ui.available_size());
+                    ui.vertical_centered(|ui| {
+                        ui.heading(
+                            self.jvm
+                                .as_ref()
+                                .and_then(|j| j.loaded_jar.as_ref())
+                                .map_or("No file loaded", |jar| &jar.manifest.name),
+                        );
+                        ui.add_space(8.0);
+
+                        if let Some(texture) = &self.game_texture {
+                            let available_size = ui.available_size();
+                            let tex_size = texture.size_vec2();
+                            let scale = (available_size.x / tex_size.x)
+                                .min(available_size.y / tex_size.y)
+                                .max(1.0);
+
+                            ui.add(egui::Image::new(texture).fit_to_exact_size(tex_size * scale));
+                        }
+                    });
                 });
 
             egui::Window::new("Debug Stats")
