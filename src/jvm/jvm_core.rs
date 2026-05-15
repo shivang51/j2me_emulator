@@ -688,7 +688,7 @@ impl JVM {
                                 ).into());
                             }
 
-                            data[index as usize] = JvmStackValue::Byte(value as u8);
+                            data[index as usize] = JvmStackValue::Int(value);
                         }
                         _ => return Err("bastore: object is not an array".into()),
                     }
@@ -1590,6 +1590,66 @@ impl JVM {
                     stack.push(JvmStackValue::ObjectRef(array_ref));
 
                     pc += 3;
+                }
+                0xC5 => {
+                    // multianewarray
+                    let cp_index =
+                        (((bytecode[pc + 1] as u16) << 8) | (bytecode[pc + 2] as u16)) as usize;
+                    let dimensions = bytecode[pc + 3] as usize;
+
+                    if dimensions == 0 {
+                        return Err("multianewarray: dimensions must be at least 1".into());
+                    }
+
+                    let array_type = match &cp[cp_index - 1] {
+                        ConstantInfo::Class(class_info) => {
+                            JVM::resolve_utf8(class_info.name_index, cp)
+                        }
+                        _ => return Err("multianewarray: expected Class constant".into()),
+                    };
+
+                    if !array_type.starts_with('[') {
+                        return Err(format!(
+                            "multianewarray: resolved type {} is not an array type",
+                            array_type
+                        ));
+                    }
+
+                    if JVM::array_type_rank(&array_type) < dimensions {
+                        return Err(format!(
+                            "multianewarray: type {} does not have {} dimensions",
+                            array_type, dimensions
+                        ));
+                    }
+
+                    let mut counts = Vec::with_capacity(dimensions);
+                    for _ in 0..dimensions {
+                        let count = match stack.pop().ok_or("multianewarray: stack underflow")? {
+                            JvmStackValue::Int(i) => i,
+                            value => {
+                                return Err(format!(
+                                    "multianewarray: dimension count is not an int: {:?}",
+                                    value
+                                ));
+                            }
+                        };
+
+                        if count < 0 {
+                            return Err("java.lang.NegativeArraySizeException".into());
+                        }
+
+                        counts.push(count);
+                    }
+                    counts.reverse();
+
+                    let array_ref = {
+                        let mut state = jvm.state.lock();
+                        JVM::allocate_multianewarray(&mut state, &array_type, &counts)?
+                    };
+
+                    stack.push(JvmStackValue::ObjectRef(array_ref));
+
+                    pc += 4;
                 }
                 0xBE => {
                     // arraylength
@@ -2707,6 +2767,82 @@ impl JVM {
 
     fn array_component_type(array_type: &str) -> Option<&str> {
         array_type.strip_prefix('[')
+    }
+
+    fn multianewarray_default_value(component_type: &str) -> JvmStackValue {
+        match component_type {
+            "Z" | "B" | "C" | "S" | "I" => JvmStackValue::Int(0),
+            "F" => JvmStackValue::Float(0.0),
+            "D" => JvmStackValue::Double(0.0),
+            "J" => JvmStackValue::Long(0),
+            _ => JvmStackValue::Null,
+        }
+    }
+
+    fn multianewarray_element_type(component_type: &str) -> String {
+        match component_type {
+            "Z" => "primitive_4".to_string(),
+            "C" => "primitive_5".to_string(),
+            "F" => "primitive_6".to_string(),
+            "D" => "primitive_7".to_string(),
+            "B" => "primitive_8".to_string(),
+            "S" => "primitive_9".to_string(),
+            "I" => "primitive_10".to_string(),
+            "J" => "primitive_11".to_string(),
+            _ if component_type.starts_with('[') => component_type.to_string(),
+            _ if component_type.starts_with('L') && component_type.ends_with(';') => {
+                component_type[1..component_type.len() - 1].to_string()
+            }
+            _ => component_type.to_string(),
+        }
+    }
+
+    fn array_type_rank(array_type: &str) -> usize {
+        array_type.chars().take_while(|ch| *ch == '[').count()
+    }
+
+    fn allocate_multianewarray(
+        state: &mut JvmState,
+        array_type: &str,
+        counts: &[i32],
+    ) -> Result<u32, String> {
+        let Some(component_type) = JVM::array_component_type(array_type) else {
+            return Err(format!(
+                "multianewarray: {} is not an array type",
+                array_type
+            ));
+        };
+
+        if counts.is_empty() {
+            return Err("multianewarray: missing dimensions".into());
+        }
+
+        let count = counts[0];
+        if count < 0 {
+            return Err("java.lang.NegativeArraySizeException".into());
+        }
+
+        let element_type = JVM::multianewarray_element_type(component_type);
+        let data = if counts.len() == 1 {
+            vec![JVM::multianewarray_default_value(component_type); count as usize]
+        } else {
+            if !component_type.starts_with('[') {
+                return Err(format!(
+                    "multianewarray: {} does not have enough dimensions for {:?}",
+                    array_type, counts
+                ));
+            }
+
+            let mut data = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let sub_ref = JVM::allocate_multianewarray(state, component_type, &counts[1..])?;
+                data.push(JvmStackValue::ObjectRef(sub_ref));
+            }
+            data
+        };
+
+        state.heap.push(HeapObject::Array { element_type, data });
+        Ok((state.heap.len() - 1) as u32)
     }
 
     fn can_cast_array_type(
