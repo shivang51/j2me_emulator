@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use egui_wgpu::RendererOptions;
-use egui_winit::egui::FullOutput;
+use egui_winit::egui::{ColorImage, FullOutput, TextureOptions};
 use egui_winit::winit::application::ApplicationHandler;
 use egui_winit::winit::event::WindowEvent;
 use egui_winit::winit::event_loop::ActiveEventLoop;
@@ -206,59 +206,59 @@ impl App {
                 });
             });
 
-            egui::Panel::right("Right")
+            egui::Panel::left("left_panel")
                 .resizable(true)
                 .show_inside(ctx, |ui| {
-                    ui.heading("Keypad");
-                    ui.add_space(10.0);
+                    ui.take_available_space();
+                });
 
-                    let buttons = [
-                        ["1", "2", "3"],
-                        ["4", "5", "6"],
-                        ["7", "8", "9"],
-                        ["*", "0", "#"],
-                    ];
-
-                    egui::Grid::new("phone_grid")
-                        .spacing([10.0, 10.0])
-                        .show(ui, |ui| {
-                            for row in buttons {
-                                for label in row {
-                                    if ui
-                                        .add(egui::Button::new(label).min_size([45.0, 45.0].into()))
-                                        .clicked()
-                                    {
-                                        println!("Key {} pressed", label);
-                                    }
-                                }
-                                ui.end_row();
-                            }
-                        });
-
-                    ui.add_space(20.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        if ui.button("A").clicked() {
-                            println!("A clicked");
-                        }
-                        if ui.button("B").clicked() {
-                            println!("B clicked");
-                        }
-                    });
+            egui::Panel::right("right_panel")
+                .resizable(true)
+                .show_inside(ctx, |ui| {
+                    ui.heading("Debug Info");
+                    if let Some(texture) = &self.game_texture {
+                        ui.label(format!("Size - {:.2}", texture.size_vec2()));
+                    }
+                    ui.take_available_space();
                 });
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show_inside(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.heading(
-                            self.jvm
-                                .as_ref()
-                                .and_then(|j| j.loaded_jar.as_ref())
-                                .map_or("No file loaded", |jar| &jar.manifest.name),
-                        );
+                        ui.horizontal(|ui| {
+                            let jar = self.jvm.as_ref().unwrap().loaded_jar.as_ref().unwrap();
+
+                            match jar.resources.get(&jar.manifest.icon) {
+                                Some(icon_data) => {
+                                    let img = image::load_from_memory(&icon_data).unwrap();
+                                    let color_img = ColorImage::from_rgba_unmultiplied(
+                                        [img.width() as usize, img.height() as usize],
+                                        &img.to_rgba8(),
+                                    );
+                                    let handle = ui.load_texture(
+                                        jar.manifest.icon.clone(),
+                                        color_img,
+                                        TextureOptions::default(),
+                                    );
+                                    let texture = egui::load::SizedTexture::new(
+                                        handle.id(),
+                                        egui::vec2(24.0, 24.0),
+                                    );
+                                    ui.image(egui::ImageSource::Texture(texture));
+                                    ui.add_space(8.0);
+                                }
+                                None => {}
+                            }
+
+                            ui.heading(
+                                self.jvm
+                                    .as_ref()
+                                    .and_then(|j| j.loaded_jar.as_ref())
+                                    .map_or("No file loaded", |jar| &jar.manifest.name),
+                            );
+                        });
+
                         ui.add_space(8.0);
 
                         if let Some(texture) = &self.game_texture {
@@ -271,16 +271,6 @@ impl App {
                             ui.add(egui::Image::new(texture).fit_to_exact_size(tex_size * scale));
                         }
                     });
-                });
-
-            egui::Window::new("Debug Stats")
-                .min_size([240.0, 120.0])
-                .resizable(true)
-                .show(ctx, |ui| {
-                    ui.label(format!("Resolution: {}x{}", DEFAULT_WIDTH, DEFAULT_HEIGHT));
-                    if ui.button("Dump Heap").clicked() {
-                        println!("Dumping heap...");
-                    }
                 });
         })
     }

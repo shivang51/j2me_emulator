@@ -38,6 +38,9 @@ impl JarManifest {
                 if parts.len() >= 3 {
                     name = parts[0].trim().to_string();
                     icon = parts[1].trim().to_string();
+                    if icon.starts_with("/") {
+                        icon = icon[1..].to_string();
+                    }
                     main_class = parts[2].trim().to_string();
                 }
             } else if line.starts_with("MIDlet-Vendor:") {
