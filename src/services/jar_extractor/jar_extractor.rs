@@ -109,6 +109,7 @@ impl JarExtractor {
             let name = file.name().to_string();
 
             if file.is_dir() || name.ends_with(".class") || name == "META-INF/MANIFEST.MF" {
+                println!("Skipping non-resource file: {}", name);
                 continue;
             }
 

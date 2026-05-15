@@ -8,6 +8,7 @@ use classfile_parser::constant_info::{ConstantInfo, FieldRefConstant, MethodRefC
 use crate::{
     jvm::javax::{
         lcdui::{display, game::game_canvas, graphics, image},
+        media::player,
         midlet,
     },
     services::jar_extractor::JarFileData,
@@ -1565,10 +1566,10 @@ impl JVM {
                     // invokeinterface
                     let cp_index =
                         u16::from_be_bytes([bytecode[pc + 1], bytecode[pc + 2]]) as usize;
-                    
+
                     // The count byte (not strictly needed as we can derive from descriptor)
                     let _count = bytecode[pc + 3];
-                    
+
                     // The fourth byte must be zero (reserved for future use)
                     let _reserved = bytecode[pc + 4];
 
@@ -1612,7 +1613,7 @@ impl JVM {
                     // 1. First check if the object's actual class has the method
                     // 2. Then search superclasses
                     // 3. Then search superinterfaces
-                    
+
                     let actual_class_name = {
                         let state = jvm.state.lock();
                         if let JvmStackValue::ObjectRef(id) = &objectref {
@@ -2501,6 +2502,20 @@ impl JVM {
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling Graphics method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == player::CLASS_NAME {
+                let return_value =
+                    player::handle_virtual_method(&objectref, method_name, descriptor, args);
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling Player method: {}", e).into());
                 }
 
                 if let Some(val) = return_value.unwrap() {
@@ -3885,7 +3900,7 @@ impl JVM {
                 let mut state = jvm.state.lock();
                 let _data = if let Some(_data) = state.resources.get(&resource_path) {
                 } else {
-                    return Err("Resource not found".into()); // Resource not found, return null
+                    return Err(format!("Resource not found {}", resource_path).into()); // Resource not found, return null
                 };
 
                 let mut fields = HashMap::new();
