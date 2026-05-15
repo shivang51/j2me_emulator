@@ -3,10 +3,10 @@ mod jvm;
 mod services;
 
 use app::App;
+use egui_winit::winit::event_loop::{ControlFlow, EventLoop};
 use jvm::JVM;
 
 use services::jar_extractor::JarExtractor;
-use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
     const JAR_PATH: &str = "test_files/towerdefen_ou812zz9.jar";

@@ -1,12 +1,13 @@
 use std::sync::LazyLock;
 
+use egui_winit::winit;
+use egui_winit::winit::application::ApplicationHandler;
+use egui_winit::winit::event::WindowEvent;
+use egui_winit::winit::event_loop::ActiveEventLoop;
+use egui_winit::winit::keyboard::{KeyCode, PhysicalKey};
+use egui_winit::winit::window::{Window, WindowId};
 use parking_lot::Mutex;
 use pixels::{Pixels, SurfaceTexture};
-use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
 
 use crate::jvm::JVM;
 use crate::jvm::javax::lcdui::game::game_canvas::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
