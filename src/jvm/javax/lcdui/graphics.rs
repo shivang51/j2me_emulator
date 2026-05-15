@@ -126,11 +126,11 @@ pub fn handle_virtual_method(
             let y = get_int_arg(args, 1)?;
             let width = get_int_arg(args, 2)?;
             let height = get_int_arg(args, 3)?;
-            let startAngle = get_int_arg(args, 4)?;
-            let arcAngle = get_int_arg(args, 5)?;
+            let start_angle = get_int_arg(args, 4)?;
+            let arc_angle = get_int_arg(args, 5)?;
 
             let color = get_color(objectref, jvm);
-            draw_arc(x, y, width, height, startAngle, arcAngle, color);
+            draw_arc(x, y, width, height, start_angle, arc_angle, color);
 
             Ok(None)
         }

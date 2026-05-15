@@ -170,8 +170,40 @@ impl JVM {
 
     pub fn add_class(&self, class: classfile_parser::ClassFile) -> Result<(), String> {
         let class_name = JVM::get_class_name(&class)?;
-        println!("[JVM] Added class: {}", class_name);
-        self.state.lock().classes.insert(class_name, class);
+        let pool = &class.const_pool;
+        let mut static_entries: Vec<(String, JvmStackValue)> = Vec::new();
+        for field in &class.fields {
+            let is_static = field
+                .access_flags
+                .contains(classfile_parser::field_info::FieldAccessFlags::STATIC);
+            if !is_static {
+                continue;
+            }
+
+            let name = JVM::resolve_utf8(field.name_index, pool);
+            let desc = JVM::resolve_utf8(field.descriptor_index, pool);
+            let key = format!("{}.{}:{}", class_name, name, desc);
+
+            let default_val = if desc.starts_with('L') || desc.starts_with('[') {
+                JvmStackValue::Null
+            } else if desc == "F" {
+                JvmStackValue::Float(0.0)
+            } else if desc == "D" {
+                JvmStackValue::Double(0.0)
+            } else if desc == "J" {
+                JvmStackValue::Long(0)
+            } else {
+                JvmStackValue::Int(0)
+            };
+
+            static_entries.push((key, default_val));
+        }
+
+        let mut state = self.state.lock();
+        state.classes.insert(class_name.clone(), class.clone());
+        for (k, v) in static_entries {
+            state.static_fields.insert(k, v);
+        }
         Ok(())
     }
 
