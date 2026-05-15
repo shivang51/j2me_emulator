@@ -9,7 +9,7 @@ use services::jar_extractor::JarExtractor;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
-    const JAR_PATH: &str = "test_files/tower_defense_(base_128x128_188767.jar";
+    const JAR_PATH: &str = "test_files/towerdefen_ou812zz9.jar";
 
     let mut jar_extractor = JarExtractor::for_path(JAR_PATH.to_string());
 
