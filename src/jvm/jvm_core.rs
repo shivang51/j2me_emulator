@@ -490,6 +490,56 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x33 => {
+                    // baload
+                    let index = match stack.pop().ok_or("baload: Stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("baload: index is not an int".into()),
+                    };
+
+                    let arrayref = stack.pop().ok_or("baload: Stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("baload: arrayref is not a reference".into()),
+                    };
+
+                    {
+                        let state = jvm.state.lock();
+                        match state.heap.get(heap_idx) {
+                            Some(HeapObject::Array { element_type, data }) => {
+                                if index < 0 || index as usize >= data.len() {
+                                    return Err(format!(
+                                        "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds",
+                                        index
+                                    ));
+                                }
+
+                                let loaded = match &data[index as usize] {
+                                    JvmStackValue::Byte(byte_value) => i32::from(*byte_value as i8),
+                                    JvmStackValue::Int(int_value)
+                                        if element_type == "primitive_4"
+                                            || element_type == "primitive_8" =>
+                                    {
+                                        ((*int_value as u8) as i8) as i32
+                                    }
+                                    other => {
+                                        return Err(format!(
+                                            "baload: expected Byte or Int, found {:?}",
+                                            other
+                                        ));
+                                    }
+                                };
+
+                                stack.push(JvmStackValue::Int(loaded));
+                            }
+                            _ => return Err("baload: object is not an array".into()),
+                        }
+                    }
+
+                    pc += 1;
+                }
                 0x3b..=0x4a => {
                     // istore_n, lstore_n, fstore_n, dstore_n
                     let index = if opcode <= 0x3e {
@@ -1308,6 +1358,59 @@ impl JVM {
 
                     pc += 3;
                 }
+                0xC0 => {
+                    // checkcast
+                    let cp_index =
+                        u16::from_be_bytes([bytecode[pc + 1], bytecode[pc + 2]]) as usize;
+
+                    let ConstantInfo::Class(class_info) = &cp[cp_index - 1] else {
+                        return Err(format!(
+                            "checkcast: expected Class constant at index {}, found {:?}",
+                            cp_index,
+                            cp[cp_index - 1]
+                        )
+                        .into());
+                    };
+
+                    let target_class_name = JVM::resolve_utf8(class_info.name_index, cp);
+
+                    let objectref = stack.last().cloned().ok_or("checkcast: stack underflow")?;
+                    if let JvmStackValue::Null = objectref {
+                        // null can be cast to any reference type and stays on the stack.
+                        pc += 3;
+                        continue;
+                    }
+
+                    let heap_idx = match objectref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        _ => return Err("checkcast: expected reference on stack".into()),
+                    };
+
+                    let actual_type_name = {
+                        let state = jvm.state.lock();
+                        match &state.heap[heap_idx] {
+                            HeapObject::Instance(obj) => obj.class_name.clone(),
+                            HeapObject::Array { element_type, .. } => {
+                                JVM::array_runtime_type_name(element_type)
+                            }
+                        }
+                    };
+
+                    let cast_ok = {
+                        let state = jvm.state.lock();
+                        JVM::can_cast_reference_type(&state, &actual_type_name, &target_class_name)
+                    };
+
+                    if !cast_ok {
+                        return Err(format!(
+                            "java.lang.ClassCastException: cannot cast {} to {}",
+                            actual_type_name, target_class_name
+                        )
+                        .into());
+                    }
+
+                    pc += 3;
+                }
                 0xC6 | 0xC7 => {
                     // ifnull, ifnonnull
                     let offset =
@@ -1843,7 +1946,10 @@ impl JVM {
             }
             "elementAt" => {
                 let Some(JvmStackValue::Int(index)) = args.get(0) else {
-                    return Err(format!("Vector.elementAt(I): invalid arg {:?}", args.get(0)));
+                    return Err(format!(
+                        "Vector.elementAt(I): invalid arg {:?}",
+                        args.get(0)
+                    ));
                 };
 
                 let index = *index as usize;
@@ -2431,6 +2537,236 @@ impl JVM {
         }
 
         false
+    }
+
+    fn class_extends_in_state(state: &JvmState, class_name: &str, target_class_name: &str) -> bool {
+        let mut current_class = Some(class_name.to_string());
+
+        while let Some(name) = current_class {
+            if name == target_class_name {
+                return true;
+            }
+
+            let Some(class_data) = state.classes.get(&name) else {
+                return false;
+            };
+
+            current_class = JVM::get_super_class_name(class_data);
+        }
+
+        false
+    }
+
+    fn class_implements_interface_in_state(
+        state: &JvmState,
+        class_name: &str,
+        target_interface_name: &str,
+    ) -> bool {
+        let Some(class_data) = state.classes.get(class_name) else {
+            return false;
+        };
+
+        if class_data
+            .access_flags
+            .contains(classfile_parser::ClassAccessFlags::INTERFACE)
+        {
+            if class_name == target_interface_name {
+                return true;
+            }
+
+            for interface_idx in &class_data.interfaces {
+                let Some(ConstantInfo::Class(interface_class)) =
+                    class_data.const_pool.get(*interface_idx as usize - 1)
+                else {
+                    continue;
+                };
+
+                let interface_name =
+                    JVM::resolve_utf8(interface_class.name_index, &class_data.const_pool);
+                if interface_name == target_interface_name
+                    || JVM::class_implements_interface_in_state(
+                        state,
+                        &interface_name,
+                        target_interface_name,
+                    )
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        for interface_idx in &class_data.interfaces {
+            let Some(ConstantInfo::Class(interface_class)) =
+                class_data.const_pool.get(*interface_idx as usize - 1)
+            else {
+                continue;
+            };
+
+            let interface_name =
+                JVM::resolve_utf8(interface_class.name_index, &class_data.const_pool);
+            if interface_name == target_interface_name
+                || JVM::class_implements_interface_in_state(
+                    state,
+                    &interface_name,
+                    target_interface_name,
+                )
+            {
+                return true;
+            }
+        }
+
+        if let Some(super_name) = JVM::get_super_class_name(class_data) {
+            return JVM::class_implements_interface_in_state(
+                state,
+                &super_name,
+                target_interface_name,
+            );
+        }
+
+        false
+    }
+
+    fn is_interface_in_state(state: &JvmState, class_name: &str) -> bool {
+        state
+            .classes
+            .get(class_name)
+            .map(|class_data| {
+                class_data
+                    .access_flags
+                    .contains(classfile_parser::ClassAccessFlags::INTERFACE)
+            })
+            .unwrap_or(false)
+    }
+
+    fn array_runtime_type_name(element_type: &str) -> String {
+        if element_type.starts_with("primitive_") {
+            match element_type {
+                "primitive_4" => "[Z".to_string(),
+                "primitive_5" => "[C".to_string(),
+                "primitive_6" => "[F".to_string(),
+                "primitive_7" => "[D".to_string(),
+                "primitive_8" => "[B".to_string(),
+                "primitive_9" => "[S".to_string(),
+                "primitive_10" => "[I".to_string(),
+                "primitive_11" => "[J".to_string(),
+                _ => format!("[?{}", element_type),
+            }
+        } else if element_type.starts_with('[') {
+            format!("[{}", element_type)
+        } else {
+            format!("[L{};", element_type)
+        }
+    }
+
+    fn array_component_type(array_type: &str) -> Option<&str> {
+        array_type.strip_prefix('[')
+    }
+
+    fn can_cast_array_type(
+        state: &JvmState,
+        actual_array_type: &str,
+        target_array_type: &str,
+    ) -> bool {
+        if actual_array_type == target_array_type {
+            return true;
+        }
+
+        let Some(actual_component) = JVM::array_component_type(actual_array_type) else {
+            return false;
+        };
+        let Some(target_component) = JVM::array_component_type(target_array_type) else {
+            return false;
+        };
+
+        let actual_is_primitive =
+            !actual_component.starts_with('[') && !actual_component.starts_with('L');
+        let target_is_primitive =
+            !target_component.starts_with('[') && !target_component.starts_with('L');
+
+        match (actual_is_primitive, target_is_primitive) {
+            (true, true) => actual_component == target_component,
+            (false, false) => {
+                let actual_component_name = actual_component
+                    .strip_prefix('L')
+                    .and_then(|name| name.strip_suffix(';'))
+                    .unwrap_or(actual_component);
+                let target_component_name = target_component
+                    .strip_prefix('L')
+                    .and_then(|name| name.strip_suffix(';'))
+                    .unwrap_or(target_component);
+
+                JVM::can_cast_reference_type(state, actual_component_name, target_component_name)
+            }
+            _ => false,
+        }
+    }
+
+    fn can_cast_reference_type(
+        state: &JvmState,
+        actual_type_name: &str,
+        target_type_name: &str,
+    ) -> bool {
+        if actual_type_name == target_type_name {
+            return true;
+        }
+
+        if actual_type_name.starts_with('[') {
+            return match target_type_name {
+                "java/lang/Object" | "java/lang/Cloneable" | "java/io/Serializable" => true,
+                _ if target_type_name.starts_with('[') => {
+                    JVM::can_cast_array_type(state, actual_type_name, target_type_name)
+                }
+                _ => false,
+            };
+        }
+
+        if target_type_name.starts_with('[') {
+            return false;
+        }
+
+        let actual_is_interface = JVM::is_interface_in_state(state, actual_type_name);
+        let target_is_interface = JVM::is_interface_in_state(state, target_type_name);
+
+        match (actual_is_interface, target_is_interface) {
+            (false, false) => {
+                JVM::class_extends_in_state(state, actual_type_name, target_type_name)
+            }
+            (false, true) => {
+                JVM::class_implements_interface_in_state(state, actual_type_name, target_type_name)
+            }
+            (true, false) => target_type_name == "java/lang/Object",
+            (true, true) => {
+                if actual_type_name == target_type_name {
+                    return true;
+                }
+
+                if let Some(actual_class) = state.classes.get(actual_type_name) {
+                    for interface_idx in &actual_class.interfaces {
+                        let Some(ConstantInfo::Class(interface_class)) =
+                            actual_class.const_pool.get(*interface_idx as usize - 1)
+                        else {
+                            continue;
+                        };
+
+                        let interface_name =
+                            JVM::resolve_utf8(interface_class.name_index, &actual_class.const_pool);
+                        if interface_name == target_type_name
+                            || JVM::class_implements_interface_in_state(
+                                state,
+                                &interface_name,
+                                target_type_name,
+                            )
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                false
+            }
+        }
     }
 
     pub fn get_class_name(class: &classfile_parser::ClassFile) -> Result<String, String> {
@@ -3131,42 +3467,66 @@ impl JVM {
         args: &[JvmStackValue],
         jvm: &JVM,
     ) -> Result<Option<JvmStackValue>, String> {
-        match (method_name, descriptor) {
-            ("available", "()I") => {
-                return Ok(Some(JvmStackValue::Int(1)));
+        let mut state = jvm.state.lock();
+
+        let object_ref = match args.get(0) {
+            Some(JvmStackValue::ObjectRef(r)) => state
+                .heap
+                .get(*r as usize)
+                .ok_or_else(|| "Invalid object reference".to_string())?,
+            _ => {
+                return Err(
+                    "Expected object reference as first argument to ByteArrayInputStream method"
+                        .into(),
+                )
             }
+        };
+
+        let resource_path = if let HeapObject::Instance(obj) = object_ref {
+            if let Some(JvmStackValue::String(path)) = obj.fields.get("jvm_res") {
+                path.clone()
+            } else {
+                return Err("ByteArrayInputStream instance missing 'jvm_res' field".into());
+            }
+        } else {
+            return Err("Expected instance for ByteArrayInputStream object".into());
+        };
+
+        let data = state
+            .resources
+            .get(&resource_path)
+            .cloned()
+            .ok_or_else(|| "Resource not found for ByteArrayInputStream".to_string())?;
+
+        match (method_name, descriptor) {
+            ("available", "()I") => Ok(Some(JvmStackValue::Int(data.len() as i32))),
             ("read", "([B)I") => {
-                let state = jvm.state.lock();
-                let object_ref = match args[0] {
-                    JvmStackValue::ObjectRef(r) => state
-                        .heap
-                        .get(r as usize)
-                        .ok_or_else(|| "Invalid object reference".to_string())?,
-                    _ => return Err("Expected object reference as first argument to read()".into()),
-                };
-
-                let resource_path = if let HeapObject::Instance(obj) = object_ref {
-                    if let Some(JvmStackValue::String(path)) = obj.fields.get("jvm_res") {
-                        path.clone()
-                    } else {
-                        return Err("ByteArrayInputStream instance missing 'jvm_res' field".into());
+                let buffer_ref = match args.get(1) {
+                    Some(JvmStackValue::ObjectRef(r)) => *r as usize,
+                    Some(value) => {
+                        return Err(format!(
+                            "Expected byte array reference as second argument to read(), found {:?}",
+                            value
+                        ))
                     }
-                } else {
-                    return Err("Expected instance for ByteArrayInputStream object".into());
+                    None => return Err("read([B)I: missing byte array argument".into()),
                 };
 
-                let data = {
-                    if let Some(data) = state.resources.get(&resource_path) {
-                        data.clone()
-                    } else {
-                        return Err("Resource not found for ByteArrayInputStream".into());
+                let copied = match state.heap.get_mut(buffer_ref) {
+                    Some(HeapObject::Array { data: buffer, .. }) => {
+                        let copy_len = data.len().min(buffer.len());
+
+                        for (slot, byte) in buffer.iter_mut().zip(data.iter()).take(copy_len) {
+                            *slot = JvmStackValue::Int(*byte as i32);
+                        }
+
+                        copy_len
                     }
+                    Some(_) => return Err("read([B)I: expected array buffer".into()),
+                    None => return Err("read([B)I: invalid byte array reference".into()),
                 };
 
-                // We ignore the actual byte array argument and just return the data directly,
-                // since implementing the full read semantics is a bit of work and not needed for our test cases.
-                // In a real implementation, we would need to track the current read position and copy bytes into the provided array.
-                Ok(Some(JvmStackValue::Int(data.len() as i32)))
+                Ok(Some(JvmStackValue::Int(copied as i32)))
             }
             _ => Err(format!(
                 "Unsupported ByteArrayInputStream method: {}{}",
