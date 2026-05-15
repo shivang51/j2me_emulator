@@ -9,6 +9,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::jvm::JVM;
+use crate::jvm::javax::lcdui::game::game_canvas::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
 
 pub struct DrawState {
     pub pixels: Option<Pixels<'static>>,
@@ -93,8 +94,8 @@ impl ApplicationHandler for App {
 
         self.window = Some(window_ref);
 
-        let internal_width = 128;
-        let internal_height = 128;
+        let internal_width = DEFAULT_WIDTH as u32;
+        let internal_height = DEFAULT_HEIGHT as u32;
 
         if size.width > 0 && size.height > 0 {
             let mut draw_state = DRAW_STATE.lock();

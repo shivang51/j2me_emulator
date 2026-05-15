@@ -8,8 +8,8 @@ use crate::{
     },
 };
 
-const DEFAULT_WIDTH: i32 = 128;
-const DEFAULT_HEIGHT: i32 = 128;
+pub const DEFAULT_WIDTH: i32 = 364;
+pub const DEFAULT_HEIGHT: i32 = 364;
 
 pub const CLASS_NAME: &str = "javax/microedition/lcdui/game/GameCanvas";
 
