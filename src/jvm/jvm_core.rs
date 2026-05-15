@@ -650,6 +650,51 @@ impl JVM {
 
                     pc += 1;
                 }
+                0x54 => {
+                    // bastore
+
+                    let value = match stack.pop().ok_or("bastore: stack underflow (value)")? {
+                        JvmStackValue::Int(i) => i,
+                        val => return Err(format!("bastore: value {:?} is not an int", val)),
+                    };
+
+                    let index = match stack.pop().ok_or("bastore: stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("bastore: index is not an int".into()),
+                    };
+
+                    let arrayref = stack.pop().ok_or("bastore: stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("bastore: arrayref is not a reference".into()),
+                    };
+
+                    match jvm.state.lock().heap.get_mut(heap_idx) {
+                        Some(HeapObject::Array { element_type, data }) => {
+                            if element_type != "primitive_8" {
+                                return Err(format!(
+                                    "bastore: expected byte array, found array of type {}",
+                                    element_type
+                                )
+                                .into());
+                            }
+
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!(
+                                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds for length {}",
+                                    index, data.len()
+                                ).into());
+                            }
+
+                            data[index as usize] = JvmStackValue::Byte(value as u8);
+                        }
+                        _ => return Err("bastore: object is not an array".into()),
+                    }
+
+                    pc += 1;
+                }
                 0x57 => {
                     // pop
                     stack.pop().ok_or("pop: Stack underflow")?;
@@ -3469,18 +3514,17 @@ impl JVM {
     ) -> Result<Option<JvmStackValue>, String> {
         let mut state = jvm.state.lock();
 
-        let object_ref = match args.get(0) {
-            Some(JvmStackValue::ObjectRef(r)) => state
-                .heap
-                .get(*r as usize)
-                .ok_or_else(|| "Invalid object reference".to_string())?,
-            _ => {
-                return Err(
+        let object_ref =
+            match args.get(0) {
+                Some(JvmStackValue::ObjectRef(r)) => state
+                    .heap
+                    .get(*r as usize)
+                    .ok_or_else(|| "Invalid object reference".to_string())?,
+                _ => return Err(
                     "Expected object reference as first argument to ByteArrayInputStream method"
                         .into(),
-                )
-            }
-        };
+                ),
+            };
 
         let resource_path = if let HeapObject::Instance(obj) = object_ref {
             if let Some(JvmStackValue::String(path)) = obj.fields.get("jvm_res") {
@@ -3507,7 +3551,7 @@ impl JVM {
                         return Err(format!(
                             "Expected byte array reference as second argument to read(), found {:?}",
                             value
-                        ))
+                        ));
                     }
                     None => return Err("read([B)I: missing byte array argument".into()),
                 };
