@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic;
 use std::sync::Arc;
 
@@ -62,6 +62,7 @@ pub struct JvmState {
     pub heap: Vec<HeapObject>,
     pub classes: HashMap<String, classfile_parser::ClassFile>,
     pub resources: HashMap<String, Vec<u8>>,
+    pub initialized_classes: HashSet<String>,
 }
 
 pub type SharedJvmState = Arc<Mutex<JvmState>>;
@@ -97,6 +98,7 @@ impl JVM {
             heap: Vec::new(),
             classes: HashMap::new(),
             resources: HashMap::new(),
+            initialized_classes: HashSet::new(),
         };
 
         state.static_fields.insert(
@@ -204,6 +206,46 @@ impl JVM {
         for (k, v) in static_entries {
             state.static_fields.insert(k, v);
         }
+        Ok(())
+    }
+
+    fn ensure_class_initialized(&self, class_name: &str) -> Result<(), String> {
+        let class_data = {
+            let state = self.state.lock();
+            if state.initialized_classes.contains(class_name) {
+                return Ok(());
+            }
+
+            state
+                .classes
+                .get(class_name)
+                .cloned()
+                .ok_or_else(|| format!("Class not found: {}", class_name))?
+        };
+
+        let has_clinit = JVM::find_method_in_class(&class_data, "<clinit>", "()V").is_some();
+
+        {
+            let mut state = self.state.lock();
+            state.initialized_classes.insert(class_name.to_string());
+        }
+
+        if !has_clinit {
+            return Ok(());
+        }
+
+        let mut caller_stack = Vec::new();
+        JVM::execute_method(
+            JvmStackValue::Null,
+            class_name,
+            "<clinit>",
+            "()V",
+            &[],
+            self,
+            &mut caller_stack,
+        )
+        .map_err(|e| format!("Class initialization failed for {}: {}", class_name, e))?;
+
         Ok(())
     }
 
@@ -648,6 +690,37 @@ impl JVM {
 
                     pc += 1;
                 }
+                0x50 => {
+                    // lastore
+                    let value = stack.pop().ok_or("lastore: stack underflow (value)")?;
+                    let index = match stack.pop().ok_or("lastore: stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("lastore: index is not an int".into()),
+                    };
+                    let arrayref = stack.pop().ok_or("lastore: stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("lastore: arrayref is not a reference".into()),
+                    };
+
+                    match jvm.state.lock().heap.get_mut(heap_idx) {
+                        Some(HeapObject::Array { data, .. }) => {
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!(
+                                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds for length {}",
+                                    index, data.len()
+                                ).into());
+                            }
+
+                            data[index as usize] = value;
+                        }
+                        _ => return Err("lastore: object is not an array".into()),
+                    }
+
+                    pc += 1;
+                }
                 0x53 => {
                     // aastore
                     let value = stack.pop().ok_or("aastore: stack underflow (value)")?;
@@ -1082,6 +1155,12 @@ impl JVM {
                     };
 
                     let key = JVM::get_field_key(field_ref, cp);
+                    let class_name = key
+                        .rsplit_once('.')
+                        .map(|(class_name, _)| class_name.to_string())
+                        .ok_or_else(|| format!("Invalid static field key: {}", key))?;
+
+                    jvm.ensure_class_initialized(&class_name)?;
 
                     let val = {
                         let state = jvm.state.lock();
