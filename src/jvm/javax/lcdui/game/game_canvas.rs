@@ -106,6 +106,18 @@ pub fn handle_virtual_method(
             if input_state.right_pressed {
                 state |= RIGHT_PRESSED;
             }
+            if input_state.a_pressed {
+                state |= GAME_A_PRESSED;
+            }
+            if input_state.b_pressed {
+                state |= GAME_B_PRESSED;
+            }
+            if input_state.c_pressed {
+                state |= GAME_C_PRESSED;
+            }
+            if input_state.d_pressed {
+                state |= GAME_D_PRESSED;
+            }
             return Ok(Some(JvmStackValue::Int(state)));
         }
         ("setFullScreenMode", "(Z)V") => Ok(None),

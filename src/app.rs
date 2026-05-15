@@ -24,6 +24,10 @@ pub struct InputState {
     pub down_pressed: bool,
     pub left_pressed: bool,
     pub right_pressed: bool,
+    pub a_pressed: bool,
+    pub b_pressed: bool,
+    pub c_pressed: bool,
+    pub d_pressed: bool,
 }
 
 pub static INPUT_STATE: LazyLock<Mutex<InputState>> = LazyLock::new(|| {
@@ -33,6 +37,10 @@ pub static INPUT_STATE: LazyLock<Mutex<InputState>> = LazyLock::new(|| {
         down_pressed: false,
         left_pressed: false,
         right_pressed: false,
+        a_pressed: false,
+        b_pressed: false,
+        c_pressed: false,
+        d_pressed: false,
     })
 });
 
@@ -157,6 +165,18 @@ impl ApplicationHandler for App {
                     }
                     KeyCode::ArrowRight => {
                         INPUT_STATE.lock().right_pressed = is_pressed;
+                    }
+                    KeyCode::KeyA => {
+                        INPUT_STATE.lock().a_pressed = is_pressed;
+                    }
+                    KeyCode::KeyS => {
+                        INPUT_STATE.lock().b_pressed = is_pressed;
+                    }
+                    KeyCode::KeyD => {
+                        INPUT_STATE.lock().c_pressed = is_pressed;
+                    }
+                    KeyCode::KeyF => {
+                        INPUT_STATE.lock().d_pressed = is_pressed;
                     }
                     _ => {}
                 }
