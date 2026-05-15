@@ -1561,6 +1561,88 @@ impl JVM {
 
                     pc += 3;
                 }
+                0xB9 => {
+                    // invokeinterface
+                    let cp_index =
+                        u16::from_be_bytes([bytecode[pc + 1], bytecode[pc + 2]]) as usize;
+                    
+                    // The count byte (not strictly needed as we can derive from descriptor)
+                    let _count = bytecode[pc + 3];
+                    
+                    // The fourth byte must be zero (reserved for future use)
+                    let _reserved = bytecode[pc + 4];
+
+                    // Resolve interface method info
+                    let (class_name, method_name, descriptor) = match &cp[cp_index - 1] {
+                        ConstantInfo::InterfaceMethodRef(iface_ref) => {
+                            JVM::resolve_interface_method_identity(iface_ref, cp)
+                        }
+                        ConstantInfo::MethodRef(m_ref) => {
+                            // Fallback for implementations that use MethodRef for interface methods
+                            JVM::resolve_method_identity(m_ref, cp)
+                        }
+                        _ => {
+                            return Err(format!(
+                                "invokeinterface: expected InterfaceMethodRef at index {}",
+                                cp_index
+                            )
+                            .into());
+                        }
+                    };
+
+                    // get count of args
+                    let arg_count = JVM::count_arguments(&descriptor);
+
+                    // get args from stack
+                    let mut args = Vec::new();
+                    for _ in 0..arg_count {
+                        args.push(stack.pop().ok_or("Stack underflow: missing arguments")?);
+                    }
+
+                    args.reverse(); // Maintain original order: [arg1, arg2, ...]
+
+                    let objectref = stack.pop().ok_or("Stack underflow: missing objectref")?;
+
+                    // if objectref is null, throw NullPointerException
+                    if let JvmStackValue::Null = objectref {
+                        return Err("0xB9 - java.lang.NullPointerException".into());
+                    }
+
+                    // For interface method lookup:
+                    // 1. First check if the object's actual class has the method
+                    // 2. Then search superclasses
+                    // 3. Then search superinterfaces
+                    
+                    let actual_class_name = {
+                        let state = jvm.state.lock();
+                        if let JvmStackValue::ObjectRef(id) = &objectref {
+                            if let Some(HeapObject::Instance(obj)) = state.heap.get(*id as usize) {
+                                obj.class_name.clone()
+                            } else {
+                                class_name.clone()
+                            }
+                        } else {
+                            return Err("invokeinterface: objectref is not a reference".into());
+                        }
+                    };
+
+                    // Execute the method on the actual class
+                    let res = JVM::execute_method(
+                        objectref,
+                        &actual_class_name,
+                        &method_name,
+                        &descriptor,
+                        &args,
+                        jvm,
+                        &mut stack,
+                    );
+
+                    if let Err(e) = res {
+                        return Err(format!("Error executing interface method: {}", e).into());
+                    }
+
+                    pc += 5; // invokeinterface is 5 bytes total
+                }
                 0xC0 => {
                     // checkcast
                     let cp_index =
@@ -2150,6 +2232,34 @@ impl JVM {
 
     fn resolve_method_identity(
         m: &MethodRefConstant,
+        pool: &[ConstantInfo],
+    ) -> (String, String, String) {
+        let ConstantInfo::Class(class_info) = &pool[m.class_index as usize - 1] else {
+            panic!()
+        };
+        let ConstantInfo::Utf8(class_utf8) = &pool[class_info.name_index as usize - 1] else {
+            panic!()
+        };
+
+        let ConstantInfo::NameAndType(nt_info) = &pool[m.name_and_type_index as usize - 1] else {
+            panic!()
+        };
+        let ConstantInfo::Utf8(name_utf8) = &pool[nt_info.name_index as usize - 1] else {
+            panic!()
+        };
+        let ConstantInfo::Utf8(desc_utf8) = &pool[nt_info.descriptor_index as usize - 1] else {
+            panic!()
+        };
+
+        (
+            class_utf8.utf8_string.clone(),
+            name_utf8.utf8_string.clone(),
+            desc_utf8.utf8_string.clone(),
+        )
+    }
+
+    fn resolve_interface_method_identity(
+        m: &classfile_parser::constant_info::InterfaceMethodRefConstant,
         pool: &[ConstantInfo],
     ) -> (String, String, String) {
         let ConstantInfo::Class(class_info) = &pool[m.class_index as usize - 1] else {
