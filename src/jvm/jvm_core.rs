@@ -1841,7 +1841,24 @@ impl JVM {
                 vector.push(val);
                 Ok(None)
             }
+            "elementAt" => {
+                let Some(JvmStackValue::Int(index)) = args.get(0) else {
+                    return Err(format!("Vector.elementAt(I): invalid arg {:?}", args.get(0)));
+                };
+
+                let index = *index as usize;
+                let value = vector
+                    .get(index)
+                    .ok_or_else(|| format!("Vector.elementAt: index out of bounds: {}", index))?
+                    .clone();
+
+                Ok(Some(value))
+            }
             "size" => Ok(Some(JvmStackValue::Int(vector.len() as i32))),
+            "removeAllElements" => {
+                vector.clear();
+                Ok(None)
+            }
             "<init>" => {
                 // Initialize the 'container' field to an empty vector
                 heap_obj
@@ -2892,7 +2909,7 @@ impl JVM {
 
         let return_value = JVM::run_frame(
             &code_attr.code,
-            &class_data.const_pool.clone(),
+            &current_class_data.const_pool,
             &mut locals,
             jvm,
         )?;
