@@ -32,8 +32,7 @@ fn main() {
 
     let event_loop = EventLoop::new().unwrap();
 
-    let flow = ControlFlow::wait_duration(Duration::from_millis(41));
-    event_loop.set_control_flow(flow);
+    event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::default();
     app.jvm = Some(jvm.clone());
