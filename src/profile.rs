@@ -11,11 +11,19 @@ static ALL_DURATIONS: Mutex<Vec<(String, Duration)>> = Mutex::new(Vec::new());
 
 impl Profile {
     pub fn clear() {
+        if !cfg!(feature = "profiler") {
+            return;
+        }
+
         let mut guard = ALL_DURATIONS.lock().unwrap();
         guard.clear();
     }
 
     pub fn dump(count: usize) {
+        if !cfg!(feature = "profiler") {
+            return;
+        }
+
         let guard = ALL_DURATIONS.lock().unwrap();
         println!("--- Profiling Results (last {} calls) ---", count);
         for (method, duration) in guard.iter().rev().take(count) {
@@ -33,6 +41,10 @@ impl Profile {
 
 impl Drop for Profile {
     fn drop(&mut self) {
+        if !cfg!(feature = "profiler") {
+            return;
+        }
+
         let elapsed = self.time.elapsed();
 
         let mut guard = ALL_DURATIONS.lock().unwrap();

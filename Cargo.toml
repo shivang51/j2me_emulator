@@ -15,3 +15,8 @@ zip = "8.6.0"
 
 [profile.dev]
 panic = "abort"
+
+
+[features]
+default = []
+profiler = []
