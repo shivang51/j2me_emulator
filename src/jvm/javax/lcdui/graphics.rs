@@ -337,6 +337,8 @@ fn get_resource_image(img_ref: &JvmStackValue, jvm: &JVM) -> Option<Arc<DynamicI
         _ => return None,
     };
 
+    println!("Attempting to load image resource with id {}", img_id);
+
     let mut cache = IMAGE_CACHE.lock().unwrap();
     if let Some(img) = cache.get(&img_id) {
         return Some(Arc::clone(img));
@@ -347,11 +349,27 @@ fn get_resource_image(img_ref: &JvmStackValue, jvm: &JVM) -> Option<Arc<DynamicI
         let Some(HeapObject::Instance(obj)) = state.heap.get(img_id) else {
             return None;
         };
+
         let Some(JvmStackValue::String(path)) = obj.fields.get("path:Ljava/lang/String;") else {
-            return None;
+            let w = match obj.fields.get("width:I") {
+                Some(JvmStackValue::Int(v)) => *v,
+                _ => panic!("Image instance missing width field"),
+            } as u32;
+            let h = match obj.fields.get("height:I") {
+                Some(JvmStackValue::Int(v)) => *v,
+                _ => panic!("Image instance missing height field"),
+            } as u32;
+            let img = image::DynamicImage::new_rgba8(w, h);
+            let img_ptr = Arc::new(img);
+            cache.insert(img_id, Arc::clone(&img_ptr));
+            return Some(img_ptr);
         };
-        let resource_name = path.strip_prefix('/').unwrap_or(path);
-        state.resources.get(resource_name).cloned()
+
+        let res_name = path.strip_prefix('/').unwrap_or(path);
+
+        println!("Loading resource: {} with id {}", res_name, img_id);
+
+        state.resources.get(res_name).cloned()
     };
 
     let Some(data) = resource_data else {
@@ -382,28 +400,36 @@ fn draw_region(
 ) {
     let img = match get_resource_image(img_ref, jvm) {
         Some(i) => i,
-        None => return,
+        None => {
+            panic!("draw_region: failed to load image resource");
+        }
     };
     let rgba = img.to_rgba8();
+    let img_w = rgba.width() as i32;
+    let img_h = rgba.height() as i32;
+
+    let (dest_w, dest_h) = match transform {
+        4 | 5 | 6 | 7 => (height, width),
+        _ => (width, height),
+    };
 
     let mut real_x = x_dest;
     let mut real_y = y_dest;
 
-    // Anchor handling
     if anchor & 1 != 0 {
         // HCENTER
-        real_x -= width / 2;
+        real_x -= dest_w / 2;
     } else if anchor & 8 != 0 {
         // RIGHT
-        real_x -= width;
+        real_x -= dest_w;
     }
 
     if anchor & 2 != 0 {
         // VCENTER
-        real_y -= height / 2;
+        real_y -= dest_h / 2;
     } else if anchor & 32 != 0 {
         // BOTTOM
-        real_y -= height;
+        real_y -= dest_h;
     }
 
     let mut draw_state = DRAW_STATE.lock();
@@ -413,59 +439,63 @@ fn draw_region(
     if let Some(pixels) = &mut draw_state.pixels {
         let frame = pixels.frame_mut();
 
-        for iy in 0..height {
-            for ix in 0..width {
-                let mut sx = ix;
-                let mut sy = iy;
+        for dy in 0..dest_h {
+            let dest_px_y = real_y + dy;
+            if dest_px_y < 0 || dest_px_y >= dh {
+                continue;
+            }
 
-                // Transform handling
-                match transform {
-                    0 => {}                    // NONE
-                    2 => sx = width - 1 - ix,  // MIRROR
-                    1 => sy = height - 1 - iy, // MIRROR_ROT180 (Vertical flip)
-                    3 => {
-                        // ROT180
-                        sx = width - 1 - ix;
-                        sy = height - 1 - iy;
-                    }
-                    _ => {} // Fallback to none for now
+            for dx in 0..dest_w {
+                let dest_px_x = real_x + dx;
+                if dest_px_x < 0 || dest_px_x >= dw {
+                    continue;
                 }
+
+                let (sx, sy) = match transform {
+                    0 => (dx, dy),                          // TRANS_NONE
+                    1 => (dx, height - 1 - dy),             // TRANS_MIRROR_ROT180 (Vertical Flip)
+                    2 => (width - 1 - dx, dy),              // TRANS_MIRROR (Horizontal Flip)
+                    3 => (width - 1 - dx, height - 1 - dy), // TRANS_ROT180
+                    4 => (dy, dx),                          // TRANS_MIRROR_ROT270
+                    5 => (dy, height - 1 - dx),             // TRANS_ROT90 (90 deg CW)
+                    6 => (width - 1 - dy, dx),              // TRANS_ROT270 (270 deg CW)
+                    7 => (width - 1 - dy, height - 1 - dx), // TRANS_MIRROR_ROT90
+                    _ => (dx, dy),                          // Fallback safety
+                };
 
                 let src_px_x = x_src + sx;
                 let src_px_y = y_src + sy;
 
-                if src_px_x < 0
-                    || src_px_x >= rgba.width() as i32
-                    || src_px_y < 0
-                    || src_px_y >= rgba.height() as i32
-                {
+                if src_px_x < 0 || src_px_x >= img_w || src_px_y < 0 || src_px_y >= img_h {
                     continue;
                 }
 
                 let px = rgba.get_pixel(src_px_x as u32, src_px_y as u32);
-                if px[3] == 0 {
-                    continue;
-                } // Fully transparent
+                let alpha = px[3];
 
-                let dest_px_x = real_x + ix;
-                let dest_px_y = real_y + iy;
-
-                if dest_px_x < 0 || dest_px_x >= dw || dest_px_y < 0 || dest_px_y >= dh {
-                    continue;
+                if alpha == 0 {
+                    continue; // Fully transparent
                 }
 
                 let offset = ((dest_px_y * dw + dest_px_x) * 4) as usize;
                 if offset + 4 <= frame.len() {
-                    if px[3] == 255 {
+                    if alpha == 255 {
+                        // opaque
                         frame[offset..offset + 4].copy_from_slice(&px.0);
                     } else {
-                        // Blend
-                        let alpha = px[3] as f32 / 255.0;
+                        let alpha_u32 = alpha as u32;
+                        let inv_alpha = 255 - alpha_u32;
+
                         for i in 0..3 {
-                            frame[offset + i] = ((px[i] as f32 * alpha)
-                                + (frame[offset + i] as f32 * (1.0 - alpha)))
-                                as u8;
+                            let src_c = px[i] as u32;
+                            let dest_c = frame[offset + i] as u32;
+
+                            // alpha blending
+                            frame[offset + i] =
+                                ((src_c * alpha_u32 + dest_c * inv_alpha) / 255) as u8;
                         }
+
+                        frame[offset + 3] = 255;
                     }
                 }
             }

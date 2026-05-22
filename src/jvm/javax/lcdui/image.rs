@@ -154,6 +154,15 @@ fn create_image_ii(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackV
         fields: HashMap::new(),
     };
 
+    instance.fields.insert(
+        "id".to_string(),
+        JvmStackValue::Int(state.heap.len() as i32),
+    );
+
+    instance
+        .fields
+        .insert("buff".to_string(), JvmStackValue::Vector(Vec::new()));
+
     instance
         .fields
         .insert("width:I".to_string(), JvmStackValue::Int(*width));
