@@ -1,5 +1,6 @@
 mod app;
 mod jvm;
+mod profile;
 mod services;
 
 use app::App;

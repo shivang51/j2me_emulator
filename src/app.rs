@@ -14,6 +14,7 @@ use pixels::{Pixels, SurfaceTexture, wgpu};
 
 use crate::jvm::JVM;
 use crate::jvm::javax::lcdui::game::game_canvas::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use crate::profile::Profile;
 
 pub struct DrawState {
     pub pixels: Option<Pixels<'static>>,
@@ -66,12 +67,16 @@ pub struct App {
 
 impl App {
     fn draw(&mut self) {
+        Profile::clear();
+
         if let Some(jvm) = &mut self.jvm {
             let res = jvm.paint();
             if let Err(e) = res {
                 eprintln!("[App] jvm.paint() failed: {}", e);
             }
         }
+
+        Profile::dump(10);
 
         let full_output = self.draw_ui();
         let window = self.window.unwrap();

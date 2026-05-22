@@ -1,6 +1,12 @@
+use std::sync::{Arc, LazyLock};
+
+use image::{DynamicImage, RgbaImage};
+use std::collections::HashMap;
+
 use crate::{
     app::DRAW_STATE,
     jvm::jvm_core::{HeapObject, JVM, JvmStackValue},
+    profile::Profile,
 };
 
 pub const CLASS_NAME: &str = "javax/microedition/lcdui/Graphics";
@@ -14,6 +20,7 @@ pub fn handle_virtual_method(
 ) -> Result<Option<JvmStackValue>, String> {
     match (method_name, descriptor) {
         ("setColor", "(I)V") => {
+            Profile::this("setColor(I)V");
             let color = match args.get(0) {
                 Some(JvmStackValue::Int(c)) => *c,
                 _ => return Err("Graphics.setColor: expected int argument".into()),
@@ -22,6 +29,7 @@ pub fn handle_virtual_method(
             return Ok(None);
         }
         ("setColor", "(III)V") => {
+            Profile::this("setColor(III)V");
             let r = match args.get(0) {
                 Some(JvmStackValue::Int(c)) => (*c & 0xFF) as i32,
                 _ => return Err("Graphics.setColor(III)V: expected int argument".into()),
@@ -40,6 +48,7 @@ pub fn handle_virtual_method(
             return Ok(None);
         }
         ("setStrokeStyle", "(I)V") => {
+            Profile::this("setStrokeStyle(I)V");
             let style = match args.get(0) {
                 Some(JvmStackValue::Int(s)) => *s,
                 _ => return Err("Graphics.setStrokeStyle: expected int argument".into()),
@@ -48,6 +57,7 @@ pub fn handle_virtual_method(
             return Ok(None);
         }
         ("getStrokeStyle", "()I") => {
+            Profile::this("getStrokeStyle()I");
             return Ok(Some(JvmStackValue::Int(get_int_field(
                 objectref,
                 jvm,
@@ -56,6 +66,7 @@ pub fn handle_virtual_method(
             ))));
         }
         ("fillRect", "(IIII)V") => {
+            Profile::this("fillRect(IIII)V");
             let x = get_int_arg(args, 0)?;
             let y = get_int_arg(args, 1)?;
             let width = get_int_arg(args, 2)?;
@@ -65,6 +76,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("drawRect", "(IIII)V") => {
+            Profile::this("drawRect(IIII)V");
             let x = get_int_arg(args, 0)?;
             let y = get_int_arg(args, 1)?;
             let width = get_int_arg(args, 2)?;
@@ -75,6 +87,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("drawLine", "(IIII)V") => {
+            Profile::this("drawLine(IIII)V");
             let x1 = get_int_arg(args, 0)?;
             let y1 = get_int_arg(args, 1)?;
             let x2 = get_int_arg(args, 2)?;
@@ -85,6 +98,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V") => {
+            Profile::this("drawRegion(IIIIIIII)V");
             let img_ref = args.get(0).ok_or("drawRegion: missing image")?;
             let x_src = get_int_arg(args, 1)?;
             let y_src = get_int_arg(args, 2)?;
@@ -101,6 +115,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("drawImage", "(Ljavax/microedition/lcdui/Image;III)V") => {
+            Profile::this("drawImage(III)V");
             let img_ref = args.get(0).ok_or("drawImage: missing image")?;
             let x = get_int_arg(args, 1)?;
             let y = get_int_arg(args, 2)?;
@@ -111,6 +126,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("fillTriangle", "(IIIIII)V") => {
+            Profile::this("fillTriangle(IIIIII)V");
             let x1 = get_int_arg(args, 0)?;
             let y1 = get_int_arg(args, 1)?;
             let x2 = get_int_arg(args, 2)?;
@@ -122,6 +138,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("drawArc", "(IIIIII)V") => {
+            Profile::this("drawArc(IIIIII)V");
             let x = get_int_arg(args, 0)?;
             let y = get_int_arg(args, 1)?;
             let width = get_int_arg(args, 2)?;
@@ -311,6 +328,46 @@ fn draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: [u8; 4], dotted: bool) {
     }
 }
 
+static IMAGE_CACHE: LazyLock<std::sync::Mutex<HashMap<usize, Arc<DynamicImage>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn get_resource_image(img_ref: &JvmStackValue, jvm: &JVM) -> Option<Arc<DynamicImage>> {
+    let img_id = match img_ref {
+        JvmStackValue::ObjectRef(id) => *id as usize,
+        _ => return None,
+    };
+
+    let mut cache = IMAGE_CACHE.lock().unwrap();
+    if let Some(img) = cache.get(&img_id) {
+        return Some(Arc::clone(img));
+    }
+
+    let resource_data = {
+        let state = jvm.state.lock();
+        let Some(HeapObject::Instance(obj)) = state.heap.get(img_id) else {
+            return None;
+        };
+        let Some(JvmStackValue::String(path)) = obj.fields.get("path:Ljava/lang/String;") else {
+            return None;
+        };
+        let resource_name = path.strip_prefix('/').unwrap_or(path);
+        state.resources.get(resource_name).cloned()
+    };
+
+    let Some(data) = resource_data else {
+        return None;
+    };
+
+    let Ok(img) = image::load_from_memory(&data) else {
+        return None;
+    };
+
+    let img_ptr = Arc::new(img);
+
+    cache.insert(img_id, Arc::clone(&img_ptr));
+    Some(img_ptr)
+}
+
 fn draw_region(
     img_ref: &JvmStackValue,
     x_src: i32,
@@ -323,30 +380,9 @@ fn draw_region(
     anchor: i32,
     jvm: &JVM,
 ) {
-    let img_id = match img_ref {
-        JvmStackValue::ObjectRef(id) => *id as usize,
-        _ => return,
-    };
-
-    let resource_data = {
-        let state = jvm.state.lock();
-        let Some(HeapObject::Instance(obj)) = state.heap.get(img_id) else {
-            return;
-        };
-        let Some(JvmStackValue::String(path)) = obj.fields.get("path:Ljava/lang/String;") else {
-            return;
-        };
-        let resource_name = path.strip_prefix('/').unwrap_or(path);
-        state.resources.get(resource_name).cloned()
-    };
-
-    let Some(data) = resource_data else {
-        return;
-    };
-
-    // Decode image (slow, but works for now)
-    let Ok(img) = image::load_from_memory(&data) else {
-        return;
+    let img = match get_resource_image(img_ref, jvm) {
+        Some(i) => i,
+        None => return,
     };
     let rgba = img.to_rgba8();
 
