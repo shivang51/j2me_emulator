@@ -1,8 +1,21 @@
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::jvm::jvm_core::{HeapObject, JVM, JvmObject, JvmStackValue};
 
 pub const CLASS_NAME: &str = "javax/microedition/lcdui/Image";
+
+#[derive(Debug, Clone)]
+pub struct ImageBufferData {
+    pub width: i32,
+    pub height: i32,
+    pub pixels: Vec<u8>,
+}
+
+pub type SharedImageBuffer = Arc<Mutex<ImageBufferData>>;
+
+pub static IMAGE_CACHE: LazyLock<Mutex<HashMap<usize, SharedImageBuffer>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn handle_static_method(
     method_name: &str,
@@ -49,10 +62,16 @@ pub fn handle_virtual_method(
         ("getWidth", "()I") => get_int_field(image, &["width:I", "width:Int"]).map(Some),
         ("getHeight", "()I") => get_int_field(image, &["height:I", "height:Int"]).map(Some),
         ("getGraphics", "()Ljavax/microedition/lcdui/Graphics;") => {
+            let mut fields = HashMap::new();
+            fields.insert(
+                "targetImageId:I".to_string(),
+                JvmStackValue::Int(image_id as i32),
+            );
+
             let handle = JVM::allocate_internal(
                 &mut state,
                 "javax/microedition/lcdui/Graphics".to_string(),
-                HashMap::new(),
+                fields,
             );
             Ok(Some(JvmStackValue::ObjectRef(handle)))
         }
@@ -105,6 +124,71 @@ fn create_image(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValu
     Ok(Some(JvmStackValue::ObjectRef(
         (state.heap.len() - 1) as u32,
     )))
+}
+
+pub fn get_or_create_buffer(img_ref: &JvmStackValue, jvm: &JVM) -> Option<SharedImageBuffer> {
+    let img_id = match img_ref {
+        JvmStackValue::ObjectRef(id) => *id as usize,
+        _ => return None,
+    };
+
+    let mut cache = IMAGE_CACHE.lock().unwrap();
+    if let Some(buffer) = cache.get(&img_id) {
+        return Some(Arc::clone(buffer));
+    }
+
+    let buffer = {
+        let state = jvm.state.lock();
+        let Some(HeapObject::Instance(obj)) = state.heap.get(img_id) else {
+            return None;
+        };
+
+        let width = match obj.fields.get("width:I") {
+            Some(JvmStackValue::Int(v)) => *v,
+            _ => return None,
+        };
+        let height = match obj.fields.get("height:I") {
+            Some(JvmStackValue::Int(v)) => *v,
+            _ => return None,
+        };
+
+        let mut pixels = vec![0; (width.max(0) * height.max(0) * 4) as usize];
+
+        if let Some(JvmStackValue::String(path)) = obj.fields.get("path:Ljava/lang/String;") {
+            let resource_name = path.strip_prefix('/').unwrap_or(path);
+            if let Some(data) = state.resources.get(resource_name) {
+                if let Ok(decoded) = image::load_from_memory(data) {
+                    let rgba = decoded.to_rgba8();
+                    let decoded_width = rgba.width() as i32;
+                    let decoded_height = rgba.height() as i32;
+                    pixels = rgba.into_raw();
+
+                    let buffer = Arc::new(Mutex::new(ImageBufferData {
+                        width: decoded_width,
+                        height: decoded_height,
+                        pixels,
+                    }));
+                    cache.insert(img_id, Arc::clone(&buffer));
+                    return Some(buffer);
+                }
+            }
+        }
+
+        Arc::new(Mutex::new(ImageBufferData {
+            width,
+            height,
+            pixels,
+        }))
+    };
+
+    cache.insert(img_id, Arc::clone(&buffer));
+    Some(buffer)
+}
+
+pub fn clone_image_buffer(img_ref: &JvmStackValue, jvm: &JVM) -> Option<ImageBufferData> {
+    let buffer = get_or_create_buffer(img_ref, jvm)?;
+    let buffer = buffer.lock().unwrap();
+    Some(buffer.clone())
 }
 
 fn get_int_field(image: &HeapObject, keys: &[&str]) -> Result<JvmStackValue, String> {

@@ -1,11 +1,9 @@
-use std::sync::{Arc, LazyLock};
-
-use image::{DynamicImage, RgbaImage};
-use std::collections::HashMap;
-
 use crate::{
     app::DRAW_STATE,
-    jvm::jvm_core::{HeapObject, JVM, JvmStackValue},
+    jvm::{
+        jvm_core::{HeapObject, JVM, JvmStackValue},
+        javax::lcdui::image::{clone_image_buffer, get_or_create_buffer},
+    },
     profile::Profile,
 };
 
@@ -72,7 +70,7 @@ pub fn handle_virtual_method(
             let width = get_int_arg(args, 2)?;
             let height = get_int_arg(args, 3)?;
             let color = get_color(objectref, jvm);
-            fill_rect(x, y, width, height, color);
+            fill_rect(objectref, jvm, x, y, width, height, color);
             Ok(None)
         }
         ("drawRect", "(IIII)V") => {
@@ -83,7 +81,7 @@ pub fn handle_virtual_method(
             let height = get_int_arg(args, 3)?;
             let color = get_color(objectref, jvm);
             let style = get_int_field(objectref, jvm, "strokeStyle", 0);
-            draw_rect(x, y, width, height, color, style == 1);
+            draw_rect(objectref, jvm, x, y, width, height, color, style == 1);
             Ok(None)
         }
         ("drawLine", "(IIII)V") => {
@@ -94,7 +92,7 @@ pub fn handle_virtual_method(
             let y2 = get_int_arg(args, 3)?;
             let color = get_color(objectref, jvm);
             let style = get_int_field(objectref, jvm, "strokeStyle", 0);
-            draw_line(x1, y1, x2, y2, color, style == 1);
+            draw_line(objectref, jvm, x1, y1, x2, y2, color, style == 1);
             Ok(None)
         }
         ("drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V") => {
@@ -110,7 +108,17 @@ pub fn handle_virtual_method(
             let anchor = get_int_arg(args, 8)?;
 
             draw_region(
-                img_ref, x_src, y_src, width, height, transform, x_dest, y_dest, anchor, jvm,
+                objectref,
+                img_ref,
+                x_src,
+                y_src,
+                width,
+                height,
+                transform,
+                x_dest,
+                y_dest,
+                anchor,
+                jvm,
             );
             Ok(None)
         }
@@ -122,7 +130,7 @@ pub fn handle_virtual_method(
             let anchor = get_int_arg(args, 3)?;
 
             let (w, h) = get_image_dim(img_ref, jvm);
-            draw_region(img_ref, 0, 0, w, h, 0, x, y, anchor, jvm);
+            draw_region(objectref, img_ref, 0, 0, w, h, 0, x, y, anchor, jvm);
             Ok(None)
         }
         ("fillTriangle", "(IIIIII)V") => {
@@ -134,7 +142,7 @@ pub fn handle_virtual_method(
             let x3 = get_int_arg(args, 4)?;
             let y3 = get_int_arg(args, 5)?;
             let color = get_color(objectref, jvm);
-            fill_triangle(x1, y1, x2, y2, x3, y3, color);
+            fill_triangle(objectref, jvm, x1, y1, x2, y2, x3, y3, color);
             Ok(None)
         }
         ("drawArc", "(IIIIII)V") => {
@@ -147,7 +155,7 @@ pub fn handle_virtual_method(
             let arc_angle = get_int_arg(args, 5)?;
 
             let color = get_color(objectref, jvm);
-            draw_arc(x, y, width, height, start_angle, arc_angle, color);
+            draw_arc(objectref, jvm, x, y, width, height, start_angle, arc_angle, color);
 
             Ok(None)
         }
@@ -182,6 +190,45 @@ fn get_int_arg(args: &[JvmStackValue], index: usize) -> Result<i32, String> {
             index
         )),
     }
+}
+
+fn get_target_image_id(objectref: &JvmStackValue, jvm: &JVM) -> Option<usize> {
+    let heap_idx = match objectref {
+        JvmStackValue::ObjectRef(id) => *id as usize,
+        _ => return None,
+    };
+
+    let state = jvm.state.lock();
+    let HeapObject::Instance(obj) = state.heap.get(heap_idx)? else {
+        return None;
+    };
+
+    match obj.fields.get("targetImageId:I") {
+        Some(JvmStackValue::Int(id)) => Some(*id as usize),
+        _ => None,
+    }
+}
+
+fn with_draw_target<R>(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    f: impl FnOnce(&mut [u8], i32, i32) -> R,
+) -> Option<R> {
+    if let Some(image_id) = get_target_image_id(objectref, jvm) {
+        let image_ref = JvmStackValue::ObjectRef(image_id as u32);
+        let buffer = get_or_create_buffer(&image_ref, jvm)?;
+        let mut buffer = buffer.lock().unwrap();
+        let width = buffer.width;
+        let height = buffer.height;
+        return Some(f(&mut buffer.pixels, width, height));
+    }
+
+    let mut draw_state = DRAW_STATE.lock();
+    let width = draw_state.width as i32;
+    let height = draw_state.height as i32;
+    let pixels = draw_state.pixels.as_mut()?;
+    let frame = pixels.frame_mut();
+    Some(f(frame, width, height))
 }
 
 fn get_color(objectref: &JvmStackValue, jvm: &JVM) -> [u8; 4] {
@@ -254,12 +301,16 @@ fn set_color_field(objectref: &JvmStackValue, jvm: &JVM, color: i32) {
     set_int_field(objectref, jvm, "color", color);
 }
 
-fn fill_rect(x: i32, y: i32, width: i32, height: i32, color: [u8; 4]) {
-    let mut draw_state = DRAW_STATE.lock();
-    let dw = draw_state.width as i32;
-    let dh = draw_state.height as i32;
-    if let Some(pixels) = &mut draw_state.pixels {
-        let frame = pixels.frame_mut();
+fn fill_rect(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: [u8; 4],
+) {
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         for iy in y..(y + height) {
             if iy < 0 || iy >= dh {
                 continue;
@@ -274,23 +325,54 @@ fn fill_rect(x: i32, y: i32, width: i32, height: i32, color: [u8; 4]) {
                 }
             }
         }
-    }
+    });
 }
 
-fn draw_rect(x: i32, y: i32, width: i32, height: i32, color: [u8; 4], dotted: bool) {
-    draw_line(x, y, x + width, y, color, dotted);
-    draw_line(x + width, y, x + width, y + height, color, dotted);
-    draw_line(x + width, y + height, x, y + height, color, dotted);
-    draw_line(x, y + height, x, y, color, dotted);
+fn draw_rect(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: [u8; 4],
+    dotted: bool,
+) {
+    draw_line(objectref, jvm, x, y, x + width, y, color, dotted);
+    draw_line(
+        objectref,
+        jvm,
+        x + width,
+        y,
+        x + width,
+        y + height,
+        color,
+        dotted,
+    );
+    draw_line(
+        objectref,
+        jvm,
+        x + width,
+        y + height,
+        x,
+        y + height,
+        color,
+        dotted,
+    );
+    draw_line(objectref, jvm, x, y + height, x, y, color, dotted);
 }
 
-fn draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: [u8; 4], dotted: bool) {
-    let mut draw_state = DRAW_STATE.lock();
-    let dw = draw_state.width as i32;
-    let dh = draw_state.height as i32;
-    if let Some(pixels) = &mut draw_state.pixels {
-        let frame = pixels.frame_mut();
-
+fn draw_line(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    color: [u8; 4],
+    dotted: bool,
+) {
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         let dx = (x2 - x1).abs();
         let dy = (y2 - y1).abs();
         let sx = if x1 < x2 { 1 } else { -1 };
@@ -325,68 +407,11 @@ fn draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: [u8; 4], dotted: bool) {
                 y += sy;
             }
         }
-    }
-}
-
-static IMAGE_CACHE: LazyLock<std::sync::Mutex<HashMap<usize, Arc<DynamicImage>>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-fn get_resource_image(img_ref: &JvmStackValue, jvm: &JVM) -> Option<Arc<DynamicImage>> {
-    let img_id = match img_ref {
-        JvmStackValue::ObjectRef(id) => *id as usize,
-        _ => return None,
-    };
-
-    println!("Attempting to load image resource with id {}", img_id);
-
-    let mut cache = IMAGE_CACHE.lock().unwrap();
-    if let Some(img) = cache.get(&img_id) {
-        return Some(Arc::clone(img));
-    }
-
-    let resource_data = {
-        let state = jvm.state.lock();
-        let Some(HeapObject::Instance(obj)) = state.heap.get(img_id) else {
-            return None;
-        };
-
-        let Some(JvmStackValue::String(path)) = obj.fields.get("path:Ljava/lang/String;") else {
-            let w = match obj.fields.get("width:I") {
-                Some(JvmStackValue::Int(v)) => *v,
-                _ => panic!("Image instance missing width field"),
-            } as u32;
-            let h = match obj.fields.get("height:I") {
-                Some(JvmStackValue::Int(v)) => *v,
-                _ => panic!("Image instance missing height field"),
-            } as u32;
-            let img = image::DynamicImage::new_rgba8(w, h);
-            let img_ptr = Arc::new(img);
-            cache.insert(img_id, Arc::clone(&img_ptr));
-            return Some(img_ptr);
-        };
-
-        let res_name = path.strip_prefix('/').unwrap_or(path);
-
-        println!("Loading resource: {} with id {}", res_name, img_id);
-
-        state.resources.get(res_name).cloned()
-    };
-
-    let Some(data) = resource_data else {
-        return None;
-    };
-
-    let Ok(img) = image::load_from_memory(&data) else {
-        return None;
-    };
-
-    let img_ptr = Arc::new(img);
-
-    cache.insert(img_id, Arc::clone(&img_ptr));
-    Some(img_ptr)
+    });
 }
 
 fn draw_region(
+    objectref: &JvmStackValue,
     img_ref: &JvmStackValue,
     x_src: i32,
     y_src: i32,
@@ -398,15 +423,12 @@ fn draw_region(
     anchor: i32,
     jvm: &JVM,
 ) {
-    let img = match get_resource_image(img_ref, jvm) {
-        Some(i) => i,
+    let (img_w, img_h, img_pixels) = match clone_image_buffer(img_ref, jvm) {
+        Some(buffer) => (buffer.width, buffer.height, buffer.pixels),
         None => {
             panic!("draw_region: failed to load image resource");
         }
     };
-    let rgba = img.to_rgba8();
-    let img_w = rgba.width() as i32;
-    let img_h = rgba.height() as i32;
 
     let (dest_w, dest_h) = match transform {
         4 | 5 | 6 | 7 => (height, width),
@@ -432,12 +454,8 @@ fn draw_region(
         real_y -= dest_h;
     }
 
-    let mut draw_state = DRAW_STATE.lock();
-    let dw = draw_state.width as i32;
-    let dh = draw_state.height as i32;
-
-    if let Some(pixels) = &mut draw_state.pixels {
-        let frame = pixels.frame_mut();
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
+        let src_stride = (img_w * 4) as usize;
 
         for dy in 0..dest_h {
             let dest_px_y = real_y + dy;
@@ -470,7 +488,12 @@ fn draw_region(
                     continue;
                 }
 
-                let px = rgba.get_pixel(src_px_x as u32, src_px_y as u32);
+                let src_offset = (src_px_y as usize * src_stride) + (src_px_x as usize * 4);
+                if src_offset + 4 > img_pixels.len() {
+                    continue;
+                }
+
+                let px = &img_pixels[src_offset..src_offset + 4];
                 let alpha = px[3];
 
                 if alpha == 0 {
@@ -481,7 +504,7 @@ fn draw_region(
                 if offset + 4 <= frame.len() {
                     if alpha == 255 {
                         // opaque
-                        frame[offset..offset + 4].copy_from_slice(&px.0);
+                        frame[offset..offset + 4].copy_from_slice(px);
                     } else {
                         let alpha_u32 = alpha as u32;
                         let inv_alpha = 255 - alpha_u32;
@@ -500,10 +523,12 @@ fn draw_region(
                 }
             }
         }
-    }
+    });
 }
 
 fn fill_triangle(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
     mut x1: i32,
     mut y1: i32,
     mut x2: i32,
@@ -530,12 +555,7 @@ fn fill_triangle(
         return;
     } // Flat line
 
-    let mut draw_state = DRAW_STATE.lock();
-    let dw = draw_state.width as i32;
-    let dh = draw_state.height as i32;
-    if let Some(pixels) = &mut draw_state.pixels {
-        let frame = pixels.frame_mut();
-
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         if y2 == y3 {
             fill_bottom_flat_triangle(x1, y1, x2, y2, x3, y3, dw, dh, frame, color);
         } else if y1 == y2 {
@@ -545,7 +565,7 @@ fn fill_triangle(
             fill_bottom_flat_triangle(x1, y1, x2, y2, x4, y2, dw, dh, frame, color);
             fill_top_flat_triangle(x2, y2, x4, y2, x3, y3, dw, dh, frame, color);
         }
-    }
+    });
 }
 
 fn fill_bottom_flat_triangle(
@@ -635,6 +655,8 @@ fn draw_horizontal_line(
 }
 
 fn draw_arc(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
     x: i32,
     y: i32,
     width: i32,
@@ -643,11 +665,7 @@ fn draw_arc(
     arc_angle: i32,
     color: [u8; 4],
 ) {
-    let mut draw_state = DRAW_STATE.lock();
-    let dw = draw_state.width as i32;
-    let dh = draw_state.height as i32;
-    if let Some(pixels) = &mut draw_state.pixels {
-        let frame = pixels.frame_mut();
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         let cx = x + width / 2;
         let cy = y + height / 2;
         let rx = width / 2;
@@ -671,5 +689,5 @@ fn draw_arc(
                 }
             }
         }
-    }
+    });
 }
