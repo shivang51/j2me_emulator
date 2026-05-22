@@ -25,10 +25,29 @@ impl Profile {
         }
 
         let guard = ALL_DURATIONS.lock().unwrap();
-        println!("--- Profiling Results (last {} calls) ---", count);
-        for (method, duration) in guard.iter().rev().take(count) {
-            println!("Graphics.{} took {:?}", method, duration);
+
+        let mut call_count: std::collections::HashMap<String, i32> =
+            std::collections::HashMap::new();
+
+        let total_time_per_method: std::collections::HashMap<String, Duration> = guard.iter().fold(
+            std::collections::HashMap::new(),
+            |mut acc, (method, duration)| {
+                *acc.entry(format!("{}", method.clone(),))
+                    .or_insert(Duration::ZERO) += *duration;
+                *call_count.entry(method.clone()).or_insert(0) += 1;
+                acc
+            },
+        );
+
+        for (method, duration) in total_time_per_method.iter().take(count) {
+            println!(
+                "[Called {} times] Graphics.{} took {:?}",
+                call_count.get(method).unwrap(),
+                method,
+                duration
+            );
         }
+        println!("--- Profiling Results (last {} calls) ---", count);
     }
 
     pub fn this(method_name: &str) -> Self {
