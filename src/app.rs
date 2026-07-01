@@ -66,6 +66,20 @@ pub struct App {
 }
 
 impl App {
+    fn is_emulation_paused(&self) -> bool {
+        self.jvm.as_ref().map(|jvm| jvm.is_paused()).unwrap_or(false)
+    }
+
+    fn set_emulation_paused(&self, paused: bool) {
+        if let Some(jvm) = &self.jvm {
+            jvm.set_paused(paused);
+        }
+    }
+
+    fn toggle_emulation_pause(&self) {
+        self.set_emulation_paused(!self.is_emulation_paused());
+    }
+
     fn draw(&mut self) {
         Profile::clear();
 
@@ -194,6 +208,7 @@ impl App {
 
         let egui_state = self.egui_state.as_mut().unwrap();
         let raw_input = egui_state.take_egui_input(self.window.unwrap());
+        let jvm_for_ui = self.jvm.clone();
         egui_state.egui_ctx().run_ui(raw_input, |ctx| {
             egui::Panel::top("menu_bar").show_inside(ctx, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
@@ -206,8 +221,28 @@ impl App {
                         }
                     });
                     ui.menu_button("Emulation", |ui| {
+                        let paused = jvm_for_ui
+                            .as_ref()
+                            .map(|jvm| jvm.is_paused())
+                            .unwrap_or(false);
+                        if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                            if let Some(jvm) = &jvm_for_ui {
+                                jvm.set_paused(!paused);
+                            }
+                            ui.close();
+                        }
                         if ui.button("Reset").clicked() { /* Reset JVM */ }
                     });
+                    ui.separator();
+                    let paused = jvm_for_ui
+                        .as_ref()
+                        .map(|jvm| jvm.is_paused())
+                        .unwrap_or(false);
+                    if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                        if let Some(jvm) = &jvm_for_ui {
+                            jvm.set_paused(!paused);
+                        }
+                    }
                 });
             });
 
@@ -221,6 +256,14 @@ impl App {
                 .resizable(true)
                 .show_inside(ctx, |ui| {
                     ui.heading("Debug Info");
+                    let paused = jvm_for_ui
+                        .as_ref()
+                        .map(|jvm| jvm.is_paused())
+                        .unwrap_or(false);
+                    ui.label(format!(
+                        "Emulation: {}",
+                        if paused { "Paused" } else { "Running" }
+                    ));
                     if let Some(texture) = &self.game_texture {
                         ui.label(format!("Size - {:.2}", texture.size_vec2()));
                     }
@@ -232,7 +275,7 @@ impl App {
                 .show_inside(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.horizontal(|ui| {
-                            let jar = self.jvm.as_ref().unwrap().loaded_jar.as_ref().unwrap();
+                            let jar = jvm_for_ui.as_ref().unwrap().loaded_jar.as_ref().unwrap();
 
                             match jar.resources.get(&jar.manifest.icon) {
                                 Some(icon_data) => {
@@ -441,6 +484,11 @@ impl ApplicationHandler for App {
                     }
                     KeyCode::KeyF => {
                         INPUT_STATE.lock().d_pressed = is_pressed;
+                    }
+                    KeyCode::KeyP => {
+                        if is_pressed && !event.repeat {
+                            self.toggle_emulation_pause();
+                        }
                     }
                     _ => {}
                 }

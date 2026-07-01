@@ -40,6 +40,24 @@ struct PlayerRuntime {
 static PLAYERS: LazyLock<Mutex<HashMap<usize, PlayerRuntime>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+pub fn pause_all() {
+    let players = PLAYERS.lock().unwrap();
+    for player in players.values() {
+        if let Some(child) = &player.child {
+            signal_child(child, ChildSignal::Stop);
+        }
+    }
+}
+
+pub fn resume_all() {
+    let players = PLAYERS.lock().unwrap();
+    for player in players.values() {
+        if let Some(child) = &player.child {
+            signal_child(child, ChildSignal::Continue);
+        }
+    }
+}
+
 pub fn handle_manager_static_method(
     method_name: &str,
     descriptor: &str,
@@ -822,3 +840,32 @@ fn existing_soundfont_file(path: PathBuf) -> Option<String> {
         None
     }
 }
+
+enum ChildSignal {
+    Stop,
+    Continue,
+}
+
+#[cfg(unix)]
+fn signal_child(child: &Child, signal: ChildSignal) {
+    use std::os::raw::c_int;
+
+    const SIGSTOP: c_int = 19;
+    const SIGCONT: c_int = 18;
+
+    unsafe extern "C" {
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    let signal = match signal {
+        ChildSignal::Stop => SIGSTOP,
+        ChildSignal::Continue => SIGCONT,
+    };
+
+    unsafe {
+        let _ = kill(child.id() as c_int, signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_child(_child: &Child, _signal: ChildSignal) {}

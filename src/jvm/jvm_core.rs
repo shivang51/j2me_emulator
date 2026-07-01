@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::panic;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use classfile_parser::constant_info::{ConstantInfo, FieldRefConstant, MethodRefConstant};
 
@@ -72,6 +73,20 @@ pub struct JVM {
     pub loaded_jar: Option<JarFileData>,
     pub state: SharedJvmState,
     pub thread_handles: Arc<Mutex<HashMap<u32, std::thread::JoinHandle<()>>>>,
+    pause_control: Arc<PauseControl>,
+}
+
+#[derive(Debug)]
+struct PauseControl {
+    state: StdMutex<PauseState>,
+    wake: Condvar,
+}
+
+#[derive(Debug)]
+struct PauseState {
+    paused: bool,
+    pause_started: Option<Instant>,
+    total_paused: Duration,
 }
 
 impl Clone for JVM {
@@ -80,6 +95,7 @@ impl Clone for JVM {
             loaded_jar: self.loaded_jar.clone(),
             state: Arc::clone(&self.state),
             thread_handles: Arc::clone(&self.thread_handles),
+            pause_control: Arc::clone(&self.pause_control),
         }
     }
 }
@@ -123,7 +139,80 @@ impl JVM {
             loaded_jar: None,
             state: Arc::new(Mutex::new(state)),
             thread_handles: Arc::new(Mutex::new(HashMap::new())),
+            pause_control: Arc::new(PauseControl {
+                state: StdMutex::new(PauseState {
+                    paused: false,
+                    pause_started: None,
+                    total_paused: Duration::ZERO,
+                }),
+                wake: Condvar::new(),
+            }),
         }
+    }
+
+    pub fn pause(&self) {
+        let mut pause_state = self.pause_control.state.lock().unwrap();
+        if pause_state.paused {
+            return;
+        }
+
+        pause_state.paused = true;
+        pause_state.pause_started = Some(Instant::now());
+        drop(pause_state);
+        player::pause_all();
+    }
+
+    pub fn resume(&self) {
+        let mut pause_state = self.pause_control.state.lock().unwrap();
+        if !pause_state.paused {
+            return;
+        }
+
+        if let Some(started) = pause_state.pause_started.take() {
+            pause_state.total_paused += started.elapsed();
+        }
+        pause_state.paused = false;
+        drop(pause_state);
+
+        player::resume_all();
+        self.pause_control.wake.notify_all();
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        if paused {
+            self.pause();
+        } else {
+            self.resume();
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.pause_control.state.lock().unwrap().paused
+    }
+
+    fn wait_if_paused(&self) {
+        let mut pause_state = self.pause_control.state.lock().unwrap();
+        while pause_state.paused {
+            pause_state = self.pause_control.wake.wait(pause_state).unwrap();
+        }
+    }
+
+    fn current_time_millis(&self) -> i64 {
+        let wall_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let paused_duration = {
+            let pause_state = self.pause_control.state.lock().unwrap();
+            let current_pause = pause_state
+                .pause_started
+                .map(|started| started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            pause_state.total_paused + current_pause
+        };
+
+        wall_millis.saturating_sub(paused_duration.as_millis()) as i64
     }
 
     pub fn run_jar(&mut self, data: JarFileData) -> Result<Option<JvmStackValue>, String> {
@@ -332,6 +421,8 @@ impl JVM {
         let mut op_count = 0;
 
         while pc < bytecode.len() {
+            jvm.wait_if_paused();
+
             let opcode = bytecode[pc];
 
             op_count += 1;
@@ -3917,11 +4008,7 @@ impl JVM {
             }
             return Ok(());
         } else if class_name == "java/lang/System" && method_name == "currentTimeMillis" {
-            let millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-            stack.push(JvmStackValue::Long(millis));
+            stack.push(JvmStackValue::Long(jvm.current_time_millis()));
             return Ok(());
         } else if class_name == "java/lang/Math" {
             let res = JVM::handle_math_fns(method_name, descriptor, args);
@@ -4020,6 +4107,10 @@ impl JVM {
     }
 
     pub fn paint(&self) -> Result<(), String> {
+        if self.is_paused() {
+            return Ok(());
+        }
+
         static IS_PAINTING: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if IS_PAINTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
