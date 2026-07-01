@@ -40,6 +40,7 @@ pub fn handle_virtual_method(
         ("getCurrent", "()Ljavax/microedition/lcdui/Displayable;") => {
             return get_displayable_obj(objectref, jvm);
         }
+        ("vibrate", "(I)Z") => Ok(Some(JvmStackValue::Int(0))),
         _ => Err(format!(
             "Unsupported Display instance method: {}{}",
             method_name, descriptor
