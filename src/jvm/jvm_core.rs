@@ -1285,7 +1285,8 @@ impl JVM {
                         return Err("getfield: expected FieldRef".into());
                     };
 
-                    let field_name = JVM::resolve_field_name(field_ref, cp);
+                    let field_key = JVM::get_field_key(field_ref, cp);
+                    let legacy_field_name = JVM::resolve_field_name(field_ref, cp);
 
                     let objectref = stack.pop().ok_or("getfield: stack underflow")?;
 
@@ -1303,12 +1304,19 @@ impl JVM {
                             .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
                         if let HeapObject::Instance(obj) = obj {
+                            let resolved_field_key = JVM::resolve_instance_field_key(
+                                &state,
+                                &field_key,
+                                &legacy_field_name,
+                            );
                             obj.fields
-                                .get(&field_name)
+                                .get(&resolved_field_key)
+                                .or_else(|| obj.fields.get(&field_key))
+                                .or_else(|| obj.fields.get(&legacy_field_name))
                                 .ok_or_else(|| {
                                     format!(
                                         "Field '{}' not found in object of class '{}'",
-                                        field_name, obj.class_name
+                                        field_key, obj.class_name
                                     )
                                 })?
                                 .clone()
@@ -1330,7 +1338,8 @@ impl JVM {
                         return Err("putfield: expected FieldRef".into());
                     };
 
-                    let field_name = JVM::resolve_field_name(field_ref, cp);
+                    let field_key = JVM::get_field_key(field_ref, cp);
+                    let legacy_field_name = JVM::resolve_field_name(field_ref, cp);
 
                     let value = stack.pop().ok_or("putfield: stack underflow (value)")?;
 
@@ -1342,6 +1351,11 @@ impl JVM {
                         _ => return Err("putfield: objectref is not a reference".into()),
                     };
 
+                    let resolved_field_key = {
+                        let state = jvm.state.lock();
+                        JVM::resolve_instance_field_key(&state, &field_key, &legacy_field_name)
+                    };
+
                     {
                         let mut state = jvm.state.lock();
                         let obj = state
@@ -1350,7 +1364,17 @@ impl JVM {
                             .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
                         if let HeapObject::Instance(obj) = obj {
-                            obj.fields.insert(field_name, value);
+                            if obj.fields.contains_key(&resolved_field_key)
+                                || !obj.fields.contains_key(&legacy_field_name)
+                            {
+                                obj.fields.insert(resolved_field_key, value);
+                            } else if obj.fields.contains_key(&field_key)
+                                || !obj.fields.contains_key(&legacy_field_name)
+                            {
+                                obj.fields.insert(field_key, value);
+                            } else {
+                                obj.fields.insert(legacy_field_name, value);
+                            }
                         } else {
                             return Err("putfield: Heap object is not an instance".into());
                         }
@@ -2190,6 +2214,43 @@ impl JVM {
             "{}.{}:{}",
             class_utf8.utf8_string, name_utf8.utf8_string, desc_utf8.utf8_string
         )
+    }
+
+    fn resolve_instance_field_key(
+        state: &JvmState,
+        field_key: &str,
+        legacy_field_name: &str,
+    ) -> String {
+        let Some((referenced_class_name, _)) = field_key.rsplit_once('.') else {
+            return field_key.to_string();
+        };
+
+        let mut current_class = Some(referenced_class_name.to_string());
+        while let Some(class_name) = current_class {
+            let Some(class_data) = state.classes.get(&class_name) else {
+                break;
+            };
+
+            for field_info in &class_data.fields {
+                if field_info
+                    .access_flags
+                    .contains(classfile_parser::field_info::FieldAccessFlags::STATIC)
+                {
+                    continue;
+                }
+
+                let field_name = JVM::resolve_utf8(field_info.name_index, &class_data.const_pool);
+                let descriptor =
+                    JVM::resolve_utf8(field_info.descriptor_index, &class_data.const_pool);
+                if format!("{}:{}", field_name, descriptor) == legacy_field_name {
+                    return format!("{}.{}:{}", class_name, field_name, descriptor);
+                }
+            }
+
+            current_class = JVM::get_super_class_name(class_data);
+        }
+
+        field_key.to_string()
     }
 
     fn count_arguments(descriptor: &str) -> usize {
@@ -3290,7 +3351,7 @@ impl JVM {
                                 };
                             let f_name =
                                 JVM::resolve_utf8(field_info.name_index, &class_data.const_pool);
-                            let key = format!("{}:{}", f_name, descriptor);
+                            let key = format!("{}.{}:{}", name, f_name, descriptor);
                             fields.insert(key, default_val);
                         }
                         current_class = JVM::get_super_class_name(class_data);
