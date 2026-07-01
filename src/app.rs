@@ -391,6 +391,32 @@ impl App {
                 .resizable(true)
                 .show_inside(ctx, |ui| {
                     ui.take_available_space();
+                    ui.heading("Test Files");
+
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        for entry in std::fs::read_dir("test_files").unwrap() {
+                            if let Ok(entry) = entry {
+                                let path = entry.path();
+                                if path.is_file()
+                                    && path.extension().map(|ext| ext == "jar").unwrap_or(false)
+                                {
+                                    let file_name =
+                                        path.file_name().unwrap().to_string_lossy().to_string();
+
+                                    let short_name = if file_name.len() > 30 {
+                                        format!("{}...", &file_name[..27])
+                                    } else {
+                                        file_name.clone()
+                                    };
+
+                                    if ui.button(short_name).on_hover_text(file_name).clicked() {
+                                        action =
+                                            UiAction::OpenJar(path.to_string_lossy().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    });
                 });
 
             egui::Panel::right("right_panel")
