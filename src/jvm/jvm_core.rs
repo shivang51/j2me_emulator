@@ -2504,6 +2504,17 @@ impl JVM {
                 }
                 Ok(Some(objectref.clone()))
             }
+            ("append", descriptor)
+                if descriptor.starts_with("(Ljava/lang/String;")
+                    || descriptor.starts_with("(Ljava/lang/Object;") =>
+            {
+                let value = args
+                    .first()
+                    .map(|val| JVM::char_sequence_to_string(val, jvm))
+                    .unwrap_or_else(|| "null".to_string());
+                print!("{}", value);
+                Ok(Some(objectref.clone()))
+            }
             ("append", descriptor) if descriptor.starts_with("(Ljava/lang/CharSequence;)") => {
                 let value = args
                     .first()
@@ -3625,42 +3636,44 @@ impl JVM {
 
         match method {
             "append" => {
-                let buffer: &mut String = {
-                    if let JvmStackValue::String(s) = heap_obj.fields.get_mut("buffer").unwrap() {
-                        s
-                    } else {
-                        return Err("StringBuffer instance missing 'buffer' field".into());
-                    }
-                };
+                JVM::ensure_string_buffer_field(heap_obj);
 
-                let val = args[1].clone();
+                let val = args.get(1).cloned().unwrap_or(JvmStackValue::Null);
                 let append_str = match val {
                     JvmStackValue::String(s) => s,
                     JvmStackValue::Int(i) => i.to_string(),
                     JvmStackValue::Float(f) => f.to_string(),
                     JvmStackValue::Long(l) => l.to_string(),
                     JvmStackValue::Double(d) => d.to_string(),
+                    JvmStackValue::Null => "null".to_string(),
                     _ => format!("{:?}", val),
+                };
+
+                let buffer = match heap_obj.fields.get_mut("buffer") {
+                    Some(JvmStackValue::String(s)) => s,
+                    _ => return Err("StringBuffer instance has invalid 'buffer' field".into()),
                 };
                 buffer.push_str(&append_str);
                 Ok(Some(args[0].clone()))
             }
             "toString" => {
-                let buffer: &mut String = {
-                    if let JvmStackValue::String(s) = heap_obj.fields.get_mut("buffer").unwrap() {
-                        s
-                    } else {
-                        return Err("StringBuffer instance missing 'buffer' field".into());
-                    }
+                JVM::ensure_string_buffer_field(heap_obj);
+                let buffer = match heap_obj.fields.get("buffer") {
+                    Some(JvmStackValue::String(s)) => s,
+                    _ => return Err("StringBuffer instance has invalid 'buffer' field".into()),
                 };
 
                 Ok(Some(JvmStackValue::String(buffer.clone())))
             }
             "<init>" => {
-                // Initialize the 'buffer' field to an empty string
+                let initial_value = match args.get(1) {
+                    Some(JvmStackValue::String(s)) => s.clone(),
+                    Some(JvmStackValue::Null) | None => String::new(),
+                    Some(value) => format!("{:?}", value),
+                };
                 heap_obj
                     .fields
-                    .insert("buffer".to_string(), JvmStackValue::String(String::new()));
+                    .insert("buffer".to_string(), JvmStackValue::String(initial_value));
                 Ok(None)
             }
             _ => {
@@ -3671,6 +3684,14 @@ impl JVM {
                 panic!();
                 Ok(None)
             }
+        }
+    }
+
+    fn ensure_string_buffer_field(heap_obj: &mut JvmObject) {
+        if !matches!(heap_obj.fields.get("buffer"), Some(JvmStackValue::String(_))) {
+            heap_obj
+                .fields
+                .insert("buffer".to_string(), JvmStackValue::String(String::new()));
         }
     }
 

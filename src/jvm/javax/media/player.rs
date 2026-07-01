@@ -87,8 +87,8 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("start", "()V") => {
-            start_player(player_id);
-            set_state(player_id, STATE_STARTED, jvm);
+            let state = start_player(player_id);
+            set_state(player_id, state, jvm);
             Ok(None)
         }
         ("stop", "()V") => {
@@ -151,14 +151,9 @@ pub fn handle_virtual_method(
             };
             Ok(Some(JvmStackValue::ObjectRef(array_ref)))
         }
-        ("getState", "()I") => Ok(Some(JvmStackValue::Int(
-            PLAYERS
-                .lock()
-                .unwrap()
-                .get(&player_id)
-                .map(|player| player.state)
-                .unwrap_or(STATE_CLOSED),
-        ))),
+        ("getState", "()I") => Ok(Some(JvmStackValue::Int(current_player_state(
+            player_id, jvm,
+        )))),
         _ => Err(format!(
             "Unsupported Player instance method: {}{}",
             method_name, descriptor
@@ -338,17 +333,17 @@ fn allocate_volume_control(jvm: &JVM, player_id: usize) -> u32 {
     JVM::allocate_internal(&mut state, VOLUME_CONTROL_CLASS_NAME.to_string(), fields)
 }
 
-fn start_player(player_id: usize) {
+fn start_player(player_id: usize) -> i32 {
     stop_player(player_id);
 
     let mut players = PLAYERS.lock().unwrap();
     let Some(player) = players.get_mut(&player_id) else {
-        return;
+        return STATE_CLOSED;
     };
 
     let Some(media_file) = ensure_media_file(player_id, player) else {
-        player.state = STATE_STARTED;
-        return;
+        player.state = STATE_PREFETCHED;
+        return player.state;
     };
 
     player.child = spawn_decoder(
@@ -357,7 +352,12 @@ fn start_player(player_id: usize) {
         player.loop_count,
         player.volume,
     );
-    player.state = STATE_STARTED;
+    player.state = if player.child.is_some() {
+        STATE_STARTED
+    } else {
+        STATE_PREFETCHED
+    };
+    player.state
 }
 
 fn stop_player(player_id: usize) {
@@ -386,10 +386,60 @@ fn set_state(player_id: usize, state_value: i32, jvm: &JVM) {
         player.state = state_value;
     }
 
+    set_heap_state(player_id, state_value, jvm);
+}
+
+fn set_heap_state(player_id: usize, state_value: i32, jvm: &JVM) {
     let mut state = jvm.state.lock();
     if let Some(HeapObject::Instance(obj)) = state.heap.get_mut(player_id) {
         obj.fields
             .insert("state:I".to_string(), JvmStackValue::Int(state_value));
+    }
+}
+
+fn current_player_state(player_id: usize, jvm: &JVM) -> i32 {
+    let mut state_to_sync = None;
+    let state_value = {
+        let mut players = PLAYERS.lock().unwrap();
+        let Some(player) = players.get_mut(&player_id) else {
+            return STATE_CLOSED;
+        };
+
+        if reap_finished_child(player) {
+            player.state = STATE_PREFETCHED;
+            state_to_sync = Some(player.state);
+        }
+
+        player.state
+    };
+
+    if let Some(state_value) = state_to_sync {
+        set_heap_state(player_id, state_value, jvm);
+    }
+
+    state_value
+}
+
+fn reap_finished_child(player: &mut PlayerRuntime) -> bool {
+    let Some(child) = player.child.as_mut() else {
+        return false;
+    };
+
+    match child.try_wait() {
+        Ok(Some(_status)) => {
+            if let Some(mut child) = player.child.take() {
+                let _ = child.wait();
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(err) => {
+            eprintln!("[Media] Failed to query decoder process: {}", err);
+            if let Some(mut child) = player.child.take() {
+                let _ = child.wait();
+            }
+            true
+        }
     }
 }
 
