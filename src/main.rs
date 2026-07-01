@@ -33,8 +33,7 @@ fn main() {
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::default();
-    app.jvm = Some(jvm.clone());
+    let mut app = App::with_jvm(jvm.clone(), Some(JAR_PATH.to_string()));
     let res = event_loop.run_app(&mut app);
 
     if let Err(e) = res {

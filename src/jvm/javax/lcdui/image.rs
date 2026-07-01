@@ -17,6 +17,10 @@ pub type SharedImageBuffer = Arc<Mutex<ImageBufferData>>;
 pub static IMAGE_CACHE: LazyLock<Mutex<HashMap<usize, SharedImageBuffer>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+pub fn clear_cache() {
+    IMAGE_CACHE.lock().unwrap().clear();
+}
+
 pub fn handle_static_method(
     method_name: &str,
     descriptor: &str,

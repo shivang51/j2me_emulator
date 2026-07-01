@@ -12,6 +12,8 @@ pub const DEFAULT_WIDTH: i32 = 364;
 pub const DEFAULT_HEIGHT: i32 = 364;
 
 pub const CLASS_NAME: &str = "javax/microedition/lcdui/game/GameCanvas";
+const SCREEN_GRAPHICS_FIELD: &str =
+    "javax/microedition/lcdui/game/GameCanvas.screenGraphics:Ljavax/microedition/lcdui/Graphics;";
 
 pub static DOWN_PRESSED: i32 = 64;
 pub static FIRE_PRESSED: i32 = 256;
@@ -26,7 +28,6 @@ pub static UP_PRESSED: i32 = 2;
 pub fn paint(jvm: &JVM) -> Result<(), String> {
     let displayable_ref;
     let class_name;
-    static mut GRAPHICS_HANDLE: i32 = -1;
     let graphics_handle;
 
     {
@@ -46,14 +47,7 @@ pub fn paint(jvm: &JVM) -> Result<(), String> {
             return Err("Displayable is not an object ref".into());
         };
 
-        if unsafe { GRAPHICS_HANDLE } == -1 {
-            let fields = HashMap::new();
-            let mut state = jvm.state.lock();
-            let hwd = JVM::allocate_internal(&mut state, graphics::CLASS_NAME.to_string(), fields);
-            unsafe { GRAPHICS_HANDLE = hwd as i32 };
-        }
-
-        graphics_handle = unsafe { GRAPHICS_HANDLE } as u32;
+        graphics_handle = get_screen_graphics_handle(jvm);
     }
 
     return JVM::execute_method(
@@ -67,6 +61,28 @@ pub fn paint(jvm: &JVM) -> Result<(), String> {
     );
 }
 
+fn get_screen_graphics_handle(jvm: &JVM) -> u32 {
+    let mut state = jvm.state.lock();
+
+    if let Some(JvmStackValue::ObjectRef(handle)) = state.static_fields.get(SCREEN_GRAPHICS_FIELD) {
+        if matches!(
+            state.heap.get(*handle as usize),
+            Some(HeapObject::Instance(inst))
+                if inst.class_name == graphics::CLASS_NAME
+                    && !inst.fields.contains_key("targetImageId:I")
+        ) {
+            return *handle;
+        }
+    }
+
+    let graphics_ref = JVM::allocate_internal(&mut state, graphics::CLASS_NAME.to_string(), HashMap::new());
+    state.static_fields.insert(
+        SCREEN_GRAPHICS_FIELD.to_string(),
+        JvmStackValue::ObjectRef(graphics_ref),
+    );
+    graphics_ref
+}
+
 pub fn handle_virtual_method(
     object: &mut JvmObject,
     method_name: &str,
@@ -75,6 +91,12 @@ pub fn handle_virtual_method(
     jvm: &JVM,
 ) -> Result<Option<JvmStackValue>, String> {
     match (method_name, descriptor) {
+        ("<init>", "()V") => {
+            object
+                .fields
+                .insert("suppressKeyEvents:Z".into(), JvmStackValue::Int(0));
+            Ok(None)
+        }
         ("<init>", "(Z)V") => {
             if let Some(JvmStackValue::Int(suppress_key_evts)) = args.get(0) {
                 object.fields.insert(
@@ -121,8 +143,8 @@ pub fn handle_virtual_method(
             return Ok(Some(JvmStackValue::Int(state)));
         }
         ("setFullScreenMode", "(Z)V") => Ok(None),
-        ("flushGraphics", "()V") => todo!("GameCanvas.flushGraphics"),
-        ("flushGraphics", "(IIII)V") => todo!("GameCanvas.flushGraphics(IIII)"),
+        ("flushGraphics", "()V") => Ok(None),
+        ("flushGraphics", "(IIII)V") => Ok(None),
         ("getGraphics", "()Ljavax/microedition/lcdui/Graphics;") => {
             let mut state = jvm.state.lock();
             let graphics_handle = JVM::allocate_internal(
@@ -139,8 +161,8 @@ pub fn handle_virtual_method(
             // }
             Ok(None)
         }
-        ("repaint", "(IIII)V") => todo!("GameCanvas.repaint(IIII)"),
-        ("serviceRepaints", "()V") => todo!("GameCanvas.serviceRepaints"),
+        ("repaint", "(IIII)V") => Ok(None),
+        ("serviceRepaints", "()V") => Ok(None),
         _ => Err(format!(
             "Unsupported GameCanvas instance method: {}{}",
             method_name, descriptor

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -14,7 +15,9 @@ use pixels::{Pixels, SurfaceTexture, wgpu};
 
 use crate::jvm::JVM;
 use crate::jvm::javax::lcdui::game::game_canvas::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use crate::jvm::javax::lcdui::image as lcdui_image;
 use crate::profile::Profile;
+use crate::services::jar_extractor::{JarExtractor, JarFileData};
 
 pub struct DrawState {
     pub pixels: Option<Pixels<'static>>,
@@ -63,11 +66,33 @@ pub struct App {
     egui_renderer: Option<egui_wgpu::Renderer>,
     game_texture: Option<egui::TextureHandle>,
     pub jvm: Option<JVM>,
+    current_jar_path: Option<String>,
+    jar_path_input: String,
+    open_jar_dialog: bool,
+    status_message: Option<String>,
+}
+
+enum UiAction {
+    None,
+    OpenJar(String),
+    Reset,
 }
 
 impl App {
+    pub fn with_jvm(jvm: JVM, jar_path: Option<String>) -> Self {
+        Self {
+            jvm: Some(jvm),
+            jar_path_input: jar_path.clone().unwrap_or_default(),
+            current_jar_path: jar_path,
+            ..Self::default()
+        }
+    }
+
     fn is_emulation_paused(&self) -> bool {
-        self.jvm.as_ref().map(|jvm| jvm.is_paused()).unwrap_or(false)
+        self.jvm
+            .as_ref()
+            .map(|jvm| jvm.is_paused())
+            .unwrap_or(false)
     }
 
     fn set_emulation_paused(&self, paused: bool) {
@@ -78,6 +103,114 @@ impl App {
 
     fn toggle_emulation_pause(&self) {
         self.set_emulation_paused(!self.is_emulation_paused());
+    }
+
+    fn update_window_title(&self) {
+        let Some(window) = self.window else {
+            return;
+        };
+
+        let title = self
+            .jvm
+            .as_ref()
+            .and_then(|jvm| jvm.loaded_jar.as_ref())
+            .map(|jar| format!("{} - J2ME", jar.manifest.name))
+            .unwrap_or_else(|| "No file loaded - J2ME".to_string());
+
+        window.set_title(&title);
+    }
+
+    fn reset_input_state() {
+        let mut input = INPUT_STATE.lock();
+        input.space_pressed = false;
+        input.up_pressed = false;
+        input.down_pressed = false;
+        input.left_pressed = false;
+        input.right_pressed = false;
+        input.a_pressed = false;
+        input.b_pressed = false;
+        input.c_pressed = false;
+        input.d_pressed = false;
+    }
+
+    fn replace_jvm(&mut self, data: JarFileData, jar_path: Option<String>) -> Result<(), String> {
+        if let Some(jvm) = &self.jvm {
+            jvm.shutdown();
+        }
+
+        lcdui_image::clear_cache();
+
+        let mut new_jvm = JVM::new();
+        if let Err(err) = new_jvm.run_jar(data) {
+            new_jvm.shutdown();
+            self.jvm = None;
+            self.game_texture = None;
+            self.update_window_title();
+            return Err(err);
+        }
+
+        self.jvm = Some(new_jvm);
+        self.current_jar_path = jar_path.clone();
+        if let Some(path) = jar_path {
+            self.jar_path_input = path;
+        }
+        self.game_texture = None;
+        Self::reset_input_state();
+        self.update_window_title();
+        Ok(())
+    }
+
+    fn reset_emulation(&mut self) {
+        let Some(data) = self.jvm.as_ref().and_then(|jvm| jvm.loaded_jar.clone()) else {
+            self.status_message = Some("No JAR loaded to reset".to_string());
+            return;
+        };
+
+        let jar_path = self.current_jar_path.clone();
+        match self.replace_jvm(data, jar_path) {
+            Ok(()) => self.status_message = Some("Emulation reset".to_string()),
+            Err(err) => self.status_message = Some(format!("Reset failed: {}", err)),
+        }
+    }
+
+    fn open_jar_path(&mut self, jar_path: String) {
+        let jar_path = jar_path.trim().to_string();
+        if jar_path.is_empty() {
+            self.status_message = Some("JAR path is empty".to_string());
+            println!("{}", self.status_message.as_ref().unwrap());
+            return;
+        }
+
+        if !Path::new(&jar_path).is_file() {
+            self.status_message = Some(format!("JAR not found: {}", jar_path));
+            println!("{}", self.status_message.as_ref().unwrap());
+            return;
+        }
+
+        let mut extractor = JarExtractor::for_path(jar_path.clone());
+        if let Err(err) = extractor.run() {
+            self.status_message = Some(format!("Open failed: {}", err.message));
+            println!("{}", self.status_message.as_ref().unwrap());
+            return;
+        }
+
+        let Some(data) = extractor.data.clone() else {
+            self.status_message = Some("Open failed: extractor returned no data".to_string());
+            println!("{}", self.status_message.as_ref().unwrap());
+            return;
+        };
+
+        match self.replace_jvm(data, Some(jar_path.clone())) {
+            Ok(()) => {
+                self.status_message = Some(format!("Loaded {}", jar_path));
+                println!("{}", self.status_message.as_ref().unwrap());
+                self.open_jar_dialog = false;
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Open failed: {}", err));
+                println!("{}", self.status_message.as_ref().unwrap());
+            }
+        }
     }
 
     fn draw(&mut self) {
@@ -209,11 +342,16 @@ impl App {
         let egui_state = self.egui_state.as_mut().unwrap();
         let raw_input = egui_state.take_egui_input(self.window.unwrap());
         let jvm_for_ui = self.jvm.clone();
-        egui_state.egui_ctx().run_ui(raw_input, |ctx| {
+        let mut action = UiAction::None;
+        let mut open_jar_dialog = self.open_jar_dialog;
+        let mut jar_path_input = self.jar_path_input.clone();
+        let status_message = self.status_message.clone();
+        let full_output = egui_state.egui_ctx().run_ui(raw_input, |ctx| {
             egui::Panel::top("menu_bar").show_inside(ctx, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("File", |ui| {
                         if ui.button("Open .jar").clicked() {
+                            open_jar_dialog = true;
                             ui.close();
                         }
                         if ui.button("Exit").clicked() {
@@ -231,7 +369,10 @@ impl App {
                             }
                             ui.close();
                         }
-                        if ui.button("Reset").clicked() { /* Reset JVM */ }
+                        if ui.button("Reset").clicked() {
+                            action = UiAction::Reset;
+                            ui.close();
+                        }
                     });
                     ui.separator();
                     let paused = jvm_for_ui
@@ -267,6 +408,10 @@ impl App {
                     if let Some(texture) = &self.game_texture {
                         ui.label(format!("Size - {:.2}", texture.size_vec2()));
                     }
+                    if let Some(message) = &status_message {
+                        ui.separator();
+                        ui.label(message);
+                    }
                     ui.take_available_space();
                 });
 
@@ -275,34 +420,37 @@ impl App {
                 .show_inside(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.horizontal(|ui| {
-                            let jar = jvm_for_ui.as_ref().unwrap().loaded_jar.as_ref().unwrap();
-
-                            match jar.resources.get(&jar.manifest.icon) {
-                                Some(icon_data) => {
-                                    let img = image::load_from_memory(&icon_data).unwrap();
-                                    let color_img = ColorImage::from_rgba_unmultiplied(
-                                        [img.width() as usize, img.height() as usize],
-                                        &img.to_rgba8(),
-                                    );
-                                    let handle = ui.load_texture(
-                                        jar.manifest.icon.clone(),
-                                        color_img,
-                                        TextureOptions::default(),
-                                    );
-                                    let texture = egui::load::SizedTexture::new(
-                                        handle.id(),
-                                        egui::vec2(24.0, 24.0),
-                                    );
-                                    ui.image(egui::ImageSource::Texture(texture));
-                                    ui.add_space(8.0);
+                            if let Some(jar) =
+                                jvm_for_ui.as_ref().and_then(|jvm| jvm.loaded_jar.as_ref())
+                            {
+                                match jar.resources.get(&jar.manifest.icon) {
+                                    Some(icon_data) => {
+                                        if let Ok(img) = image::load_from_memory(&icon_data) {
+                                            let color_img = ColorImage::from_rgba_unmultiplied(
+                                                [img.width() as usize, img.height() as usize],
+                                                &img.to_rgba8(),
+                                            );
+                                            let handle = ui.load_texture(
+                                                jar.manifest.icon.clone(),
+                                                color_img,
+                                                TextureOptions::default(),
+                                            );
+                                            let texture = egui::load::SizedTexture::new(
+                                                handle.id(),
+                                                egui::vec2(24.0, 24.0),
+                                            );
+                                            ui.image(egui::ImageSource::Texture(texture));
+                                            ui.add_space(8.0);
+                                        }
+                                    }
+                                    None => {}
                                 }
-                                None => {}
                             }
 
                             ui.heading(
-                                self.jvm
+                                jvm_for_ui
                                     .as_ref()
-                                    .and_then(|j| j.loaded_jar.as_ref())
+                                    .and_then(|jvm| jvm.loaded_jar.as_ref())
                                     .map_or("No file loaded", |jar| &jar.manifest.name),
                             );
                         });
@@ -320,7 +468,43 @@ impl App {
                         }
                     });
                 });
-        })
+
+            if open_jar_dialog {
+                let mut close_dialog = false;
+                egui::Window::new("Open JAR")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open_jar_dialog)
+                    .show(ctx, |ui| {
+                        ui.label("JAR path");
+                        ui.text_edit_singleline(&mut jar_path_input);
+                        ui.horizontal(|ui| {
+                            if ui.button("Open").clicked() {
+                                action = UiAction::OpenJar(jar_path_input.clone());
+                                close_dialog = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close_dialog = true;
+                            }
+                        });
+                    });
+
+                if close_dialog {
+                    open_jar_dialog = false;
+                }
+            }
+        });
+
+        self.open_jar_dialog = open_jar_dialog;
+        self.jar_path_input = jar_path_input;
+
+        match action {
+            UiAction::None => {}
+            UiAction::OpenJar(path) => self.open_jar_path(path),
+            UiAction::Reset => self.reset_emulation(),
+        }
+
+        full_output
     }
 
     fn add_egui_fonts(ctx: &egui::Context) {
@@ -446,6 +630,19 @@ impl ApplicationHandler for App {
                             .unwrap();
                     }
                     window.request_redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("jar"))
+                    .unwrap_or(false)
+                {
+                    self.open_jar_path(path.to_string_lossy().to_string());
+                } else {
+                    self.status_message =
+                        Some(format!("Unsupported file: {}", path.to_string_lossy()));
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

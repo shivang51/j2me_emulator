@@ -85,6 +85,7 @@ struct PauseControl {
 #[derive(Debug)]
 struct PauseState {
     paused: bool,
+    stopped: bool,
     pause_started: Option<Instant>,
     total_paused: Duration,
 }
@@ -142,6 +143,7 @@ impl JVM {
             pause_control: Arc::new(PauseControl {
                 state: StdMutex::new(PauseState {
                     paused: false,
+                    stopped: false,
                     pause_started: None,
                     total_paused: Duration::ZERO,
                 }),
@@ -152,7 +154,7 @@ impl JVM {
 
     pub fn pause(&self) {
         let mut pause_state = self.pause_control.state.lock().unwrap();
-        if pause_state.paused {
+        if pause_state.paused || pause_state.stopped {
             return;
         }
 
@@ -164,7 +166,7 @@ impl JVM {
 
     pub fn resume(&self) {
         let mut pause_state = self.pause_control.state.lock().unwrap();
-        if !pause_state.paused {
+        if !pause_state.paused || pause_state.stopped {
             return;
         }
 
@@ -190,10 +192,49 @@ impl JVM {
         self.pause_control.state.lock().unwrap().paused
     }
 
-    fn wait_if_paused(&self) {
+    pub fn shutdown(&self) {
         let mut pause_state = self.pause_control.state.lock().unwrap();
-        while pause_state.paused {
+        if pause_state.stopped {
+            return;
+        }
+
+        pause_state.stopped = true;
+        pause_state.paused = false;
+        if let Some(started) = pause_state.pause_started.take() {
+            pause_state.total_paused += started.elapsed();
+        }
+        drop(pause_state);
+
+        player::stop_all();
+        self.thread_handles.lock().clear();
+        self.pause_control.wake.notify_all();
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.pause_control.state.lock().unwrap().stopped
+    }
+
+    fn wait_if_paused(&self) -> bool {
+        let mut pause_state = self.pause_control.state.lock().unwrap();
+        while pause_state.paused && !pause_state.stopped {
             pause_state = self.pause_control.wake.wait(pause_state).unwrap();
+        }
+
+        !pause_state.stopped
+    }
+
+    fn sleep_emulated(&self, duration: Duration) {
+        let mut remaining = duration;
+
+        while remaining > Duration::ZERO {
+            if !self.wait_if_paused() {
+                return;
+            }
+
+            let chunk = remaining.min(Duration::from_millis(10));
+            let before = Instant::now();
+            std::thread::sleep(chunk);
+            remaining = remaining.saturating_sub(before.elapsed());
         }
     }
 
@@ -421,7 +462,9 @@ impl JVM {
         let mut op_count = 0;
 
         while pc < bytecode.len() {
-            jvm.wait_if_paused();
+            if !jvm.wait_if_paused() {
+                return Ok(None);
+            }
 
             let opcode = bytecode[pc];
 
@@ -945,7 +988,9 @@ impl JVM {
                     if !JVM::is_category_2_value(&value1) {
                         let value2 = stack.pop().ok_or("pop2: Stack underflow")?;
                         if JVM::is_category_2_value(&value2) {
-                            return Err("pop2: invalid category 2 value under category 1 value".into());
+                            return Err(
+                                "pop2: invalid category 2 value under category 1 value".into()
+                            );
                         }
                     }
                     pc += 1;
@@ -2653,11 +2698,7 @@ impl JVM {
         }
     }
 
-    fn printstream_value_to_string(
-        value: &JvmStackValue,
-        descriptor: &str,
-        jvm: &JVM,
-    ) -> String {
+    fn printstream_value_to_string(value: &JvmStackValue, descriptor: &str, jvm: &JVM) -> String {
         if descriptor.starts_with("(C)") {
             return JVM::printstream_char_to_string(value);
         }
@@ -3138,6 +3179,11 @@ impl JVM {
                     }
                     return Ok(());
                 } else if is_thread_is_alive {
+                    if jvm.is_shutdown() {
+                        caller_stack.push(JvmStackValue::Int(0));
+                        return Ok(());
+                    }
+
                     let obj_id = match &objectref {
                         JvmStackValue::ObjectRef(id) => *id,
                         _ => return Err("Thread.isAlive: not an object ref".into()),
@@ -3779,7 +3825,10 @@ impl JVM {
     }
 
     fn ensure_string_buffer_field(heap_obj: &mut JvmObject) {
-        if !matches!(heap_obj.fields.get("buffer"), Some(JvmStackValue::String(_))) {
+        if !matches!(
+            heap_obj.fields.get("buffer"),
+            Some(JvmStackValue::String(_))
+        ) {
             heap_obj
                 .fields
                 .insert("buffer".to_string(), JvmStackValue::String(String::new()));
@@ -4004,7 +4053,7 @@ impl JVM {
             return Ok(());
         } else if class_name == "java/lang/Thread" && method_name == "sleep" {
             if let Some(JvmStackValue::Long(ms)) = args.first() {
-                std::thread::sleep(std::time::Duration::from_millis(*ms as u64));
+                jvm.sleep_emulated(Duration::from_millis(*ms as u64));
             }
             return Ok(());
         } else if class_name == "java/lang/System" && method_name == "currentTimeMillis" {
@@ -4107,7 +4156,7 @@ impl JVM {
     }
 
     pub fn paint(&self) -> Result<(), String> {
-        if self.is_paused() {
+        if self.is_paused() || self.is_shutdown() {
             return Ok(());
         }
 

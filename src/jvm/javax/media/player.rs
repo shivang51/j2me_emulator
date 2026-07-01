@@ -58,6 +58,23 @@ pub fn resume_all() {
     }
 }
 
+pub fn stop_all() {
+    let mut players = PLAYERS.lock().unwrap();
+    let players_to_stop = std::mem::take(&mut *players);
+    drop(players);
+
+    for mut player in players_to_stop.into_values() {
+        if let Some(mut child) = player.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        if let Some(path) = player.media_file {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 pub fn handle_manager_static_method(
     method_name: &str,
     descriptor: &str,
@@ -65,9 +82,10 @@ pub fn handle_manager_static_method(
     jvm: &JVM,
 ) -> Result<Option<JvmStackValue>, String> {
     match (method_name, descriptor) {
-        ("createPlayer", "(Ljava/io/InputStream;Ljava/lang/String;)Ljavax/microedition/media/Player;") => {
-            create_player_from_stream(args, jvm)
-        }
+        (
+            "createPlayer",
+            "(Ljava/io/InputStream;Ljava/lang/String;)Ljavax/microedition/media/Player;",
+        ) => create_player_from_stream(args, jvm),
         ("createPlayer", "(Ljava/lang/String;)Ljavax/microedition/media/Player;") => {
             create_player_from_locator(args, jvm)
         }
@@ -132,7 +150,9 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("getMediaTime", "()J") => Ok(Some(JvmStackValue::Long(0))),
-        ("setMediaTime", "(J)J") => Ok(Some(args.first().cloned().unwrap_or(JvmStackValue::Long(0)))),
+        ("setMediaTime", "(J)J") => Ok(Some(
+            args.first().cloned().unwrap_or(JvmStackValue::Long(0)),
+        )),
         ("setMediaTime", "(J)V") => Ok(None),
         ("getDuration", "()J") => Ok(Some(JvmStackValue::Long(-1))),
         ("getContentType", "()Ljava/lang/String;") => Ok(Some(JvmStackValue::String(
@@ -288,8 +308,7 @@ fn create_player_from_locator(
 
     let data = {
         let state = jvm.state.lock();
-        resource_key_from_locator(&locator)
-            .and_then(|key| state.resources.get(&key).cloned())
+        resource_key_from_locator(&locator).and_then(|key| state.resources.get(&key).cloned())
     }
     .or_else(|| file_path_from_locator(&locator).and_then(|path| fs::read(path).ok()))
     .unwrap_or_default();
@@ -345,7 +364,10 @@ fn register_player(
 
 fn allocate_volume_control(jvm: &JVM, player_id: usize) -> u32 {
     let mut fields = HashMap::new();
-    fields.insert("playerId:I".to_string(), JvmStackValue::Int(player_id as i32));
+    fields.insert(
+        "playerId:I".to_string(),
+        JvmStackValue::Int(player_id as i32),
+    );
 
     let mut state = jvm.state.lock();
     JVM::allocate_internal(&mut state, VOLUME_CONTROL_CLASS_NAME.to_string(), fields)
@@ -479,7 +501,11 @@ fn ensure_media_file(player_id: usize, player: &mut PlayerRuntime) -> Option<Pat
         return Some(path.clone());
     }
 
-    let extension = media_extension(player.locator.as_deref(), &player.content_type, &player.media_data);
+    let extension = media_extension(
+        player.locator.as_deref(),
+        &player.content_type,
+        &player.media_data,
+    );
     let mut path = env::temp_dir();
     path.push(format!(
         "j2me_emulator_audio_{}_{}.{}",
@@ -489,7 +515,10 @@ fn ensure_media_file(player_id: usize, player: &mut PlayerRuntime) -> Option<Pat
     ));
 
     if fs::write(&path, &player.media_data).is_err() {
-        eprintln!("[Media] Failed to write media temp file: {}", path.display());
+        eprintln!(
+            "[Media] Failed to write media temp file: {}",
+            path.display()
+        );
         return None;
     }
 
@@ -676,7 +705,10 @@ fn infer_content_type(locator: Option<&str>, data: &[u8]) -> String {
         return "audio/ogg".to_string();
     }
 
-    match locator.and_then(|path| Path::new(path).extension()).and_then(|ext| ext.to_str()) {
+    match locator
+        .and_then(|path| Path::new(path).extension())
+        .and_then(|ext| ext.to_str())
+    {
         Some(ext) if ext.eq_ignore_ascii_case("mid") || ext.eq_ignore_ascii_case("midi") => {
             "audio/midi".to_string()
         }
