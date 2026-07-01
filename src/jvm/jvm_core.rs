@@ -501,6 +501,49 @@ impl JVM {
 
                     pc += 1;
                 }
+                0x2f => {
+                    // laload
+                    let index = match stack.pop().ok_or("laload: Stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("laload: index is not an int".into()),
+                    };
+
+                    let arrayref = stack.pop().ok_or("laload: Stack underflow (arrayref)")?;
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("laload: arrayref is not a reference".into()),
+                    };
+
+                    {
+                        let state = jvm.state.lock();
+                        match state.heap.get(heap_idx) {
+                            Some(HeapObject::Array { data, .. }) => {
+                                if index < 0 || index as usize >= data.len() {
+                                    return Err(format!(
+                                        "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds",
+                                        index
+                                    ));
+                                }
+
+                                match &data[index as usize] {
+                                    JvmStackValue::Long(value) => {
+                                        stack.push(JvmStackValue::Long(*value))
+                                    }
+                                    value => {
+                                        return Err(format!(
+                                            "laload: expected Long, found {:?}",
+                                            value
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => return Err("laload: object is not an array".into()),
+                        }
+                    }
+
+                    pc += 1;
+                }
                 0x32 => {
                     // aaload
                     let index = match stack.pop().ok_or("aaload: Stack underflow (index)")? {
@@ -803,6 +846,17 @@ impl JVM {
                 0x57 => {
                     // pop
                     stack.pop().ok_or("pop: Stack underflow")?;
+                    pc += 1;
+                }
+                0x58 => {
+                    // pop2
+                    let value1 = stack.pop().ok_or("pop2: Stack underflow")?;
+                    if !JVM::is_category_2_value(&value1) {
+                        let value2 = stack.pop().ok_or("pop2: Stack underflow")?;
+                        if JVM::is_category_2_value(&value2) {
+                            return Err("pop2: invalid category 2 value under category 1 value".into());
+                        }
+                    }
                     pc += 1;
                 }
                 0x59 => {
@@ -1414,9 +1468,17 @@ impl JVM {
                     }
 
                     if let JvmStackValue::ObjectRef(999) = objectref {
-                        JVM::handle_native_printstream(&method_name, &args);
-                    }
-                    if class_name == "java/lang/String" {
+                        let return_value = JVM::handle_native_printstream(
+                            &objectref,
+                            &method_name,
+                            &descriptor,
+                            &args,
+                            jvm,
+                        )?;
+                        if let Some(val) = return_value {
+                            stack.push(val);
+                        }
+                    } else if class_name == "java/lang/String" {
                         let res = JVM::execute_method(
                             objectref,
                             &class_name,
@@ -2414,36 +2476,157 @@ impl JVM {
         }
     }
 
-    fn handle_native_printstream(method: &str, args: &[JvmStackValue]) {
-        match method {
-            "println" => {
-                if let Some(val) = args.get(0) {
-                    match val {
-                        JvmStackValue::String(s) => println!("{}", s),
-                        JvmStackValue::Int(i) => println!("{}", i),
-                        JvmStackValue::Float(f) => println!("{}", f),
-                        JvmStackValue::Long(l) => println!("{}", l),
-                        JvmStackValue::Double(d) => println!("{}", d),
-                        _ => println!("{:?}", val),
-                    }
+    fn handle_native_printstream(
+        objectref: &JvmStackValue,
+        method: &str,
+        descriptor: &str,
+        args: &[JvmStackValue],
+        jvm: &JVM,
+    ) -> Result<Option<JvmStackValue>, String> {
+        match (method, descriptor) {
+            ("println", _) => {
+                if let Some(val) = args.first() {
+                    println!("{}", JVM::printstream_value_to_string(val, descriptor, jvm));
                 } else {
                     println!();
                 }
+                Ok(None)
             }
-            "print" => {
-                if let Some(val) = args.get(0) {
-                    match val {
-                        JvmStackValue::String(s) => print!("{}", s),
-                        JvmStackValue::Int(i) => print!("{}", i),
-                        JvmStackValue::Float(f) => print!("{}", f),
-                        JvmStackValue::Long(l) => print!("{}", l),
-                        JvmStackValue::Double(d) => print!("{}", d),
-                        _ => print!("{:?}", val),
+            ("print", _) => {
+                if let Some(val) = args.first() {
+                    print!("{}", JVM::printstream_value_to_string(val, descriptor, jvm));
+                }
+                Ok(None)
+            }
+            ("append", descriptor) if descriptor.starts_with("(C)") => {
+                if let Some(val) = args.first() {
+                    print!("{}", JVM::printstream_char_to_string(val));
+                }
+                Ok(Some(objectref.clone()))
+            }
+            ("append", descriptor) if descriptor.starts_with("(Ljava/lang/CharSequence;)") => {
+                let value = args
+                    .first()
+                    .map(|val| JVM::char_sequence_to_string(val, jvm))
+                    .unwrap_or_else(|| "null".to_string());
+                print!("{}", value);
+                Ok(Some(objectref.clone()))
+            }
+            ("append", descriptor) if descriptor.starts_with("(Ljava/lang/CharSequence;II)") => {
+                let value = args
+                    .first()
+                    .map(|val| JVM::char_sequence_to_string(val, jvm))
+                    .unwrap_or_else(|| "null".to_string());
+                let start = match args.get(1) {
+                    Some(JvmStackValue::Int(value)) => *value,
+                    value => {
+                        return Err(format!(
+                            "PrintStream.append(CharSequence,int,int): invalid start {:?}",
+                            value
+                        ));
                     }
+                };
+                let end = match args.get(2) {
+                    Some(JvmStackValue::Int(value)) => *value,
+                    value => {
+                        return Err(format!(
+                            "PrintStream.append(CharSequence,int,int): invalid end {:?}",
+                            value
+                        ));
+                    }
+                };
+                print!("{}", JVM::substring_by_char_range(&value, start, end)?);
+                Ok(Some(objectref.clone()))
+            }
+            ("toString", "()Ljava/lang/String;") => Ok(Some(JvmStackValue::String(
+                "java.io.PrintStream".to_string(),
+            ))),
+            _ => {
+                println!(
+                    "Native PrintStream called unknown method: {}{}",
+                    method, descriptor
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn printstream_value_to_string(
+        value: &JvmStackValue,
+        descriptor: &str,
+        jvm: &JVM,
+    ) -> String {
+        if descriptor.starts_with("(C)") {
+            return JVM::printstream_char_to_string(value);
+        }
+
+        JVM::char_sequence_to_string(value, jvm)
+    }
+
+    fn printstream_char_to_string(value: &JvmStackValue) -> String {
+        match value {
+            JvmStackValue::Int(value) => char::from_u32(*value as u32)
+                .unwrap_or(char::REPLACEMENT_CHARACTER)
+                .to_string(),
+            other => JVM::char_sequence_to_string_without_heap(other),
+        }
+    }
+
+    fn char_sequence_to_string(value: &JvmStackValue, jvm: &JVM) -> String {
+        match value {
+            JvmStackValue::ObjectRef(id) => {
+                let state = jvm.state.lock();
+                match state.heap.get(*id as usize) {
+                    Some(HeapObject::Instance(obj)) => {
+                        if let Some(JvmStackValue::String(buffer)) = obj.fields.get("buffer") {
+                            buffer.clone()
+                        } else {
+                            format!("{}@{:x}", obj.class_name.replace('/', "."), id)
+                        }
+                    }
+                    _ => format!("ObjectRef({})", id),
                 }
             }
-            _ => println!("Native PrintStream called unknown method: {}", method),
+            other => JVM::char_sequence_to_string_without_heap(other),
         }
+    }
+
+    fn char_sequence_to_string_without_heap(value: &JvmStackValue) -> String {
+        match value {
+            JvmStackValue::String(value) => value.clone(),
+            JvmStackValue::Int(value) => value.to_string(),
+            JvmStackValue::Float(value) => value.to_string(),
+            JvmStackValue::Long(value) => value.to_string(),
+            JvmStackValue::Double(value) => value.to_string(),
+            JvmStackValue::Null => "null".to_string(),
+            other => format!("{:?}", other),
+        }
+    }
+
+    fn substring_by_char_range(value: &str, start: i32, end: i32) -> Result<String, String> {
+        if start < 0 || end < start {
+            return Err(format!(
+                "java.lang.IndexOutOfBoundsException: start {}, end {}",
+                start, end
+            ));
+        }
+
+        let start = start as usize;
+        let end = end as usize;
+        let chars: Vec<char> = value.chars().collect();
+        if end > chars.len() {
+            return Err(format!(
+                "java.lang.IndexOutOfBoundsException: end {} out of bounds for length {}",
+                end,
+                chars.len()
+            ));
+        }
+
+        Ok(chars[start..end].iter().collect())
+    }
+
+    fn is_category_2_value(value: &JvmStackValue) -> bool {
+        matches!(value, JvmStackValue::Long(_) | JvmStackValue::Double(_))
     }
 
     pub fn execute_method(
@@ -2573,10 +2756,29 @@ impl JVM {
             }
             if class_name == player::CLASS_NAME {
                 let return_value =
-                    player::handle_virtual_method(&objectref, method_name, descriptor, args);
+                    player::handle_virtual_method(&objectref, method_name, descriptor, args, jvm);
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling Player method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == player::VOLUME_CONTROL_CLASS_NAME {
+                let return_value = player::handle_volume_control_method(
+                    &objectref,
+                    method_name,
+                    descriptor,
+                    args,
+                    jvm,
+                );
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling VolumeControl method: {}", e).into());
                 }
 
                 if let Some(val) = return_value.unwrap() {
@@ -2590,7 +2792,11 @@ impl JVM {
                 class_name, method_name, descriptor
             );
         } else if class_name == "java/io/PrintStream" {
-            JVM::handle_native_printstream(method_name, args);
+            let return_value =
+                JVM::handle_native_printstream(&objectref, method_name, descriptor, args, jvm)?;
+            if let Some(val) = return_value {
+                caller_stack.push(val);
+            }
             return Ok(());
         } else if class_name == "java/lang/String" {
             let return_value = JVM::handle_string_fns(objectref, method_name, descriptor, args)?;
@@ -3655,6 +3861,16 @@ impl JVM {
             if class_name == "javax/microedition/lcdui/Display" {
                 let return_value =
                     display::handle_static_method(method_name, descriptor, args, jvm)?;
+
+                if let Some(val) = return_value {
+                    stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == player::MANAGER_CLASS_NAME {
+                let return_value =
+                    player::handle_manager_static_method(method_name, descriptor, args, jvm)?;
 
                 if let Some(val) = return_value {
                     stack.push(val);
