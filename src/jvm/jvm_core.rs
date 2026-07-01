@@ -30,7 +30,7 @@ macro_rules! jvm_debug {
     };
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JvmStackValue {
     Byte(u8),
     Int(i32),
@@ -110,6 +110,20 @@ pub struct Code {
 }
 
 impl JVM {
+    pub fn is_reference_value(val: &JvmStackValue) -> bool {
+        matches!(
+            val,
+            JvmStackValue::ObjectRef(_)
+                | JvmStackValue::String(_)
+                | JvmStackValue::Vector(_)
+                | JvmStackValue::Null
+        )
+    }
+
+    pub fn reference_values_equal(val1: &JvmStackValue, val2: &JvmStackValue) -> bool {
+        val1 == val2
+    }
+
     pub fn new() -> Self {
         let mut state = JvmState {
             static_fields: HashMap::new(),
@@ -977,6 +991,94 @@ impl JVM {
 
                     pc += 1;
                 }
+                0x55 => {
+                    // castore
+                    let value = match stack.pop().ok_or("castore: stack underflow (value)")? {
+                        JvmStackValue::Int(value) => value,
+                        value => return Err(format!("castore: value is not an int: {:?}", value)),
+                    };
+
+                    let index = match stack.pop().ok_or("castore: stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("castore: index is not an int".into()),
+                    };
+
+                    let arrayref = stack.pop().ok_or("castore: stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("castore: arrayref is not a reference".into()),
+                    };
+
+                    match jvm.state.lock().heap.get_mut(heap_idx) {
+                        Some(HeapObject::Array { element_type, data }) => {
+                            if element_type != "primitive_5" {
+                                return Err(format!(
+                                    "castore: expected char array, found array of type {}",
+                                    element_type
+                                ));
+                            }
+
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!(
+                                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds for length {}",
+                                    index,
+                                    data.len()
+                                ));
+                            }
+
+                            data[index as usize] = JvmStackValue::Int(value & 0xFFFF);
+                        }
+                        _ => return Err("castore: object is not an array".into()),
+                    }
+
+                    pc += 1;
+                }
+                0x56 => {
+                    // sastore
+                    let value = match stack.pop().ok_or("sastore: stack underflow (value)")? {
+                        JvmStackValue::Int(value) => value,
+                        value => return Err(format!("sastore: value is not an int: {:?}", value)),
+                    };
+
+                    let index = match stack.pop().ok_or("sastore: stack underflow (index)")? {
+                        JvmStackValue::Int(i) => i,
+                        _ => return Err("sastore: index is not an int".into()),
+                    };
+
+                    let arrayref = stack.pop().ok_or("sastore: stack underflow (arrayref)")?;
+
+                    let heap_idx = match arrayref {
+                        JvmStackValue::ObjectRef(id) => id as usize,
+                        JvmStackValue::Null => return Err("java.lang.NullPointerException".into()),
+                        _ => return Err("sastore: arrayref is not a reference".into()),
+                    };
+
+                    match jvm.state.lock().heap.get_mut(heap_idx) {
+                        Some(HeapObject::Array { element_type, data }) => {
+                            if element_type != "primitive_9" {
+                                return Err(format!(
+                                    "sastore: expected short array, found array of type {}",
+                                    element_type
+                                ));
+                            }
+
+                            if index < 0 || index as usize >= data.len() {
+                                return Err(format!(
+                                    "java.lang.ArrayIndexOutOfBoundsException: Index {} out of bounds for length {}",
+                                    index,
+                                    data.len()
+                                ));
+                            }
+
+                            data[index as usize] = JvmStackValue::Int((value as i16) as i32);
+                        }
+                        _ => return Err("sastore: object is not an array".into()),
+                    }
+
+                    pc += 1;
+                }
                 0x57 => {
                     // pop
                     stack.pop().ok_or("pop: Stack underflow")?;
@@ -1328,6 +1430,39 @@ impl JVM {
                         0xA2 => val1 >= val2, // if_icmpge
                         0xA3 => val1 > val2,  // if_icmpgt
                         0xA4 => val1 <= val2, // if_icmple
+                        _ => unreachable!(),
+                    };
+
+                    if condition_met {
+                        pc = (pc as i32 + offset) as usize;
+                        continue;
+                    } else {
+                        pc += 3;
+                    }
+                }
+                0xA5 | 0xA6 => {
+                    // if_acmp<cond>
+                    let offset =
+                        (((bytecode[pc + 1] as i16) << 8) | (bytecode[pc + 2] as i16)) as i32;
+
+                    let val2 = stack
+                        .pop()
+                        .ok_or("if_acmp<cond>: stack underflow for val2")?;
+                    let val1 = stack
+                        .pop()
+                        .ok_or("if_acmp<cond>: stack underflow for val1")?;
+
+                    if !JVM::is_reference_value(&val1) || !JVM::is_reference_value(&val2) {
+                        return Err(format!(
+                            "if_acmp<cond>: expected references, found {:?} and {:?}",
+                            val1, val2
+                        ));
+                    }
+
+                    let equal = JVM::reference_values_equal(&val1, &val2);
+                    let condition_met = match opcode {
+                        0xA5 => equal,
+                        0xA6 => !equal,
                         _ => unreachable!(),
                     };
 
@@ -2612,6 +2747,349 @@ impl JVM {
         }
     }
 
+    fn handle_hashtable_fns(
+        object_ref: &mut HeapObject,
+        method: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        let heap_obj = if let HeapObject::Instance(obj) = object_ref {
+            obj
+        } else {
+            return Err("Expected instance for Hashtable object".into());
+        };
+
+        match method {
+            "<init>" => {
+                heap_obj.fields.insert("keys".to_string(), JvmStackValue::Vector(Vec::new()));
+                heap_obj.fields.insert("values".to_string(), JvmStackValue::Vector(Vec::new()));
+                Ok(None)
+            }
+            "put" => {
+                let key = args[0].clone();
+                let value = args[1].clone();
+                let mut old_value = JvmStackValue::Null;
+                
+                let mut keys = match heap_obj.fields.get("keys").unwrap() {
+                    JvmStackValue::Vector(v) => v.clone(),
+                    _ => unreachable!(),
+                };
+                let mut values = match heap_obj.fields.get("values").unwrap() {
+                    JvmStackValue::Vector(v) => v.clone(),
+                    _ => unreachable!(),
+                };
+                
+                if let Some(pos) = keys.iter().position(|k| k == &key) {
+                    old_value = values[pos].clone();
+                    values[pos] = value;
+                } else {
+                    keys.push(key);
+                    values.push(value);
+                }
+                
+                heap_obj.fields.insert("keys".to_string(), JvmStackValue::Vector(keys));
+                heap_obj.fields.insert("values".to_string(), JvmStackValue::Vector(values));
+                
+                Ok(Some(old_value))
+            }
+            "get" => {
+                let key = args[0].clone();
+                let keys = match heap_obj.fields.get("keys").unwrap() {
+                    JvmStackValue::Vector(v) => v,
+                    _ => unreachable!(),
+                };
+                let values = match heap_obj.fields.get("values").unwrap() {
+                    JvmStackValue::Vector(v) => v,
+                    _ => unreachable!(),
+                };
+                
+                if let Some(pos) = keys.iter().position(|k| k == &key) {
+                    Ok(Some(values[pos].clone()))
+                } else {
+                    Ok(Some(JvmStackValue::Null))
+                }
+            }
+            "size" => {
+                let keys = match heap_obj.fields.get("keys").unwrap() {
+                    JvmStackValue::Vector(v) => v,
+                    _ => unreachable!(),
+                };
+                Ok(Some(JvmStackValue::Int(keys.len() as i32)))
+            }
+            "remove" => {
+                let key = args[0].clone();
+                let mut keys = match heap_obj.fields.get("keys").unwrap() {
+                    JvmStackValue::Vector(v) => v.clone(),
+                    _ => unreachable!(),
+                };
+                let mut values = match heap_obj.fields.get("values").unwrap() {
+                    JvmStackValue::Vector(v) => v.clone(),
+                    _ => unreachable!(),
+                };
+                
+                let old_value = if let Some(pos) = keys.iter().position(|k| k == &key) {
+                    keys.remove(pos);
+                    let val = values.remove(pos);
+                    val
+                } else {
+                    JvmStackValue::Null
+                };
+                
+                heap_obj.fields.insert("keys".to_string(), JvmStackValue::Vector(keys));
+                heap_obj.fields.insert("values".to_string(), JvmStackValue::Vector(values));
+                
+                Ok(Some(old_value))
+            }
+            "clear" => {
+                heap_obj.fields.insert("keys".to_string(), JvmStackValue::Vector(Vec::new()));
+                heap_obj.fields.insert("values".to_string(), JvmStackValue::Vector(Vec::new()));
+                Ok(None)
+            }
+            "isEmpty" => {
+                let keys = match heap_obj.fields.get("keys").unwrap() {
+                    JvmStackValue::Vector(v) => v,
+                    _ => unreachable!(),
+                };
+                Ok(Some(JvmStackValue::Int(if keys.is_empty() { 1 } else { 0 })))
+            }
+            "contains" | "containsValue" => {
+                let value = args[0].clone();
+                let values = match heap_obj.fields.get("values").unwrap() {
+                    JvmStackValue::Vector(v) => v,
+                    _ => unreachable!(),
+                };
+                let res = values.contains(&value);
+                Ok(Some(JvmStackValue::Int(if res { 1 } else { 0 })))
+            }
+            "containsKey" => {
+                let key = args[0].clone();
+                let keys = match heap_obj.fields.get("keys").unwrap() {
+                    JvmStackValue::Vector(v) => v,
+                    _ => unreachable!(),
+                };
+                let res = keys.contains(&key);
+                Ok(Some(JvmStackValue::Int(if res { 1 } else { 0 })))
+            }
+            _ => {
+                println!("[-] Unknown Hashtable method: {} | args = {:?}", method, args);
+                panic!();
+            }
+        }
+    }
+
+    fn handle_random_fns(
+        object_ref: &mut HeapObject,
+        method: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        let heap_obj = if let HeapObject::Instance(obj) = object_ref {
+            obj
+        } else {
+            return Err("Expected instance for Random object".into());
+        };
+
+        match method {
+            "<init>" => {
+                let seed = if let Some(JvmStackValue::Long(s)) = args.get(0) {
+                    (*s ^ 0x5DEECE66Di64) & ((1i64 << 48) - 1)
+                } else if args.is_empty() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as i64;
+                    (now ^ 0x5DEECE66Di64) & ((1i64 << 48) - 1)
+                } else {
+                    return Err("Random.<init> invalid args".into());
+                };
+                heap_obj.fields.insert("seed".to_string(), JvmStackValue::Long(seed));
+                Ok(None)
+            }
+            "setSeed" => {
+                let seed = match args.get(0) {
+                    Some(JvmStackValue::Long(s)) => *s,
+                    _ => return Err("Random.setSeed expects Long argument".into()),
+                };
+                let new_seed = (seed ^ 0x5DEECE66Di64) & ((1i64 << 48) - 1);
+                heap_obj.fields.insert("seed".to_string(), JvmStackValue::Long(new_seed));
+                Ok(None)
+            }
+            "nextInt" => {
+                let mut current_seed = match heap_obj.fields.get("seed") {
+                    Some(JvmStackValue::Long(s)) => *s,
+                    _ => 0,
+                };
+                
+                if let Some(JvmStackValue::Int(n)) = args.get(0) {
+                    if *n <= 0 {
+                        return Err("Random.nextInt(n) must be positive".into());
+                    }
+                    
+                    let mut next_seed = (current_seed.wrapping_mul(0x5DEECE66Di64).wrapping_add(0xBi64)) & ((1i64 << 48) - 1);
+                    heap_obj.fields.insert("seed".to_string(), JvmStackValue::Long(next_seed));
+                    
+                    let n = *n as i64;
+                    if (n & -n) == n { 
+                        let bits = (next_seed >> 17) as i32;
+                        let res = ((n * (bits as i64)) >> 31) as i32;
+                        return Ok(Some(JvmStackValue::Int(res)));
+                    }
+                    
+                    let mut bits;
+                    let mut val;
+                    loop {
+                        bits = (next_seed >> 17) as i32;
+                        val = bits % (n as i32);
+                        if bits - val + (n as i32) - 1 >= 0 {
+                            break;
+                        }
+                        next_seed = (next_seed.wrapping_mul(0x5DEECE66Di64).wrapping_add(0xBi64)) & ((1i64 << 48) - 1);
+                        heap_obj.fields.insert("seed".to_string(), JvmStackValue::Long(next_seed));
+                    }
+                    Ok(Some(JvmStackValue::Int(val)))
+                } else {
+                    current_seed = (current_seed.wrapping_mul(0x5DEECE66Di64).wrapping_add(0xBi64)) & ((1i64 << 48) - 1);
+                    heap_obj.fields.insert("seed".to_string(), JvmStackValue::Long(current_seed));
+                    let res = (current_seed >> 16) as i32;
+                    Ok(Some(JvmStackValue::Int(res)))
+                }
+            }
+            "nextLong" => {
+                let mut current_seed = match heap_obj.fields.get("seed") {
+                    Some(JvmStackValue::Long(s)) => *s,
+                    _ => 0,
+                };
+                current_seed = (current_seed.wrapping_mul(0x5DEECE66Di64).wrapping_add(0xBi64)) & ((1i64 << 48) - 1);
+                let high = (current_seed >> 16) as i32 as i64;
+                current_seed = (current_seed.wrapping_mul(0x5DEECE66Di64).wrapping_add(0xBi64)) & ((1i64 << 48) - 1);
+                let low = (current_seed >> 16) as i32 as i64;
+                heap_obj.fields.insert("seed".to_string(), JvmStackValue::Long(current_seed));
+                
+                let res = (high << 32) + (low & 0xFFFFFFFFu32 as i64);
+                Ok(Some(JvmStackValue::Long(res)))
+            }
+            _ => Err(format!("Random method {} not implemented", method)),
+        }
+    }
+
+    fn handle_integer_fns(
+        object_ref: &mut HeapObject,
+        method: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        let heap_obj = if let HeapObject::Instance(obj) = object_ref {
+            obj
+        } else {
+            return Err("Expected instance for Integer object".into());
+        };
+
+        match method {
+            "<init>" => {
+                let value = match args.get(0) {
+                    Some(JvmStackValue::Int(v)) => *v,
+                    _ => return Err("Integer.<init> expects Int argument".into()),
+                };
+                heap_obj.fields.insert("value".to_string(), JvmStackValue::Int(value));
+                Ok(None)
+            }
+            "intValue" => {
+                let val = heap_obj.fields.get("value").unwrap().clone();
+                Ok(Some(val))
+            }
+            "toString" => {
+                let val = match heap_obj.fields.get("value").unwrap() {
+                    JvmStackValue::Int(v) => v,
+                    _ => unreachable!(),
+                };
+                Ok(Some(JvmStackValue::String(val.to_string())))
+            }
+            "equals" => {
+                Err(format!("Integer method {} not implemented", method))
+            }
+            _ => Err(format!("Integer method {} not implemented", method)),
+        }
+    }
+
+    fn handle_integer_static_fns(
+        method: &str,
+        descriptor: &str,
+        args: &[JvmStackValue],
+        jvm: &JVM,
+    ) -> Result<Option<JvmStackValue>, String> {
+        match method {
+            "parseInt" => {
+                let s = match args.get(0) {
+                    Some(JvmStackValue::String(s)) => s,
+                    _ => return Err("Integer.parseInt expects String argument".into()),
+                };
+                let radix = if args.len() > 1 {
+                    match args.get(1) {
+                        Some(JvmStackValue::Int(r)) => *r as u32,
+                        _ => 10,
+                    }
+                } else {
+                    10
+                };
+                let parsed = i32::from_str_radix(s.trim(), radix).unwrap_or(0);
+                Ok(Some(JvmStackValue::Int(parsed)))
+            }
+            "toString" => {
+                let val = match args.get(0) {
+                    Some(JvmStackValue::Int(v)) => *v,
+                    _ => return Err("Integer.toString expects Int argument".into()),
+                };
+                let radix = if args.len() > 1 {
+                    match args.get(1) {
+                        Some(JvmStackValue::Int(r)) => *r as u32,
+                        _ => 10,
+                    }
+                } else {
+                    10
+                };
+                let s = if radix == 16 {
+                    format!("{:x}", val)
+                } else {
+                    val.to_string()
+                };
+                Ok(Some(JvmStackValue::String(s)))
+            }
+            "valueOf" => {
+                if let Some(JvmStackValue::String(s)) = args.get(0) {
+                    let radix = if args.len() > 1 {
+                        match args.get(1) {
+                            Some(JvmStackValue::Int(r)) => *r as u32,
+                            _ => 10,
+                        }
+                    } else {
+                        10
+                    };
+                    let parsed = i32::from_str_radix(s.trim(), radix).unwrap_or(0);
+                    
+                    let id = jvm.allocate("java/lang/Integer".to_string());
+                    {
+                        let mut state = jvm.state.lock();
+                        let heap_obj = state.heap.get_mut(id as usize).unwrap();
+                        if let HeapObject::Instance(obj) = heap_obj {
+                            obj.fields.insert("value".to_string(), JvmStackValue::Int(parsed));
+                        }
+                    }
+                    Ok(Some(JvmStackValue::ObjectRef(id)))
+                } else if let Some(JvmStackValue::Int(v)) = args.get(0) {
+                    let id = jvm.allocate("java/lang/Integer".to_string());
+                    {
+                        let mut state = jvm.state.lock();
+                        let heap_obj = state.heap.get_mut(id as usize).unwrap();
+                        if let HeapObject::Instance(obj) = heap_obj {
+                            obj.fields.insert("value".to_string(), JvmStackValue::Int(*v));
+                        }
+                    }
+                    Ok(Some(JvmStackValue::ObjectRef(id)))
+                } else {
+                    Err("Integer.valueOf invalid args".into())
+                }
+            }
+            _ => Err(format!("Integer static method {} not implemented", method)),
+        }
+    }
+
     fn handle_native_printstream(
         objectref: &JvmStackValue,
         method: &str,
@@ -2968,6 +3446,81 @@ impl JVM {
 
             if let Err(e) = res {
                 return Err(format!("Error handling Vector method: {}", e).into());
+            }
+
+            let return_value = res.unwrap();
+            if let Some(val) = return_value {
+                caller_stack.push(val);
+            }
+
+            return Ok(());
+        } else if class_name == "java/util/Hashtable" {
+            let this_id = match objectref {
+                JvmStackValue::ObjectRef(id) => id,
+                _ => return Err("Hashtable: NullPointerException".into()),
+            };
+
+            let res = {
+                let mut state = jvm.state.lock();
+                let object_ref = state
+                    .heap
+                    .get_mut(this_id as usize)
+                    .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+                JVM::handle_hashtable_fns(object_ref, method_name, args)
+            };
+
+            if let Err(e) = res {
+                return Err(format!("Error handling Hashtable method: {}", e).into());
+            }
+
+            let return_value = res.unwrap();
+            if let Some(val) = return_value {
+                caller_stack.push(val);
+            }
+
+            return Ok(());
+        } else if class_name == "java/util/Random" {
+            let this_id = match objectref {
+                JvmStackValue::ObjectRef(id) => id,
+                _ => return Err("Random: NullPointerException".into()),
+            };
+
+            let res = {
+                let mut state = jvm.state.lock();
+                let object_ref = state
+                    .heap
+                    .get_mut(this_id as usize)
+                    .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+                JVM::handle_random_fns(object_ref, method_name, args)
+            };
+
+            if let Err(e) = res {
+                return Err(format!("Error handling Random method: {}", e).into());
+            }
+
+            let return_value = res.unwrap();
+            if let Some(val) = return_value {
+                caller_stack.push(val);
+            }
+
+            return Ok(());
+        } else if class_name == "java/lang/Integer" {
+            let this_id = match objectref {
+                JvmStackValue::ObjectRef(id) => id,
+                _ => return Err("Integer: NullPointerException".into()),
+            };
+
+            let res = {
+                let mut state = jvm.state.lock();
+                let object_ref = state
+                    .heap
+                    .get_mut(this_id as usize)
+                    .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+                JVM::handle_integer_fns(object_ref, method_name, args)
+            };
+
+            if let Err(e) = res {
+                return Err(format!("Error handling Integer method: {}", e).into());
             }
 
             let return_value = res.unwrap();
@@ -3687,6 +4240,13 @@ impl JVM {
             let mut fields = HashMap::new();
             if class_name == "java/util/Vector" {
                 fields.insert("container".to_string(), JvmStackValue::Vector(Vec::new()));
+            } else if class_name == "java/util/Hashtable" {
+                fields.insert("keys".to_string(), JvmStackValue::Vector(Vec::new()));
+                fields.insert("values".to_string(), JvmStackValue::Vector(Vec::new()));
+            } else if class_name == "java/util/Random" {
+                fields.insert("seed".to_string(), JvmStackValue::Long(0));
+            } else if class_name == "java/lang/Integer" {
+                fields.insert("value".to_string(), JvmStackValue::Int(0));
             } else {
                 let mut current_class = Some(class_name.clone());
                 let state = self.state.lock();
@@ -4045,6 +4605,14 @@ impl JVM {
             );
         } else if class_name == "java/lang/String" {
             let return_value = JVM::handle_string_static_fns(method_name, descriptor, args)?;
+
+            if let Some(val) = return_value {
+                stack.push(val);
+            }
+
+            return Ok(());
+        } else if class_name == "java/lang/Integer" {
+            let return_value = JVM::handle_integer_static_fns(method_name, descriptor, args, jvm)?;
 
             if let Some(val) = return_value {
                 stack.push(val);
