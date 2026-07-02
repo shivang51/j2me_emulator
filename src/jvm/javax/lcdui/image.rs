@@ -32,6 +32,9 @@ pub fn handle_static_method(
             create_image(args, jvm)
         }
         ("createImage", "(II)Ljavax/microedition/lcdui/Image;") => create_image_ii(args, jvm),
+        ("createRGBImage", "([IIIZ)Ljavax/microedition/lcdui/Image;") => {
+            create_rgb_image(args, jvm)
+        }
         _ => Err(format!(
             "Unsupported Image static method: {}{}",
             method_name, descriptor
@@ -261,6 +264,148 @@ fn create_image_ii(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackV
 
     let image_id = state.heap.len() as u32;
     state.heap.push(HeapObject::Instance(instance));
+
+    Ok(Some(JvmStackValue::ObjectRef(image_id)))
+}
+
+fn create_rgb_image(args: &[JvmStackValue], jvm: &JVM) -> Result<Option<JvmStackValue>, String> {
+    let rgb_ref = match args.get(0) {
+        Some(JvmStackValue::ObjectRef(id)) => *id as usize,
+        Some(JvmStackValue::Null) => return Err("java.lang.NullPointerException".into()),
+        Some(value) => {
+            return Err(format!(
+                "Image.createRGBImage: expected int array, found {:?}",
+                value
+            ));
+        }
+        None => return Err("Image.createRGBImage: missing rgb array argument".into()),
+    };
+
+    let width = match args.get(1) {
+        Some(JvmStackValue::Int(width)) => *width,
+        Some(value) => {
+            return Err(format!(
+                "Image.createRGBImage: expected width int, found {:?}",
+                value
+            ));
+        }
+        None => return Err("Image.createRGBImage: missing width argument".into()),
+    };
+
+    let height = match args.get(2) {
+        Some(JvmStackValue::Int(height)) => *height,
+        Some(value) => {
+            return Err(format!(
+                "Image.createRGBImage: expected height int, found {:?}",
+                value
+            ));
+        }
+        None => return Err("Image.createRGBImage: missing height argument".into()),
+    };
+
+    let process_alpha = match args.get(3) {
+        Some(JvmStackValue::Int(value)) => *value != 0,
+        Some(value) => {
+            return Err(format!(
+                "Image.createRGBImage: expected boolean int, found {:?}",
+                value
+            ));
+        }
+        None => return Err("Image.createRGBImage: missing processAlpha argument".into()),
+    };
+
+    if width <= 0 || height <= 0 {
+        return Err(format!(
+            "java.lang.IllegalArgumentException: invalid image size {}x{}",
+            width, height
+        ));
+    }
+
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| {
+            "java.lang.IllegalArgumentException: image dimensions overflow".to_string()
+        })?;
+
+    let rgb_values = {
+        let state = jvm.state.lock();
+        match state.heap.get(rgb_ref) {
+            Some(HeapObject::Array { element_type, data }) => {
+                if element_type != "primitive_10" {
+                    return Err(format!(
+                        "Image.createRGBImage: expected int array, found array of type {}",
+                        element_type
+                    ));
+                }
+
+                if data.len() < pixel_count {
+                    return Err(format!(
+                        "java.lang.ArrayIndexOutOfBoundsException: need {} pixels, array length {}",
+                        pixel_count,
+                        data.len()
+                    ));
+                }
+
+                data.iter()
+                    .take(pixel_count)
+                    .map(|value| match value {
+                        JvmStackValue::Int(argb) => Ok(*argb),
+                        value => Err(format!(
+                            "Image.createRGBImage: expected int pixel, found {:?}",
+                            value
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            Some(_) => return Err("Image.createRGBImage: rgbData is not an array".into()),
+            None => {
+                return Err(format!(
+                    "Image.createRGBImage: invalid rgb array reference {}",
+                    rgb_ref
+                ));
+            }
+        }
+    };
+
+    let mut pixels = Vec::with_capacity(pixel_count * 4);
+    for argb in rgb_values {
+        pixels.push(((argb >> 16) & 0xFF) as u8);
+        pixels.push(((argb >> 8) & 0xFF) as u8);
+        pixels.push((argb & 0xFF) as u8);
+        pixels.push(if process_alpha {
+            ((argb >> 24) & 0xFF) as u8
+        } else {
+            0xFF
+        });
+    }
+
+    let mut fields = HashMap::new();
+    fields.insert("width:I".to_string(), JvmStackValue::Int(width));
+    fields.insert("height:I".to_string(), JvmStackValue::Int(height));
+    fields.insert(
+        "processAlpha:Z".to_string(),
+        JvmStackValue::Int(if process_alpha { 1 } else { 0 }),
+    );
+
+    let image_id = {
+        let mut state = jvm.state.lock();
+        let image_id = state.heap.len() as u32;
+        fields.insert("id".to_string(), JvmStackValue::Int(image_id as i32));
+        state.heap.push(HeapObject::Instance(JvmObject {
+            class_name: CLASS_NAME.to_string(),
+            fields,
+        }));
+        image_id
+    };
+
+    IMAGE_CACHE.lock().unwrap().insert(
+        image_id as usize,
+        Arc::new(Mutex::new(ImageBufferData {
+            width,
+            height,
+            pixels,
+        })),
+    );
 
     Ok(Some(JvmStackValue::ObjectRef(image_id)))
 }

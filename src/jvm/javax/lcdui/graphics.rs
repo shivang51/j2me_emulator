@@ -1,8 +1,8 @@
 use crate::{
     app::DRAW_STATE,
     jvm::{
-        jvm_core::{HeapObject, JVM, JvmStackValue},
         javax::lcdui::image::{clone_image_buffer, get_or_create_buffer},
+        jvm_core::{HeapObject, JVM, JvmStackValue},
     },
     profile::Profile,
 };
@@ -108,16 +108,7 @@ pub fn handle_virtual_method(
             let anchor = get_int_arg(args, 8)?;
 
             draw_region(
-                objectref,
-                img_ref,
-                x_src,
-                y_src,
-                width,
-                height,
-                transform,
-                x_dest,
-                y_dest,
-                anchor,
+                objectref, img_ref, x_src, y_src, width, height, transform, x_dest, y_dest, anchor,
                 jvm,
             );
             Ok(None)
@@ -155,7 +146,17 @@ pub fn handle_virtual_method(
             let arc_angle = get_int_arg(args, 5)?;
 
             let color = get_color(objectref, jvm);
-            draw_arc(objectref, jvm, x, y, width, height, start_angle, arc_angle, color);
+            draw_arc(
+                objectref,
+                jvm,
+                x,
+                y,
+                width,
+                height,
+                start_angle,
+                arc_angle,
+                color,
+            );
 
             Ok(None)
         }

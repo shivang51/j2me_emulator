@@ -75,7 +75,8 @@ fn get_screen_graphics_handle(jvm: &JVM) -> u32 {
         }
     }
 
-    let graphics_ref = JVM::allocate_internal(&mut state, graphics::CLASS_NAME.to_string(), HashMap::new());
+    let graphics_ref =
+        JVM::allocate_internal(&mut state, graphics::CLASS_NAME.to_string(), HashMap::new());
     state.static_fields.insert(
         SCREEN_GRAPHICS_FIELD.to_string(),
         JvmStackValue::ObjectRef(graphics_ref),
