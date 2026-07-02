@@ -5613,18 +5613,21 @@ impl JVM {
                 }
                 value => Err(format!("String.valueOf(I): invalid arg {:?}", value)),
             },
+
             ("valueOf", "(J)Ljava/lang/String;") => match args.first() {
                 Some(JvmStackValue::Long(value)) => {
                     Ok(Some(JvmStackValue::String(value.to_string())))
                 }
                 value => Err(format!("String.valueOf(J): invalid arg {:?}", value)),
             },
+
             ("valueOf", "(Z)Ljava/lang/String;") => match args.first() {
                 Some(JvmStackValue::Int(value)) => Ok(Some(JvmStackValue::String(
                     if *value == 0 { "false" } else { "true" }.to_string(),
                 ))),
                 value => Err(format!("String.valueOf(Z): invalid arg {:?}", value)),
             },
+
             ("valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => match args.first() {
                 Some(JvmStackValue::String(value)) => {
                     Ok(Some(JvmStackValue::String(value.clone())))
@@ -5647,8 +5650,110 @@ impl JVM {
         args: &[JvmStackValue],
         jvm: &JVM,
     ) -> Result<Option<JvmStackValue>, String> {
-        let string = match objectref {
-            JvmStackValue::String(value) => value,
+        if method == "<init>" {
+            let parsed_string = match descriptor {
+                "()V" => "".to_string(),
+                "(Ljava/lang/String;)V" => {
+                    let other = args.first().ok_or("String.<init>(String): missing arg")?;
+                    JVM::char_sequence_to_string(other, jvm)
+                }
+                "([B)V" => {
+                    let bytes_ref = args.first().ok_or("String.<init>(byte[]): missing arg")?;
+                    let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+                "([BII)V" => {
+                    let bytes_ref = args.first().ok_or("String.<init>(byte[], int, int): missing arg 1")?;
+                    let offset = match args.get(1) {
+                        Some(JvmStackValue::Int(o)) => *o as usize,
+                        _ => return Err("String.<init>(byte[], int, int): invalid/missing offset".into()),
+                    };
+                    let length = match args.get(2) {
+                        Some(JvmStackValue::Int(l)) => *l as usize,
+                        _ => return Err("String.<init>(byte[], int, int): invalid/missing length".into()),
+                    };
+                    let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
+                    if offset + length > bytes.len() {
+                        return Err(format!("StringIndexOutOfBoundsException: offset {}, length {}, bytes len {}", offset, length, bytes.len()));
+                    }
+                    String::from_utf8_lossy(&bytes[offset..offset+length]).into_owned()
+                }
+                "([BIILjava/lang/String;)V" => {
+                    let bytes_ref = args.first().ok_or("String.<init>(byte[], int, int, String): missing arg 1")?;
+                    let offset = match args.get(1) {
+                        Some(JvmStackValue::Int(o)) => *o as usize,
+                        _ => return Err("String.<init>(byte[], int, int, String): invalid/missing offset".into()),
+                    };
+                    let length = match args.get(2) {
+                        Some(JvmStackValue::Int(l)) => *l as usize,
+                        _ => return Err("String.<init>(byte[], int, int, String): invalid/missing length".into()),
+                    };
+                    let charset_ref = args.get(3).ok_or("String.<init>(byte[], int, int, String): missing charset")?;
+                    let charset = JVM::char_sequence_to_string(charset_ref, jvm).to_ascii_uppercase();
+
+                    let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
+                    if offset + length > bytes.len() {
+                        return Err(format!("StringIndexOutOfBoundsException: offset {}, length {}, bytes len {}", offset, length, bytes.len()));
+                    }
+                    let sub_bytes = &bytes[offset..offset+length];
+
+                    JVM::decode_bytes_with_charset(sub_bytes, &charset)?
+                }
+                "([C)V" => {
+                    let chars_ref = args.first().ok_or("String.<init>(char[]): missing arg")?;
+                    let chars = JVM::extract_char_array(chars_ref, jvm)?;
+                    chars.into_iter().collect::<String>()
+                }
+                "([CII)V" => {
+                    let chars_ref = args.first().ok_or("String.<init>(char[], int, int): missing arg 1")?;
+                    let offset = match args.get(1) {
+                        Some(JvmStackValue::Int(o)) => *o as usize,
+                        _ => return Err("String.<init>(char[], int, int): invalid/missing offset".into()),
+                    };
+                    let length = match args.get(2) {
+                        Some(JvmStackValue::Int(l)) => *l as usize,
+                        _ => return Err("String.<init>(char[], int, int): invalid/missing length".into()),
+                    };
+                    let chars = JVM::extract_char_array(chars_ref, jvm)?;
+                    if offset + length > chars.len() {
+                        return Err(format!("StringIndexOutOfBoundsException: offset {}, length {}, chars len {}", offset, length, chars.len()));
+                    }
+                    chars[offset..offset+length].iter().collect::<String>()
+                }
+                "([Ljava/lang/String;)V" => {
+                    "".to_string()
+                }
+                _ => return Err(format!("Unsupported String constructor: {}", descriptor)),
+            };
+
+            if let JvmStackValue::ObjectRef(id) = objectref {
+                let mut state = jvm.state.lock();
+                if let Some(HeapObject::Instance(obj)) = state.heap.get_mut(id as usize) {
+                    obj.fields.insert("buffer".to_string(), JvmStackValue::String(parsed_string));
+                    return Ok(None);
+                } else {
+                    return Err(format!("String.<init>: object ref {} is not a heap instance", id));
+                }
+            } else {
+                return Err("String.<init>: expected ObjectRef for 'this'".into());
+            }
+        }
+
+        let string = match &objectref {
+            JvmStackValue::String(value) => value.clone(),
+            JvmStackValue::ObjectRef(id) => {
+                let state = jvm.state.lock();
+                match state.heap.get(*id as usize) {
+                    Some(HeapObject::Instance(obj)) => {
+                        if let Some(JvmStackValue::String(buffer)) = obj.fields.get("buffer") {
+                            buffer.clone()
+                        } else {
+                            "".to_string()
+                        }
+                    }
+                    _ => return Err(format!("String: expected string object instance, found {:?}", objectref)),
+                }
+            }
             JvmStackValue::Null => return Err("String: NullPointerException".into()),
             value => return Err(format!("String: expected string object, found {:?}", value)),
         };
@@ -7093,6 +7198,84 @@ impl JVM {
             data,
         });
         JvmStackValue::ObjectRef((state.heap.len() - 1) as u32)
+    }
+
+    fn extract_byte_array(val: &JvmStackValue, jvm: &JVM) -> Result<Vec<u8>, String> {
+        match val {
+            JvmStackValue::ObjectRef(id) => {
+                let state = jvm.state.lock();
+                match state.heap.get(*id as usize) {
+                    Some(HeapObject::Array { data, .. }) => {
+                        JVM::byte_array_values_to_bytes(data, "extract_byte_array")
+                    }
+                    _ => Err("expected byte array object".into()),
+                }
+            }
+            JvmStackValue::Null => Err("NullPointerException: null byte array".into()),
+            _ => Err("expected object reference for byte array".into()),
+        }
+    }
+
+    fn extract_char_array(val: &JvmStackValue, jvm: &JVM) -> Result<Vec<char>, String> {
+        match val {
+            JvmStackValue::ObjectRef(id) => {
+                let state = jvm.state.lock();
+                match state.heap.get(*id as usize) {
+                    Some(HeapObject::Array { data, .. }) => {
+                        let mut chars = Vec::with_capacity(data.len());
+                        for item in data {
+                            match item {
+                                JvmStackValue::Int(c) => {
+                                    let ch = char::from_u32(*c as u32)
+                                        .unwrap_or(char::REPLACEMENT_CHARACTER);
+                                    chars.push(ch);
+                                }
+                                _ => return Err(format!("expected char in array, found {:?}", item)),
+                            }
+                        }
+                        Ok(chars)
+                    }
+                    _ => Err("expected char array object".into()),
+                }
+            }
+            JvmStackValue::Null => Err("NullPointerException: null char array".into()),
+            _ => Err("expected object reference for char array".into()),
+        }
+    }
+
+    fn decode_bytes_with_charset(bytes: &[u8], charset: &str) -> Result<String, String> {
+        match charset {
+            "UTF-8" | "UTF8" => Ok(String::from_utf8_lossy(bytes).into_owned()),
+            "US-ASCII" | "ASCII" => {
+                let s: String = bytes
+                    .iter()
+                    .map(|&b| if b <= 0x7f { b as char } else { '?' })
+                    .collect();
+                Ok(s)
+            }
+            "ISO-8859-1" | "ISO8859-1" | "ISO_8859_1" | "ISO8859_1" => {
+                let s: String = bytes.iter().map(|&b| b as char).collect();
+                Ok(s)
+            }
+            "UTF-16BE" | "UNICODEBIGUNMARKED" => {
+                let mut u16_units = Vec::with_capacity(bytes.len() / 2);
+                for chunk in bytes.chunks_exact(2) {
+                    u16_units.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+                }
+                Ok(String::from_utf16_lossy(&u16_units))
+            }
+            "UTF-16LE" | "UNICODELITTLEUNMARKED" => {
+                let mut u16_units = Vec::with_capacity(bytes.len() / 2);
+                for chunk in bytes.chunks_exact(2) {
+                    u16_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+                Ok(String::from_utf16_lossy(&u16_units))
+            }
+            _ => {
+                // Default to UTF-8
+                Ok(String::from_utf8_lossy(bytes).into_owned())
+            }
+        }
     }
 
     fn byte_array_values_to_bytes(
