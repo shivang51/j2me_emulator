@@ -5842,6 +5842,61 @@ impl JVM {
                     0
                 })))
             }
+            ("startsWith", "(Ljava/lang/String;)Z") => {
+                let Some(JvmStackValue::String(prefix)) = args.first() else {
+                    return Err(format!("String.startsWith: invalid arg {:?}", args.first()));
+                };
+
+                Ok(Some(JvmStackValue::Int(if string.starts_with(prefix) {
+                    1
+                } else {
+                    0
+                })))
+            }
+            ("contains", "(Ljava/lang/CharSequence;)Z") => {
+                let Some(JvmStackValue::String(seq)) = args.first() else {
+                    return Err(format!("String.contains: invalid arg {:?}", args.first()));
+                };
+
+                Ok(Some(JvmStackValue::Int(if string.contains(seq) {
+                    1
+                } else {
+                    0
+                })))
+            }
+            ("isEmpty", "()Z") => Ok(Some(JvmStackValue::Int(if string.is_empty() {
+                1
+            } else {
+                0
+            }))),
+            ("replace", "(CC)Ljava/lang/String;") => {
+                let (Some(JvmStackValue::Int(old_char)), Some(JvmStackValue::Int(new_char))) =
+                    (args.first(), args.get(1))
+                else {
+                    return Err(format!("String.replace: invalid args {:?}", args));
+                };
+
+                let old_char = char::from_u32(*old_char as u32).unwrap_or('\0');
+                let new_char = char::from_u32(*new_char as u32).unwrap_or('\0');
+
+                Ok(Some(JvmStackValue::String(
+                    string.replace(old_char, String::from(new_char).as_str()),
+                )))
+            }
+            ("indexOf", "(Ljava/lang/String;)I") => {
+                let Some(JvmStackValue::String(substr)) = args.first() else {
+                    return Err(format!(
+                        "String.indexOf(String): invalid arg {:?}",
+                        args.first()
+                    ));
+                };
+
+                Ok(Some(JvmStackValue::Int(
+                    string
+                        .find(substr)
+                        .map_or(-1, |idx| string[..idx].chars().count() as i32),
+                )))
+            }
             _ => Err(format!(
                 "Unsupported String instance method: {}{}",
                 method, descriptor
