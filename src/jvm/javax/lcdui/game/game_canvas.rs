@@ -50,7 +50,8 @@ pub fn paint(jvm: &JVM) -> Result<(), String> {
         graphics_handle = get_screen_graphics_handle(jvm);
     }
 
-    return JVM::execute_method(
+    let start = std::time::Instant::now();
+    let res = JVM::execute_method(
         displayable_ref,
         &class_name,
         "paint",
@@ -59,6 +60,11 @@ pub fn paint(jvm: &JVM) -> Result<(), String> {
         jvm,
         &mut Vec::new(),
     );
+    let elapsed = start.elapsed();
+    if elapsed > std::time::Duration::from_millis(100) {
+        println!("[WARNING] game_canvas::paint for {} took {:?}", class_name, elapsed);
+    }
+    res
 }
 
 fn get_screen_graphics_handle(jvm: &JVM) -> u32 {

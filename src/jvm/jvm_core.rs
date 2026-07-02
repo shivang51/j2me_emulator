@@ -854,15 +854,17 @@ impl JVM {
         let mut op_count = 0;
 
         while pc < bytecode.len() {
-            if !jvm.wait_if_paused() {
-                return Ok(None);
-            }
-
             let opcode = bytecode[pc];
 
             op_count += 1;
-            if op_count % 50_000 == 0 {
-                std::thread::yield_now();
+            // Only check for pause and yield periodically to save CPU cycles in the hot loop
+            if op_count & 0x3FF == 0 { // Every 1024 instructions
+                if !jvm.wait_if_paused() {
+                    return Ok(None);
+                }
+                if op_count & 0xFFFF == 0 { // Every ~65000 instructions
+                    std::thread::yield_now();
+                }
             }
 
             // debug-out added this line for easy finding this line ;)
@@ -4337,7 +4339,8 @@ impl JVM {
         jvm: &JVM,
         caller_stack: &mut Vec<JvmStackValue>,
     ) -> Result<(), String> {
-        JVM::execute_method_inner(
+        let start_time = std::time::Instant::now();
+        let res = JVM::execute_method_inner(
             objectref,
             class_name,
             method_name,
@@ -4346,7 +4349,14 @@ impl JVM {
             jvm,
             caller_stack,
         )
-        .map_err(|e| JVM::append_method_context(e, class_name, method_name, descriptor))
+        .map_err(|e| JVM::append_method_context(e, class_name, method_name, descriptor));
+
+        let elapsed = start_time.elapsed();
+        if elapsed > std::time::Duration::from_millis(50) {
+            println!("[PROFILE] {}.{} took {:?}", class_name, method_name, elapsed);
+        }
+
+        res
     }
 
     fn execute_method_inner(
