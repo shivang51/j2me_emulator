@@ -3530,7 +3530,9 @@ impl JVM {
                 };
                 Ok(JvmStackValue::String(value))
             }
-            ConstantInfo::Utf8(utf8_info) => Ok(JvmStackValue::String(utf8_info.utf8_string.clone())),
+            ConstantInfo::Utf8(utf8_info) => {
+                Ok(JvmStackValue::String(utf8_info.utf8_string.clone()))
+            }
             ConstantInfo::Class(class_info) => {
                 let class_name = JVM::resolve_utf8(class_info.name_index, cp);
                 Ok(JVM::allocate_class_object(jvm, class_name))
@@ -4617,42 +4619,19 @@ impl JVM {
             if class_name == game_canvas::CLASS_NAME
                 || class_name == "javax/microedition/lcdui/Canvas"
             {
-                let return_value = {
-                    let mut state = jvm.state.lock();
-                    let heap_idx = if let JvmStackValue::ObjectRef(id) = objectref {
-                        id as usize
-                    } else {
-                        return Err(
-                            "Canvas/GameCanvas method call with non-reference object".into()
-                        );
-                    };
-
-                    // Temporarily replace the object with a dummy to avoid multiple mutable borrows
-                    let mut obj = std::mem::replace(
-                        &mut state.heap[heap_idx],
-                        HeapObject::Array {
-                            element_type: "".into(),
-                            data: vec![],
-                        },
-                    );
-                    let res = if let HeapObject::Instance(ref mut inst) = obj {
-                        game_canvas::handle_virtual_method(
-                            inst,
-                            method_name,
-                            descriptor,
-                            args,
-                            &jvm,
-                        )
-                    } else {
-                        Err(
-                            "Canvas/GameCanvas method call on non-instance object or invalid ref"
-                                .into(),
-                        )
-                    };
-                    // Put it back!
-                    state.heap[heap_idx] = obj;
-                    res
+                let object_id = if let JvmStackValue::ObjectRef(id) = objectref {
+                    id
+                } else {
+                    return Err("Canvas/GameCanvas method call with non-reference object".into());
                 };
+
+                let return_value = game_canvas::handle_virtual_method(
+                    object_id,
+                    method_name,
+                    descriptor,
+                    args,
+                    jvm,
+                );
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling Canvas/GameCanvas method: {}", e).into());
@@ -4670,6 +4649,25 @@ impl JVM {
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling Graphics method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == graphics::FONT_CLASS_NAME {
+                let return_value = graphics::handle_font_virtual_method(
+                    &objectref,
+                    method_name,
+                    descriptor,
+                    args,
+                    jvm,
+                );
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling Font method: {}", e).into());
                 }
 
                 if let Some(val) = return_value.unwrap() {
@@ -5021,40 +5019,19 @@ impl JVM {
             if JVM::class_extends(jvm, class_name, game_canvas::CLASS_NAME)
                 || JVM::class_extends(jvm, class_name, "javax/microedition/lcdui/Canvas")
             {
-                let return_value = {
-                    let mut state = jvm.state.lock();
-                    let heap_idx = if let JvmStackValue::ObjectRef(id) = objectref {
-                        id as usize
-                    } else {
-                        return Err(
-                            "Canvas/GameCanvas method call with non-reference object".into()
-                        );
-                    };
-
-                    let mut obj = std::mem::replace(
-                        &mut state.heap[heap_idx],
-                        HeapObject::Array {
-                            element_type: "".into(),
-                            data: vec![],
-                        },
-                    );
-                    let res = if let HeapObject::Instance(ref mut inst) = obj {
-                        game_canvas::handle_virtual_method(
-                            inst,
-                            method_name,
-                            descriptor,
-                            args,
-                            &jvm,
-                        )
-                    } else {
-                        Err(
-                            "Canvas/GameCanvas method call on non-instance object or invalid ref"
-                                .into(),
-                        )
-                    };
-                    state.heap[heap_idx] = obj;
-                    res?
+                let object_id = if let JvmStackValue::ObjectRef(id) = objectref {
+                    id
+                } else {
+                    return Err("Canvas/GameCanvas method call with non-reference object".into());
                 };
+
+                let return_value = game_canvas::handle_virtual_method(
+                    object_id,
+                    method_name,
+                    descriptor,
+                    args,
+                    jvm,
+                )?;
 
                 if let Some(val) = return_value {
                     caller_stack.push(val);
@@ -5927,11 +5904,9 @@ impl JVM {
                 JVM::copy_chars_to_array(state, &dst, dst_begin, &chars)?;
                 Ok(None)
             }
-            ("toString", "()Ljava/lang/String;") => {
-                Ok(Some(JvmStackValue::String(JVM::string_buffer_text(
-                    state, this_id,
-                )?)))
-            }
+            ("toString", "()Ljava/lang/String;") => Ok(Some(JvmStackValue::String(
+                JVM::string_buffer_text(state, this_id)?,
+            ))),
             _ => Err(format!(
                 "Unsupported StringBuffer method: {}{} | args = {:?}",
                 method, descriptor, args
@@ -6407,10 +6382,8 @@ impl JVM {
                         .first()
                         .ok_or("String.<init>(byte[], int, int): missing arg 1")?;
                     let context = "(byte[], int, int)";
-                    let offset =
-                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
-                    let length =
-                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
+                    let offset = JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length = JVM::string_constructor_int_arg(args, 2, context, "length")?;
                     let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
                     let range =
                         JVM::string_constructor_range(bytes.len(), offset, length, context)?;
@@ -6430,10 +6403,8 @@ impl JVM {
                         .first()
                         .ok_or("String.<init>(byte[], int, int, String): missing arg 1")?;
                     let context = "(byte[], int, int, charset)";
-                    let offset =
-                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
-                    let length =
-                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
+                    let offset = JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length = JVM::string_constructor_int_arg(args, 2, context, "length")?;
                     let charset = JVM::string_constructor_charset_arg(args, 3, context, jvm)?;
                     let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
                     let range =
@@ -6446,8 +6417,7 @@ impl JVM {
                         .first()
                         .ok_or("String.<init>(byte[], int): missing arg 1")?;
                     let context = "(byte[], int)";
-                    let hibyte =
-                        JVM::string_constructor_int_arg(args, 1, context, "hibyte")?;
+                    let hibyte = JVM::string_constructor_int_arg(args, 1, context, "hibyte")?;
                     let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
                     JVM::decode_hibyte_bytes(&bytes, hibyte)
                 }
@@ -6456,12 +6426,9 @@ impl JVM {
                         .first()
                         .ok_or("String.<init>(byte[], int, int, int): missing arg 1")?;
                     let context = "(byte[], int, int, int)";
-                    let hibyte =
-                        JVM::string_constructor_int_arg(args, 1, context, "hibyte")?;
-                    let offset =
-                        JVM::string_constructor_int_arg(args, 2, context, "offset")?;
-                    let length =
-                        JVM::string_constructor_int_arg(args, 3, context, "length")?;
+                    let hibyte = JVM::string_constructor_int_arg(args, 1, context, "hibyte")?;
+                    let offset = JVM::string_constructor_int_arg(args, 2, context, "offset")?;
+                    let length = JVM::string_constructor_int_arg(args, 3, context, "length")?;
                     let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
                     let range =
                         JVM::string_constructor_range(bytes.len(), offset, length, context)?;
@@ -6477,10 +6444,8 @@ impl JVM {
                         .first()
                         .ok_or("String.<init>(char[], int, int): missing arg 1")?;
                     let context = "(char[], int, int)";
-                    let offset =
-                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
-                    let length =
-                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
+                    let offset = JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length = JVM::string_constructor_int_arg(args, 2, context, "length")?;
                     let chars = JVM::extract_char_array(chars_ref, jvm)?;
                     let range =
                         JVM::string_constructor_range(chars.len(), offset, length, context)?;
@@ -6491,10 +6456,8 @@ impl JVM {
                         .first()
                         .ok_or("String.<init>(int[], int, int): missing arg 1")?;
                     let context = "(int[], int, int)";
-                    let offset =
-                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
-                    let length =
-                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
+                    let offset = JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length = JVM::string_constructor_int_arg(args, 2, context, "length")?;
                     let code_points = JVM::extract_int_array(code_points_ref, jvm)?;
                     let range =
                         JVM::string_constructor_range(code_points.len(), offset, length, context)?;
@@ -6849,6 +6812,16 @@ impl JVM {
             if class_name == player::MANAGER_CLASS_NAME {
                 let return_value =
                     player::handle_manager_static_method(method_name, descriptor, args, jvm)?;
+
+                if let Some(val) = return_value {
+                    stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == graphics::FONT_CLASS_NAME {
+                let return_value =
+                    graphics::handle_font_static_method(method_name, descriptor, args, jvm)?;
 
                 if let Some(val) = return_value {
                     stack.push(val);
@@ -8023,7 +7996,8 @@ impl JVM {
                 let mut state = jvm.state.lock();
                 let _data = if let Some(_data) = state.resources.get(&resource_path) {
                 } else {
-                    return Err(format!("Resource not found {}", resource_path).into()); // Resource not found, return null
+                    // Resource not found, return null
+                    return Err(format!("Resource not found {}", resource_path).into());
                 };
 
                 let mut fields = HashMap::new();
@@ -8095,7 +8069,10 @@ impl JVM {
                                     chars.push(ch);
                                 }
                                 _ => {
-                                    return Err(format!("expected char in array, found {:?}", item));
+                                    return Err(format!(
+                                        "expected char in array, found {:?}",
+                                        item
+                                    ));
                                 }
                             }
                         }

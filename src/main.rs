@@ -5,12 +5,14 @@ mod services;
 
 use app::App;
 use egui_winit::winit::event_loop::{ControlFlow, EventLoop};
-use jvm::JVM;
+use jvm::{javax::lcdui::game::game_canvas, JVM};
 
 use services::jar_extractor::JarExtractor;
 
 fn main() {
     const JAR_PATH: &str = "test_files/towerdefen_ou812zz9.jar";
+
+    game_canvas::configure_canvas_size_from_path(Some(JAR_PATH));
 
     let mut jar_extractor = JarExtractor::for_path(JAR_PATH.to_string());
 

@@ -11,11 +11,11 @@ use egui_winit::winit::keyboard::{KeyCode, PhysicalKey};
 use egui_winit::winit::window::{Window, WindowId};
 use egui_winit::{egui, winit};
 use parking_lot::Mutex;
-use pixels::{Pixels, SurfaceTexture, wgpu};
+use pixels::{wgpu, Pixels, SurfaceTexture};
 
-use crate::jvm::JVM;
-use crate::jvm::javax::lcdui::game::game_canvas::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use crate::jvm::javax::lcdui::game::game_canvas;
 use crate::jvm::javax::lcdui::image as lcdui_image;
+use crate::jvm::JVM;
 use crate::profile::Profile;
 use crate::services::jar_extractor::{JarExtractor, JarFileData};
 
@@ -80,6 +80,8 @@ enum UiAction {
 
 impl App {
     pub fn with_jvm(jvm: JVM, jar_path: Option<String>) -> Self {
+        game_canvas::configure_canvas_size_from_path(jar_path.as_deref());
+
         Self {
             jvm: Some(jvm),
             jar_path_input: jar_path.clone().unwrap_or_default(),
@@ -141,12 +143,39 @@ impl App {
         }
     }
 
+    fn resize_draw_buffer(width: i32, height: i32) {
+        let width = width.max(1) as u32;
+        let height = height.max(1) as u32;
+        let mut draw_state = DRAW_STATE.lock();
+
+        if draw_state.width == width && draw_state.height == height {
+            return;
+        }
+
+        if let Some(pixels) = draw_state.pixels.as_mut() {
+            if let Err(err) = pixels.resize_buffer(width, height) {
+                eprintln!(
+                    "Failed to resize draw buffer to {}x{}: {}",
+                    width, height, err
+                );
+                return;
+            }
+        }
+
+        draw_state.width = width;
+        draw_state.height = height;
+    }
+
     fn replace_jvm(&mut self, data: JarFileData, jar_path: Option<String>) -> Result<(), String> {
         if let Some(jvm) = &self.jvm {
             jvm.shutdown();
         }
 
         lcdui_image::clear_cache();
+
+        let (canvas_width, canvas_height) =
+            game_canvas::configure_canvas_size_from_path(jar_path.as_deref());
+        Self::resize_draw_buffer(canvas_width, canvas_height);
 
         let mut new_jvm = JVM::new();
         if let Err(err) = new_jvm.run_jar(data) {
@@ -611,8 +640,9 @@ impl ApplicationHandler for App {
             None,
         );
 
-        let internal_width = DEFAULT_WIDTH as u32;
-        let internal_height = DEFAULT_HEIGHT as u32;
+        let (internal_width, internal_height) = game_canvas::canvas_size();
+        let internal_width = internal_width as u32;
+        let internal_height = internal_height as u32;
 
         if size.width > 0 && size.height > 0 {
             let mut draw_state = DRAW_STATE.lock();

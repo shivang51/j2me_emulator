@@ -1,13 +1,22 @@
+use std::collections::HashMap;
+
 use crate::{
     app::DRAW_STATE,
     jvm::{
         javax::lcdui::image::get_or_create_buffer,
-        jvm_core::{HeapObject, JVM, JvmStackValue},
+        jvm_core::{HeapObject, JvmStackValue, JVM},
     },
     profile::Profile,
 };
 
 pub const CLASS_NAME: &str = "javax/microedition/lcdui/Graphics";
+pub const FONT_CLASS_NAME: &str = "javax/microedition/lcdui/Font";
+
+const DEFAULT_FONT_HEIGHT: i32 = 16;
+const FONT_SCALE: i32 = 2;
+const GLYPH_WIDTH: i32 = 5;
+const GLYPH_HEIGHT: i32 = 7;
+const FONT_ADVANCE: i32 = GLYPH_WIDTH * FONT_SCALE + 2;
 
 #[derive(Clone, Copy)]
 struct ClipRect {
@@ -253,7 +262,100 @@ pub fn handle_virtual_method(
 
             Ok(None)
         }
-        ("drawString", "(Ljava/lang/String;III)V") => todo!("Graphics.drawString"),
+        ("fillArc", "(IIIIII)V") => {
+            Profile::this("fillArc(IIIIII)V");
+            let x = get_int_arg(args, 0)?;
+            let y = get_int_arg(args, 1)?;
+            let width = get_int_arg(args, 2)?;
+            let height = get_int_arg(args, 3)?;
+            let start_angle = get_int_arg(args, 4)?;
+            let arc_angle = get_int_arg(args, 5)?;
+            let color = get_color(objectref, jvm);
+
+            fill_arc(
+                objectref,
+                jvm,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                width,
+                height,
+                start_angle,
+                arc_angle,
+                color,
+            );
+
+            Ok(None)
+        }
+        ("drawRoundRect", "(IIIIII)V") => {
+            Profile::this("drawRoundRect(IIIIII)V");
+            let x = get_int_arg(args, 0)?;
+            let y = get_int_arg(args, 1)?;
+            let width = get_int_arg(args, 2)?;
+            let height = get_int_arg(args, 3)?;
+            let arc_width = get_int_arg(args, 4)?;
+            let arc_height = get_int_arg(args, 5)?;
+            let color = get_color(objectref, jvm);
+            let style = get_int_field(objectref, jvm, "strokeStyle", 0);
+
+            draw_round_rect(
+                objectref,
+                jvm,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                width,
+                height,
+                arc_width,
+                arc_height,
+                color,
+                style == 1,
+            );
+
+            Ok(None)
+        }
+        ("fillRoundRect", "(IIIIII)V") => {
+            Profile::this("fillRoundRect(IIIIII)V");
+            let x = get_int_arg(args, 0)?;
+            let y = get_int_arg(args, 1)?;
+            let width = get_int_arg(args, 2)?;
+            let height = get_int_arg(args, 3)?;
+            let arc_width = get_int_arg(args, 4)?;
+            let arc_height = get_int_arg(args, 5)?;
+            let color = get_color(objectref, jvm);
+
+            fill_round_rect(
+                objectref,
+                jvm,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                width,
+                height,
+                arc_width,
+                arc_height,
+                color,
+            );
+
+            Ok(None)
+        }
+        ("drawString", "(Ljava/lang/String;III)V") => {
+            Profile::this("drawString(Ljava/lang/String;III)V");
+            let text = get_string_arg(args, 0, jvm, "Graphics.drawString")?;
+            let x = get_int_arg(args, 1)?;
+            let y = get_int_arg(args, 2)?;
+            let anchor = get_int_arg(args, 3)?;
+            let color = get_color(objectref, jvm);
+
+            draw_text(
+                objectref,
+                jvm,
+                &text,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                anchor,
+                color,
+            );
+
+            Ok(None)
+        }
         ("drawRGB", "([IIIIIIIZ)V") => {
             Profile::this("drawRGB([IIIIIIIZ)V");
             let rgb_ref = args.get(0).ok_or("drawRGB: missing rgbData")?;
@@ -292,8 +394,82 @@ pub fn handle_virtual_method(
 
             Ok(None)
         }
-        ("drawSubstring", "(Ljava/lang/String;IIIII)V") => todo!("Graphics.drawSubstring"),
-        ("setFont", "(Ljavax/microedition/lcdui/Font;)V") => todo!("Graphics.setFont"),
+        ("drawSubstring", "(Ljava/lang/String;IIIII)V") => {
+            Profile::this("drawSubstring(Ljava/lang/String;IIIII)V");
+            let text = get_string_arg(args, 0, jvm, "Graphics.drawSubstring")?;
+            let offset = get_int_arg(args, 1)?;
+            let len = get_int_arg(args, 2)?;
+            let x = get_int_arg(args, 3)?;
+            let y = get_int_arg(args, 4)?;
+            let anchor = get_int_arg(args, 5)?;
+            let substring = substring_chars(&text, offset, len, "Graphics.drawSubstring")?;
+            let color = get_color(objectref, jvm);
+
+            draw_text(
+                objectref,
+                jvm,
+                &substring,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                anchor,
+                color,
+            );
+
+            Ok(None)
+        }
+        ("drawChar", "(CIII)V") => {
+            Profile::this("drawChar(CIII)V");
+            let ch = char::from_u32(get_int_arg(args, 0)? as u32).unwrap_or('\u{fffd}');
+            let x = get_int_arg(args, 1)?;
+            let y = get_int_arg(args, 2)?;
+            let anchor = get_int_arg(args, 3)?;
+            let color = get_color(objectref, jvm);
+
+            draw_text(
+                objectref,
+                jvm,
+                &ch.to_string(),
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                anchor,
+                color,
+            );
+
+            Ok(None)
+        }
+        ("setFont", "(Ljavax/microedition/lcdui/Font;)V") => {
+            let font_ref = args
+                .get(0)
+                .ok_or_else(|| "Graphics.setFont: missing font argument".to_string())?;
+            set_font_field(objectref, jvm, font_ref)?;
+            Ok(None)
+        }
+        ("getFont", "()Ljavax/microedition/lcdui/Font;") => {
+            let font_ref = get_or_create_font(objectref, jvm)?;
+            Ok(Some(JvmStackValue::ObjectRef(font_ref)))
+        }
+        ("getColor", "()I") => Ok(Some(JvmStackValue::Int(get_color_int(objectref, jvm)))),
+        ("getRedComponent", "()I") => Ok(Some(JvmStackValue::Int(
+            (get_color_int(objectref, jvm) >> 16) & 0xFF,
+        ))),
+        ("getGreenComponent", "()I") => Ok(Some(JvmStackValue::Int(
+            (get_color_int(objectref, jvm) >> 8) & 0xFF,
+        ))),
+        ("getBlueComponent", "()I") => Ok(Some(JvmStackValue::Int(
+            get_color_int(objectref, jvm) & 0xFF,
+        ))),
+        ("setGrayScale", "(I)V") => {
+            let value = get_int_arg(args, 0)?.clamp(0, 255);
+            set_color_field(objectref, jvm, (value << 16) | (value << 8) | value);
+            Ok(None)
+        }
+        ("getGrayScale", "()I") => {
+            let color = get_color_int(objectref, jvm);
+            let r = (color >> 16) & 0xFF;
+            let g = (color >> 8) & 0xFF;
+            let b = color & 0xFF;
+            Ok(Some(JvmStackValue::Int((r * 30 + g * 59 + b * 11) / 100)))
+        }
         ("setClip", "(IIII)V") => {
             Profile::this("setClip(IIII)V");
             let x = get_int_arg(args, 0)?;
@@ -327,18 +503,14 @@ pub fn handle_virtual_method(
         ("getClipY", "()I") => Ok(Some(JvmStackValue::Int(
             get_clip_rect(objectref, jvm).y - get_translate_y(objectref, jvm),
         ))),
-        ("getTranslateX", "()I") => {
-            Ok(Some(JvmStackValue::Int(get_translate_x(objectref, jvm))))
-        }
-        ("getTranslateY", "()I") => {
-            Ok(Some(JvmStackValue::Int(get_translate_y(objectref, jvm))))
-        }
-        ("getClipWidth", "()I") => {
-            Ok(Some(JvmStackValue::Int(get_clip_rect(objectref, jvm).width)))
-        }
-        ("getClipHeight", "()I") => {
-            Ok(Some(JvmStackValue::Int(get_clip_rect(objectref, jvm).height)))
-        }
+        ("getTranslateX", "()I") => Ok(Some(JvmStackValue::Int(get_translate_x(objectref, jvm)))),
+        ("getTranslateY", "()I") => Ok(Some(JvmStackValue::Int(get_translate_y(objectref, jvm)))),
+        ("getClipWidth", "()I") => Ok(Some(JvmStackValue::Int(
+            get_clip_rect(objectref, jvm).width,
+        ))),
+        ("getClipHeight", "()I") => Ok(Some(JvmStackValue::Int(
+            get_clip_rect(objectref, jvm).height,
+        ))),
         _ => Err(format!(
             "Unsupported Graphics instance method: {}{}",
             method_name, descriptor
@@ -354,6 +526,207 @@ fn get_int_arg(args: &[JvmStackValue], index: usize) -> Result<i32, String> {
             index
         )),
     }
+}
+
+fn get_string_arg(
+    args: &[JvmStackValue],
+    index: usize,
+    jvm: &JVM,
+    context: &str,
+) -> Result<String, String> {
+    match args.get(index) {
+        Some(JvmStackValue::String(value)) => Ok(value.clone()),
+        Some(JvmStackValue::ObjectRef(id)) => {
+            let state = jvm.state.lock();
+            let Some(HeapObject::Instance(obj)) = state.heap.get(*id as usize) else {
+                return Err(format!("{}: expected String object", context));
+            };
+
+            for field in ["value", "buffer", "text"] {
+                if let Some(JvmStackValue::String(value)) = obj.fields.get(field) {
+                    return Ok(value.clone());
+                }
+            }
+
+            Ok(String::new())
+        }
+        Some(JvmStackValue::Null) => Err("java.lang.NullPointerException".into()),
+        Some(value) => Err(format!("{}: expected String, found {:?}", context, value)),
+        None => Err(format!("{}: missing String argument", context)),
+    }
+}
+
+fn substring_chars(value: &str, offset: i32, len: i32, context: &str) -> Result<String, String> {
+    if offset < 0 || len < 0 {
+        return Err(format!(
+            "java.lang.StringIndexOutOfBoundsException: {} offset {}, length {}",
+            context, offset, len
+        ));
+    }
+
+    let offset = offset as usize;
+    let len = len as usize;
+    let chars: Vec<char> = value.chars().collect();
+    if offset > chars.len() || offset + len > chars.len() {
+        return Err(format!(
+            "java.lang.StringIndexOutOfBoundsException: {} offset {}, length {}, string length {}",
+            context,
+            offset,
+            len,
+            chars.len()
+        ));
+    }
+
+    Ok(chars[offset..offset + len].iter().collect())
+}
+
+pub fn handle_font_static_method(
+    method_name: &str,
+    descriptor: &str,
+    args: &[JvmStackValue],
+    jvm: &JVM,
+) -> Result<Option<JvmStackValue>, String> {
+    match (method_name, descriptor) {
+        ("getDefaultFont", "()Ljavax/microedition/lcdui/Font;") => {
+            Ok(Some(JvmStackValue::ObjectRef(allocate_font(jvm, 0, 0, 0))))
+        }
+        ("getFont", "(III)Ljavax/microedition/lcdui/Font;") => {
+            let face = get_int_arg(args, 0)?;
+            let style = get_int_arg(args, 1)?;
+            let size = get_int_arg(args, 2)?;
+            Ok(Some(JvmStackValue::ObjectRef(allocate_font(
+                jvm, face, style, size,
+            ))))
+        }
+        _ => Err(format!(
+            "Unsupported Font static method: {}{}",
+            method_name, descriptor
+        )),
+    }
+}
+
+pub fn handle_font_virtual_method(
+    objectref: &JvmStackValue,
+    method_name: &str,
+    descriptor: &str,
+    args: &[JvmStackValue],
+    jvm: &JVM,
+) -> Result<Option<JvmStackValue>, String> {
+    match (method_name, descriptor) {
+        ("getHeight", "()I") => Ok(Some(JvmStackValue::Int(get_font_height(objectref, jvm)))),
+        ("charWidth", "(C)I") => Ok(Some(JvmStackValue::Int(font_char_width()))),
+        ("stringWidth", "(Ljava/lang/String;)I") => {
+            let text = get_string_arg(args, 0, jvm, "Font.stringWidth")?;
+            Ok(Some(JvmStackValue::Int(text_width(&text))))
+        }
+        ("substringWidth", "(Ljava/lang/String;II)I") => {
+            let text = get_string_arg(args, 0, jvm, "Font.substringWidth")?;
+            let offset = get_int_arg(args, 1)?;
+            let len = get_int_arg(args, 2)?;
+            let substring = substring_chars(&text, offset, len, "Font.substringWidth")?;
+            Ok(Some(JvmStackValue::Int(text_width(&substring))))
+        }
+        _ => Err(format!(
+            "Unsupported Font instance method: {}{}",
+            method_name, descriptor
+        )),
+    }
+}
+
+fn allocate_font(jvm: &JVM, face: i32, style: i32, size: i32) -> u32 {
+    let mut fields = HashMap::new();
+    fields.insert("face:I".to_string(), JvmStackValue::Int(face));
+    fields.insert("style:I".to_string(), JvmStackValue::Int(style));
+    fields.insert("size:I".to_string(), JvmStackValue::Int(size));
+    fields.insert(
+        "height:I".to_string(),
+        JvmStackValue::Int(DEFAULT_FONT_HEIGHT),
+    );
+
+    let mut state = jvm.state.lock();
+    JVM::allocate_internal(&mut state, FONT_CLASS_NAME.to_string(), fields)
+}
+
+fn get_font_height(objectref: &JvmStackValue, jvm: &JVM) -> i32 {
+    let JvmStackValue::ObjectRef(id) = objectref else {
+        return DEFAULT_FONT_HEIGHT;
+    };
+
+    let state = jvm.state.lock();
+    let Some(HeapObject::Instance(obj)) = state.heap.get(*id as usize) else {
+        return DEFAULT_FONT_HEIGHT;
+    };
+
+    match obj.fields.get("height:I") {
+        Some(JvmStackValue::Int(height)) => *height,
+        _ => DEFAULT_FONT_HEIGHT,
+    }
+}
+
+fn get_or_create_font(objectref: &JvmStackValue, jvm: &JVM) -> Result<u32, String> {
+    let JvmStackValue::ObjectRef(graphics_id) = objectref else {
+        return Err("Graphics.getFont: expected Graphics object".into());
+    };
+
+    {
+        let state = jvm.state.lock();
+        let Some(HeapObject::Instance(graphics)) = state.heap.get(*graphics_id as usize) else {
+            return Err("Graphics.getFont: invalid Graphics object".into());
+        };
+
+        if let Some(JvmStackValue::ObjectRef(font_id)) =
+            graphics.fields.get("font:Ljavax/microedition/lcdui/Font;")
+        {
+            if matches!(
+                state.heap.get(*font_id as usize),
+                Some(HeapObject::Instance(font)) if font.class_name == FONT_CLASS_NAME
+            ) {
+                return Ok(*font_id);
+            }
+        }
+    }
+
+    let font_id = allocate_font(jvm, 0, 0, 0);
+    let mut state = jvm.state.lock();
+    let Some(HeapObject::Instance(graphics)) = state.heap.get_mut(*graphics_id as usize) else {
+        return Err("Graphics.getFont: invalid Graphics object".into());
+    };
+    graphics.fields.insert(
+        "font:Ljavax/microedition/lcdui/Font;".to_string(),
+        JvmStackValue::ObjectRef(font_id),
+    );
+    Ok(font_id)
+}
+
+fn set_font_field(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    font_ref: &JvmStackValue,
+) -> Result<(), String> {
+    let JvmStackValue::ObjectRef(graphics_id) = objectref else {
+        return Err("Graphics.setFont: expected Graphics object".into());
+    };
+
+    let font_value = match font_ref {
+        JvmStackValue::ObjectRef(id) => JvmStackValue::ObjectRef(*id),
+        JvmStackValue::Null => JvmStackValue::ObjectRef(allocate_font(jvm, 0, 0, 0)),
+        value => {
+            return Err(format!(
+                "Graphics.setFont: expected Font object, found {:?}",
+                value
+            ));
+        }
+    };
+
+    let mut state = jvm.state.lock();
+    let Some(HeapObject::Instance(graphics)) = state.heap.get_mut(*graphics_id as usize) else {
+        return Err("Graphics.setFont: invalid Graphics object".into());
+    };
+    graphics.fields.insert(
+        "font:Ljavax/microedition/lcdui/Font;".to_string(),
+        font_value,
+    );
+    Ok(())
 }
 
 fn get_target_image_id(objectref: &JvmStackValue, jvm: &JVM) -> Option<usize> {
@@ -396,21 +769,28 @@ fn with_draw_target<R>(
 }
 
 fn get_color(objectref: &JvmStackValue, jvm: &JVM) -> [u8; 4] {
+    let c = get_color_int(objectref, jvm);
+    [
+        ((c >> 16) & 0xFF) as u8,
+        ((c >> 8) & 0xFF) as u8,
+        (c & 0xFF) as u8,
+        255,
+    ]
+}
+
+fn get_color_int(objectref: &JvmStackValue, jvm: &JVM) -> i32 {
     let heap_idx = match objectref {
         JvmStackValue::ObjectRef(id) => *id as usize,
-        _ => return [0, 0, 0, 255],
+        _ => return 0,
     };
 
     let state = jvm.state.lock();
     if let Some(HeapObject::Instance(obj)) = state.heap.get(heap_idx) {
         if let Some(JvmStackValue::Int(c)) = obj.fields.get("color") {
-            let r = ((c >> 16) & 0xFF) as u8;
-            let g = ((c >> 8) & 0xFF) as u8;
-            let b = (c & 0xFF) as u8;
-            return [r, g, b, 255];
+            return *c & 0x00FF_FFFF;
         }
     }
-    [0, 0, 0, 255]
+    0
 }
 
 fn get_int_field(objectref: &JvmStackValue, jvm: &JVM, field_name: &str, default: i32) -> i32 {
@@ -511,14 +891,7 @@ fn store_clip_rect(objectref: &JvmStackValue, jvm: &JVM, clip: ClipRect) {
     set_int_field(objectref, jvm, "clipHeight", clip.height);
 }
 
-fn set_clip_rect(
-    objectref: &JvmStackValue,
-    jvm: &JVM,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-) {
+fn set_clip_rect(objectref: &JvmStackValue, jvm: &JVM, x: i32, y: i32, width: i32, height: i32) {
     let clip = make_clip_rect(objectref, jvm, x, y, width, height);
     store_clip_rect(objectref, jvm, clip);
 }
@@ -702,15 +1075,7 @@ fn draw_rgb(
     });
 }
 
-fn put_pixel(
-    frame: &mut [u8],
-    dw: i32,
-    dh: i32,
-    clip: ClipRect,
-    x: i32,
-    y: i32,
-    color: [u8; 4],
-) {
+fn put_pixel(frame: &mut [u8], dw: i32, dh: i32, clip: ClipRect, x: i32, y: i32, color: [u8; 4]) {
     if x < 0 || x >= dw || y < 0 || y >= dh || !clip.contains(x, y) {
         return;
     }
@@ -1106,6 +1471,10 @@ fn draw_arc(
     arc_angle: i32,
     color: [u8; 4],
 ) {
+    if width <= 0 || height <= 0 || arc_angle == 0 {
+        return;
+    }
+
     let clip = get_clip_rect(objectref, jvm);
     let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         let cx = x + width / 2;
@@ -1127,4 +1496,436 @@ fn draw_arc(
             put_pixel(frame, dw, dh, clip, px, py, color);
         }
     });
+}
+
+fn fill_arc(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    start_angle: i32,
+    arc_angle: i32,
+    color: [u8; 4],
+) {
+    if width <= 0 || height <= 0 || arc_angle == 0 {
+        return;
+    }
+
+    let clip = get_clip_rect(objectref, jvm);
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
+        let cx = x as f32 + width as f32 / 2.0;
+        let cy = y as f32 + height as f32 / 2.0;
+        let rx = width as f32 / 2.0;
+        let ry = height as f32 / 2.0;
+
+        let start_y = y.max(0).max(clip.y);
+        let end_y = y.saturating_add(height).min(dh).min(clip.bottom());
+        let start_x = x.max(0).max(clip.x);
+        let end_x = x.saturating_add(width).min(dw).min(clip.right());
+
+        for py in start_y..end_y {
+            for px in start_x..end_x {
+                let dx = (px as f32 + 0.5 - cx) / rx;
+                let dy = (py as f32 + 0.5 - cy) / ry;
+                if dx * dx + dy * dy > 1.0 {
+                    continue;
+                }
+
+                let angle = dy.atan2(dx).to_degrees();
+                if angle_in_arc(angle, start_angle, arc_angle) {
+                    put_pixel(frame, dw, dh, clip, px, py, color);
+                }
+            }
+        }
+    });
+}
+
+fn draw_round_rect(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    arc_width: i32,
+    arc_height: i32,
+    color: [u8; 4],
+    dotted: bool,
+) {
+    if width < 0 || height < 0 {
+        return;
+    }
+
+    let arc_width = arc_width.max(0).min(width);
+    let arc_height = arc_height.max(0).min(height);
+    if arc_width == 0 || arc_height == 0 {
+        draw_rect(objectref, jvm, x, y, width, height, color, dotted);
+        return;
+    }
+
+    let rx = arc_width / 2;
+    let ry = arc_height / 2;
+    let right = x + width;
+    let bottom = y + height;
+
+    draw_line(objectref, jvm, x + rx, y, right - rx, y, color, dotted);
+    draw_line(
+        objectref,
+        jvm,
+        x + rx,
+        bottom,
+        right - rx,
+        bottom,
+        color,
+        dotted,
+    );
+    draw_line(objectref, jvm, x, y + ry, x, bottom - ry, color, dotted);
+    draw_line(
+        objectref,
+        jvm,
+        right,
+        y + ry,
+        right,
+        bottom - ry,
+        color,
+        dotted,
+    );
+
+    draw_arc(objectref, jvm, x, y, arc_width, arc_height, 180, 90, color);
+    draw_arc(
+        objectref,
+        jvm,
+        right - arc_width,
+        y,
+        arc_width,
+        arc_height,
+        270,
+        90,
+        color,
+    );
+    draw_arc(
+        objectref,
+        jvm,
+        right - arc_width,
+        bottom - arc_height,
+        arc_width,
+        arc_height,
+        0,
+        90,
+        color,
+    );
+    draw_arc(
+        objectref,
+        jvm,
+        x,
+        bottom - arc_height,
+        arc_width,
+        arc_height,
+        90,
+        90,
+        color,
+    );
+}
+
+fn fill_round_rect(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    arc_width: i32,
+    arc_height: i32,
+    color: [u8; 4],
+) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let rx = (arc_width.max(0).min(width) / 2).max(0);
+    let ry = (arc_height.max(0).min(height) / 2).max(0);
+    if rx == 0 || ry == 0 {
+        fill_rect(objectref, jvm, x, y, width, height, color);
+        return;
+    }
+
+    let clip = get_clip_rect(objectref, jvm);
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
+        let start_y = y.max(0).max(clip.y);
+        let end_y = y.saturating_add(height).min(dh).min(clip.bottom());
+        let start_x = x.max(0).max(clip.x);
+        let end_x = x.saturating_add(width).min(dw).min(clip.right());
+
+        for py in start_y..end_y {
+            for px in start_x..end_x {
+                let local_x = px - x;
+                let local_y = py - y;
+                if rounded_rect_contains(local_x, local_y, width, height, rx, ry) {
+                    put_pixel(frame, dw, dh, clip, px, py, color);
+                }
+            }
+        }
+    });
+}
+
+fn rounded_rect_contains(px: i32, py: i32, width: i32, height: i32, rx: i32, ry: i32) -> bool {
+    let cx = if px < rx {
+        rx
+    } else if px >= width - rx {
+        width - rx - 1
+    } else {
+        return true;
+    };
+
+    let cy = if py < ry {
+        ry
+    } else if py >= height - ry {
+        height - ry - 1
+    } else {
+        return true;
+    };
+
+    let dx = (px - cx) as f32 / rx.max(1) as f32;
+    let dy = (py - cy) as f32 / ry.max(1) as f32;
+    dx * dx + dy * dy <= 1.0
+}
+
+fn angle_in_arc(angle: f32, start_angle: i32, arc_angle: i32) -> bool {
+    if arc_angle.abs() >= 360 {
+        return true;
+    }
+
+    let angle = normalize_degrees(angle);
+    let start = normalize_degrees(start_angle as f32);
+
+    if arc_angle > 0 {
+        let delta = normalize_degrees(angle - start);
+        delta <= arc_angle as f32
+    } else {
+        let delta = normalize_degrees(start - angle);
+        delta <= (-arc_angle) as f32
+    }
+}
+
+fn normalize_degrees(angle: f32) -> f32 {
+    angle.rem_euclid(360.0)
+}
+
+fn draw_text(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    text: &str,
+    x: i32,
+    y: i32,
+    anchor: i32,
+    color: [u8; 4],
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let (x, y) = text_anchor_to_top_left(x, y, text_width(text), DEFAULT_FONT_HEIGHT, anchor);
+    let clip = get_clip_rect(objectref, jvm);
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
+        let mut cursor_x = x;
+        for ch in text.chars() {
+            draw_glyph(frame, dw, dh, clip, cursor_x, y, ch, color);
+            cursor_x += FONT_ADVANCE;
+        }
+    });
+}
+
+fn text_anchor_to_top_left(x: i32, y: i32, width: i32, height: i32, anchor: i32) -> (i32, i32) {
+    let mut x = x;
+    let mut y = y;
+
+    if anchor & 1 != 0 {
+        x -= width / 2;
+    } else if anchor & 8 != 0 {
+        x -= width;
+    }
+
+    if anchor & 2 != 0 {
+        y -= height / 2;
+    } else if anchor & 32 != 0 {
+        y -= height;
+    } else if anchor & 64 != 0 {
+        y -= height - 3;
+    }
+
+    (x, y)
+}
+
+fn text_width(text: &str) -> i32 {
+    text.chars().count() as i32 * FONT_ADVANCE
+}
+
+fn font_char_width() -> i32 {
+    FONT_ADVANCE
+}
+
+fn draw_glyph(
+    frame: &mut [u8],
+    dw: i32,
+    dh: i32,
+    clip: ClipRect,
+    x: i32,
+    y: i32,
+    ch: char,
+    color: [u8; 4],
+) {
+    let rows = glyph_rows(ch);
+    for (row, bits) in rows.iter().enumerate() {
+        for col in 0..GLYPH_WIDTH {
+            let mask = 1 << (GLYPH_WIDTH - 1 - col);
+            if bits & mask == 0 {
+                continue;
+            }
+
+            for sy in 0..FONT_SCALE {
+                for sx in 0..FONT_SCALE {
+                    put_pixel(
+                        frame,
+                        dw,
+                        dh,
+                        clip,
+                        x + col * FONT_SCALE + sx,
+                        y + row as i32 * FONT_SCALE + sy,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn glyph_rows(ch: char) -> [u8; GLYPH_HEIGHT as usize] {
+    match ch.to_ascii_uppercase() {
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11110, 0b00000, 0b00000, 0b00000,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        ':' => [
+            0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000,
+        ],
+        '/' => [
+            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
+        ' ' => [0; GLYPH_HEIGHT as usize],
+        _ => [
+            0b11111, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
+    }
 }
