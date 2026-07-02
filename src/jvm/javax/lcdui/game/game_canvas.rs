@@ -25,6 +25,16 @@ pub static LEFT_PRESSED: i32 = 4;
 pub static RIGHT_PRESSED: i32 = 32;
 pub static UP_PRESSED: i32 = 2;
 
+const ACTION_UP: i32 = 1;
+const ACTION_LEFT: i32 = 2;
+const ACTION_RIGHT: i32 = 5;
+const ACTION_DOWN: i32 = 6;
+const ACTION_FIRE: i32 = 8;
+const ACTION_GAME_A: i32 = 9;
+const ACTION_GAME_B: i32 = 10;
+const ACTION_GAME_C: i32 = 11;
+const ACTION_GAME_D: i32 = 12;
+
 pub fn paint(jvm: &JVM) -> Result<(), String> {
     let displayable_ref;
     let class_name;
@@ -62,7 +72,10 @@ pub fn paint(jvm: &JVM) -> Result<(), String> {
     );
     let elapsed = start.elapsed();
     if elapsed > std::time::Duration::from_millis(100) {
-        println!("[WARNING] game_canvas::paint for {} took {:?}", class_name, elapsed);
+        println!(
+            "[WARNING] game_canvas::paint for {} took {:?}",
+            class_name, elapsed
+        );
     }
     res
 }
@@ -117,6 +130,26 @@ pub fn handle_virtual_method(
         }
         ("getWidth", "()I") => Ok(Some(JvmStackValue::Int(DEFAULT_WIDTH))),
         ("getHeight", "()I") => Ok(Some(JvmStackValue::Int(DEFAULT_HEIGHT))),
+        ("getGameAction", "(I)I") => {
+            let Some(JvmStackValue::Int(keycode)) = args.get(0) else {
+                return Err("Canvas.getGameAction: expected int keycode".into());
+            };
+
+            let action = match *keycode {
+                -1 | 50 => ACTION_UP,
+                -2 | 56 => ACTION_DOWN,
+                -3 | 52 => ACTION_LEFT,
+                -4 | 54 => ACTION_RIGHT,
+                -5 | 53 => ACTION_FIRE,
+                49 => ACTION_GAME_A,
+                51 => ACTION_GAME_B,
+                55 => ACTION_GAME_C,
+                57 => ACTION_GAME_D,
+                _ => 0,
+            };
+
+            Ok(Some(JvmStackValue::Int(action)))
+        }
         ("getKeyStates", "()I") => {
             let mut state = 0;
             let input_state = INPUT_STATE.lock();
@@ -149,6 +182,18 @@ pub fn handle_virtual_method(
             }
             return Ok(Some(JvmStackValue::Int(state)));
         }
+        ("hasPointerEvents", "()Z") => Ok(Some(JvmStackValue::Int(1))),
+        ("hasPointerMotionEvents", "()Z") => Ok(Some(JvmStackValue::Int(1))),
+        ("hasRepeatEvents", "()Z") => Ok(Some(JvmStackValue::Int(0))),
+        ("isDoubleBuffered", "()Z") => Ok(Some(JvmStackValue::Int(1))),
+        ("keyPressed", "(I)V") => Ok(None),
+        ("keyReleased", "(I)V") => Ok(None),
+        ("keyRepeated", "(I)V") => Ok(None),
+        ("pointerPressed", "(II)V") => Ok(None),
+        ("pointerDragged", "(II)V") => Ok(None),
+        ("pointerReleased", "(II)V") => Ok(None),
+        ("showNotify", "()V") => Ok(None),
+        ("hideNotify", "()V") => Ok(None),
         ("setFullScreenMode", "(Z)V") => Ok(None),
         ("flushGraphics", "()V") => Ok(None),
         ("flushGraphics", "(IIII)V") => Ok(None),

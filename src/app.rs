@@ -133,6 +133,14 @@ impl App {
         input.d_pressed = false;
     }
 
+    fn dispatch_key_event(&self, keycode: i32, is_pressed: bool) {
+        if let Some(jvm) = &self.jvm {
+            if let Err(err) = jvm.handle_key_event(keycode, is_pressed) {
+                eprintln!("[App] key event {} failed: {}", keycode, err);
+            }
+        }
+    }
+
     fn replace_jvm(&mut self, data: JarFileData, jar_path: Option<String>) -> Result<(), String> {
         if let Some(jvm) = &self.jvm {
             jvm.shutdown();
@@ -683,30 +691,81 @@ impl ApplicationHandler for App {
                 match keycode {
                     KeyCode::Space => {
                         INPUT_STATE.lock().space_pressed = is_pressed;
+                        self.dispatch_key_event(-5, is_pressed);
+                    }
+                    KeyCode::Enter | KeyCode::NumpadEnter => {
+                        self.dispatch_key_event(-5, is_pressed);
                     }
                     KeyCode::ArrowUp => {
                         INPUT_STATE.lock().up_pressed = is_pressed;
+                        self.dispatch_key_event(-1, is_pressed);
                     }
                     KeyCode::ArrowDown => {
                         INPUT_STATE.lock().down_pressed = is_pressed;
+                        self.dispatch_key_event(-2, is_pressed);
                     }
                     KeyCode::ArrowLeft => {
                         INPUT_STATE.lock().left_pressed = is_pressed;
+                        self.dispatch_key_event(-3, is_pressed);
                     }
                     KeyCode::ArrowRight => {
                         INPUT_STATE.lock().right_pressed = is_pressed;
+                        self.dispatch_key_event(-4, is_pressed);
                     }
                     KeyCode::KeyA => {
                         INPUT_STATE.lock().a_pressed = is_pressed;
+                        self.dispatch_key_event(49, is_pressed);
                     }
                     KeyCode::KeyS => {
                         INPUT_STATE.lock().b_pressed = is_pressed;
+                        self.dispatch_key_event(51, is_pressed);
                     }
                     KeyCode::KeyD => {
                         INPUT_STATE.lock().c_pressed = is_pressed;
+                        self.dispatch_key_event(55, is_pressed);
                     }
                     KeyCode::KeyF => {
                         INPUT_STATE.lock().d_pressed = is_pressed;
+                        self.dispatch_key_event(57, is_pressed);
+                    }
+                    KeyCode::Digit0 | KeyCode::Numpad0 => {
+                        self.dispatch_key_event(48, is_pressed);
+                    }
+                    KeyCode::Digit1 | KeyCode::Numpad1 => {
+                        self.dispatch_key_event(49, is_pressed);
+                    }
+                    KeyCode::Digit2 | KeyCode::Numpad2 => {
+                        self.dispatch_key_event(50, is_pressed);
+                    }
+                    KeyCode::Digit3 | KeyCode::Numpad3 => {
+                        self.dispatch_key_event(51, is_pressed);
+                    }
+                    KeyCode::Digit4 | KeyCode::Numpad4 => {
+                        self.dispatch_key_event(52, is_pressed);
+                    }
+                    KeyCode::Digit5 | KeyCode::Numpad5 => {
+                        self.dispatch_key_event(53, is_pressed);
+                    }
+                    KeyCode::Digit6 | KeyCode::Numpad6 => {
+                        self.dispatch_key_event(54, is_pressed);
+                    }
+                    KeyCode::Digit7 | KeyCode::Numpad7 => {
+                        self.dispatch_key_event(55, is_pressed);
+                    }
+                    KeyCode::Digit8 | KeyCode::Numpad8 => {
+                        self.dispatch_key_event(56, is_pressed);
+                    }
+                    KeyCode::Digit9 | KeyCode::Numpad9 => {
+                        self.dispatch_key_event(57, is_pressed);
+                    }
+                    KeyCode::KeyQ => {
+                        self.dispatch_key_event(-6, is_pressed);
+                    }
+                    KeyCode::KeyE => {
+                        self.dispatch_key_event(-7, is_pressed);
+                    }
+                    KeyCode::Escape | KeyCode::Backspace => {
+                        self.dispatch_key_event(-8, is_pressed);
                     }
                     KeyCode::KeyP => {
                         if is_pressed && !event.repeat {

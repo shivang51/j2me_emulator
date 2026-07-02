@@ -9,6 +9,42 @@ use crate::{
 
 pub const CLASS_NAME: &str = "javax/microedition/lcdui/Graphics";
 
+#[derive(Clone, Copy)]
+struct ClipRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl ClipRect {
+    fn right(self) -> i32 {
+        self.x.saturating_add(self.width)
+    }
+
+    fn bottom(self) -> i32 {
+        self.y.saturating_add(self.height)
+    }
+
+    fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x && y >= self.y && x < self.right() && y < self.bottom()
+    }
+
+    fn intersect(self, other: ClipRect) -> ClipRect {
+        let x1 = self.x.max(other.x);
+        let y1 = self.y.max(other.y);
+        let x2 = self.right().min(other.right());
+        let y2 = self.bottom().min(other.bottom());
+
+        ClipRect {
+            x: x1,
+            y: y1,
+            width: (x2 - x1).max(0),
+            height: (y2 - y1).max(0),
+        }
+    }
+}
+
 pub fn handle_virtual_method(
     objectref: &JvmStackValue,
     method_name: &str,
@@ -258,8 +294,24 @@ pub fn handle_virtual_method(
         }
         ("drawSubstring", "(Ljava/lang/String;IIIII)V") => todo!("Graphics.drawSubstring"),
         ("setFont", "(Ljavax/microedition/lcdui/Font;)V") => todo!("Graphics.setFont"),
-        ("setClip", "(IIII)V") => todo!("Graphics.setClip"),
-        ("clipRect", "(IIII)V") => todo!("Graphics.clipRect"),
+        ("setClip", "(IIII)V") => {
+            Profile::this("setClip(IIII)V");
+            let x = get_int_arg(args, 0)?;
+            let y = get_int_arg(args, 1)?;
+            let width = get_int_arg(args, 2)?;
+            let height = get_int_arg(args, 3)?;
+            set_clip_rect(objectref, jvm, x, y, width, height);
+            Ok(None)
+        }
+        ("clipRect", "(IIII)V") => {
+            Profile::this("clipRect(IIII)V");
+            let x = get_int_arg(args, 0)?;
+            let y = get_int_arg(args, 1)?;
+            let width = get_int_arg(args, 2)?;
+            let height = get_int_arg(args, 3)?;
+            intersect_clip_rect(objectref, jvm, x, y, width, height);
+            Ok(None)
+        }
         ("translate", "(II)V") => {
             let x = get_int_arg(args, 0)?;
             let y = get_int_arg(args, 1)?;
@@ -269,8 +321,12 @@ pub fn handle_virtual_method(
             set_int_field(objectref, jvm, "translateY", translate_y + y);
             Ok(None)
         }
-        ("getClipX", "()I") => Ok(Some(JvmStackValue::Int(0))),
-        ("getClipY", "()I") => Ok(Some(JvmStackValue::Int(0))),
+        ("getClipX", "()I") => Ok(Some(JvmStackValue::Int(
+            get_clip_rect(objectref, jvm).x - get_translate_x(objectref, jvm),
+        ))),
+        ("getClipY", "()I") => Ok(Some(JvmStackValue::Int(
+            get_clip_rect(objectref, jvm).y - get_translate_y(objectref, jvm),
+        ))),
         ("getTranslateX", "()I") => {
             Ok(Some(JvmStackValue::Int(get_translate_x(objectref, jvm))))
         }
@@ -278,12 +334,10 @@ pub fn handle_virtual_method(
             Ok(Some(JvmStackValue::Int(get_translate_y(objectref, jvm))))
         }
         ("getClipWidth", "()I") => {
-            let draw_state = DRAW_STATE.lock();
-            Ok(Some(JvmStackValue::Int(draw_state.width as i32)))
+            Ok(Some(JvmStackValue::Int(get_clip_rect(objectref, jvm).width)))
         }
         ("getClipHeight", "()I") => {
-            let draw_state = DRAW_STATE.lock();
-            Ok(Some(JvmStackValue::Int(draw_state.height as i32)))
+            Ok(Some(JvmStackValue::Int(get_clip_rect(objectref, jvm).height)))
         }
         _ => Err(format!(
             "Unsupported Graphics instance method: {}{}",
@@ -411,6 +465,93 @@ fn set_color_field(objectref: &JvmStackValue, jvm: &JVM, color: i32) {
     set_int_field(objectref, jvm, "color", color);
 }
 
+fn get_target_dimensions(objectref: &JvmStackValue, jvm: &JVM) -> (i32, i32) {
+    if let Some(image_id) = get_target_image_id(objectref, jvm) {
+        return get_image_dim(&JvmStackValue::ObjectRef(image_id as u32), jvm);
+    }
+
+    let draw_state = DRAW_STATE.lock();
+    (draw_state.width as i32, draw_state.height as i32)
+}
+
+fn full_target_clip(objectref: &JvmStackValue, jvm: &JVM) -> ClipRect {
+    let (width, height) = get_target_dimensions(objectref, jvm);
+    ClipRect {
+        x: 0,
+        y: 0,
+        width: width.max(0),
+        height: height.max(0),
+    }
+}
+
+fn make_clip_rect(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> ClipRect {
+    let translate_x = get_translate_x(objectref, jvm);
+    let translate_y = get_translate_y(objectref, jvm);
+    let requested = ClipRect {
+        x: x.saturating_add(translate_x),
+        y: y.saturating_add(translate_y),
+        width: width.max(0),
+        height: height.max(0),
+    };
+
+    requested.intersect(full_target_clip(objectref, jvm))
+}
+
+fn store_clip_rect(objectref: &JvmStackValue, jvm: &JVM, clip: ClipRect) {
+    set_int_field(objectref, jvm, "clipX", clip.x);
+    set_int_field(objectref, jvm, "clipY", clip.y);
+    set_int_field(objectref, jvm, "clipWidth", clip.width);
+    set_int_field(objectref, jvm, "clipHeight", clip.height);
+}
+
+fn set_clip_rect(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    let clip = make_clip_rect(objectref, jvm, x, y, width, height);
+    store_clip_rect(objectref, jvm, clip);
+}
+
+fn intersect_clip_rect(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    let requested = make_clip_rect(objectref, jvm, x, y, width, height);
+    let current = get_clip_rect(objectref, jvm);
+    store_clip_rect(objectref, jvm, current.intersect(requested));
+}
+
+fn get_clip_rect(objectref: &JvmStackValue, jvm: &JVM) -> ClipRect {
+    let default_clip = full_target_clip(objectref, jvm);
+    let x = get_int_field(objectref, jvm, "clipX", default_clip.x);
+    let y = get_int_field(objectref, jvm, "clipY", default_clip.y);
+    let width = get_int_field(objectref, jvm, "clipWidth", default_clip.width);
+    let height = get_int_field(objectref, jvm, "clipHeight", default_clip.height);
+
+    ClipRect {
+        x,
+        y,
+        width: width.max(0),
+        height: height.max(0),
+    }
+    .intersect(default_clip)
+}
+
 fn get_translate_x(objectref: &JvmStackValue, jvm: &JVM) -> i32 {
     get_int_field(objectref, jvm, "translateX", 0)
 }
@@ -497,12 +638,13 @@ fn draw_rgb(
     height: i32,
     process_alpha: bool,
 ) {
+    let clip = get_clip_rect(objectref, jvm);
     let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         let mut row_start = offset as i64;
 
         for row in 0..height {
             let dest_y = y + row;
-            if dest_y < 0 || dest_y >= dh {
+            if dest_y < 0 || dest_y >= dh || dest_y < clip.y || dest_y >= clip.bottom() {
                 row_start += scanline as i64;
                 continue;
             }
@@ -510,7 +652,7 @@ fn draw_rgb(
             let mut src_index = row_start;
             for col in 0..width {
                 let dest_x = x + col;
-                if dest_x < 0 || dest_x >= dw {
+                if dest_x < 0 || dest_x >= dw || !clip.contains(dest_x, dest_y) {
                     src_index += 1;
                     continue;
                 }
@@ -560,6 +702,25 @@ fn draw_rgb(
     });
 }
 
+fn put_pixel(
+    frame: &mut [u8],
+    dw: i32,
+    dh: i32,
+    clip: ClipRect,
+    x: i32,
+    y: i32,
+    color: [u8; 4],
+) {
+    if x < 0 || x >= dw || y < 0 || y >= dh || !clip.contains(x, y) {
+        return;
+    }
+
+    let offset = ((y * dw + x) * 4) as usize;
+    if offset + 4 <= frame.len() {
+        frame[offset..offset + 4].copy_from_slice(&color);
+    }
+}
+
 fn fill_rect(
     objectref: &JvmStackValue,
     jvm: &JVM,
@@ -569,19 +730,22 @@ fn fill_rect(
     height: i32,
     color: [u8; 4],
 ) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let clip = get_clip_rect(objectref, jvm);
     let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
-        for iy in y..(y + height) {
-            if iy < 0 || iy >= dh {
-                continue;
-            }
-            for ix in x..(x + width) {
-                if ix < 0 || ix >= dw {
-                    continue;
-                }
-                let offset = ((iy * dw + ix) * 4) as usize;
-                if offset + 4 <= frame.len() {
-                    frame[offset..offset + 4].copy_from_slice(&color);
-                }
+        let x_end = x.saturating_add(width);
+        let y_end = y.saturating_add(height);
+        let start_y = y.max(0).max(clip.y);
+        let end_y = y_end.min(dh).min(clip.bottom());
+        let start_x = x.max(0).max(clip.x);
+        let end_x = x_end.min(dw).min(clip.right());
+
+        for iy in start_y..end_y {
+            for ix in start_x..end_x {
+                put_pixel(frame, dw, dh, clip, ix, iy, color);
             }
         }
     });
@@ -631,6 +795,7 @@ fn draw_line(
     color: [u8; 4],
     dotted: bool,
 ) {
+    let clip = get_clip_rect(objectref, jvm);
     let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         let dx = (x2 - x1).abs();
         let dy = (y2 - y1).abs();
@@ -644,12 +809,7 @@ fn draw_line(
 
         loop {
             if !dotted || step % 4 < 2 {
-                if x >= 0 && x < dw && y >= 0 && y < dh {
-                    let offset = ((y * dw + x) * 4) as usize;
-                    if offset + 4 <= frame.len() {
-                        frame[offset..offset + 4].copy_from_slice(&color);
-                    }
-                }
+                put_pixel(frame, dw, dh, clip, x, y, color);
             }
             step += 1;
 
@@ -717,18 +877,20 @@ fn draw_region(
         real_y -= dest_h;
     }
 
+    let clip = get_clip_rect(objectref, jvm);
     let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         let src_stride = (img_w * 4) as usize;
 
         for dy in 0..dest_h {
             let dest_px_y = real_y + dy;
-            if dest_px_y < 0 || dest_px_y >= dh {
+            if dest_px_y < 0 || dest_px_y >= dh || dest_px_y < clip.y || dest_px_y >= clip.bottom()
+            {
                 continue;
             }
 
             for dx in 0..dest_w {
                 let dest_px_x = real_x + dx;
-                if dest_px_x < 0 || dest_px_x >= dw {
+                if dest_px_x < 0 || dest_px_x >= dw || !clip.contains(dest_px_x, dest_px_y) {
                     continue;
                 }
 
@@ -818,15 +980,16 @@ fn fill_triangle(
         return;
     } // Flat line
 
+    let clip = get_clip_rect(objectref, jvm);
     let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         if y2 == y3 {
-            fill_bottom_flat_triangle(x1, y1, x2, y2, x3, y3, dw, dh, frame, color);
+            fill_bottom_flat_triangle(x1, y1, x2, y2, x3, y3, dw, dh, clip, frame, color);
         } else if y1 == y2 {
-            fill_top_flat_triangle(x1, y1, x2, y2, x3, y3, dw, dh, frame, color);
+            fill_top_flat_triangle(x1, y1, x2, y2, x3, y3, dw, dh, clip, frame, color);
         } else {
             let x4 = x1 + ((y2 - y1) as f32 * (x3 - x1) as f32 / (y3 - y1) as f32) as i32;
-            fill_bottom_flat_triangle(x1, y1, x2, y2, x4, y2, dw, dh, frame, color);
-            fill_top_flat_triangle(x2, y2, x4, y2, x3, y3, dw, dh, frame, color);
+            fill_bottom_flat_triangle(x1, y1, x2, y2, x4, y2, dw, dh, clip, frame, color);
+            fill_top_flat_triangle(x2, y2, x4, y2, x3, y3, dw, dh, clip, frame, color);
         }
     });
 }
@@ -840,6 +1003,7 @@ fn fill_bottom_flat_triangle(
     y3: i32,
     dw: i32,
     dh: i32,
+    clip: ClipRect,
     frame: &mut [u8],
     color: [u8; 4],
 ) {
@@ -854,7 +1018,16 @@ fn fill_bottom_flat_triangle(
     let mut curx2 = x1 as f32;
 
     for scanline_y in y1..y2 {
-        draw_horizontal_line(curx1 as i32, curx2 as i32, scanline_y, dw, dh, frame, color);
+        draw_horizontal_line(
+            curx1 as i32,
+            curx2 as i32,
+            scanline_y,
+            dw,
+            dh,
+            clip,
+            frame,
+            color,
+        );
         curx1 += invslope1;
         curx2 += invslope2;
     }
@@ -869,6 +1042,7 @@ fn fill_top_flat_triangle(
     y3: i32,
     dw: i32,
     dh: i32,
+    clip: ClipRect,
     frame: &mut [u8],
     color: [u8; 4],
 ) {
@@ -883,7 +1057,16 @@ fn fill_top_flat_triangle(
     let mut curx2 = x2 as f32;
 
     for scanline_y in y1..=y3 {
-        draw_horizontal_line(curx1 as i32, curx2 as i32, scanline_y, dw, dh, frame, color);
+        draw_horizontal_line(
+            curx1 as i32,
+            curx2 as i32,
+            scanline_y,
+            dw,
+            dh,
+            clip,
+            frame,
+            color,
+        );
         curx1 += invslope1;
         curx2 += invslope2;
     }
@@ -895,10 +1078,11 @@ fn draw_horizontal_line(
     y: i32,
     dw: i32,
     dh: i32,
+    clip: ClipRect,
     frame: &mut [u8],
     color: [u8; 4],
 ) {
-    if y < 0 || y >= dh {
+    if y < 0 || y >= dh || y < clip.y || y >= clip.bottom() {
         return;
     }
     if x1 > x2 {
@@ -906,14 +1090,8 @@ fn draw_horizontal_line(
     }
 
     // Add 1 to x2 to make it inclusive if needed, but J2ME fill usually includes the last pixel
-    for x in x1..=x2 {
-        if x < 0 || x >= dw {
-            continue;
-        }
-        let offset = ((y * dw + x) * 4) as usize;
-        if offset + 4 <= frame.len() {
-            frame[offset..offset + 4].copy_from_slice(&color);
-        }
+    for x in x1.max(0).max(clip.x)..=x2.min(dw - 1).min(clip.right() - 1) {
+        put_pixel(frame, dw, dh, clip, x, y, color);
     }
 }
 
@@ -928,6 +1106,7 @@ fn draw_arc(
     arc_angle: i32,
     color: [u8; 4],
 ) {
+    let clip = get_clip_rect(objectref, jvm);
     let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
         let cx = x + width / 2;
         let cy = y + height / 2;
@@ -945,12 +1124,7 @@ fn draw_arc(
             let px = cx + (rx as f32 * angle.cos()) as i32;
             let py = cy + (ry as f32 * angle.sin()) as i32;
 
-            if px >= 0 && px < dw && py >= 0 && py < dh {
-                let offset = ((py * dw + px) * 4) as usize;
-                if offset + 4 <= frame.len() {
-                    frame[offset..offset + 4].copy_from_slice(&color);
-                }
-            }
+            put_pixel(frame, dw, dh, clip, px, py, color);
         }
     });
 }

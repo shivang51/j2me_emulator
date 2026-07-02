@@ -67,7 +67,8 @@ pub struct JvmState {
     pub resources: HashMap<String, Vec<u8>>,
     pub initialized_classes: HashSet<String>,
     pub field_resolution_cache: HashMap<String, String>,
-    pub method_resolution_cache: HashMap<String, (String, Arc<classfile_parser::ClassFile>, Arc<Code>)>,
+    pub method_resolution_cache:
+        HashMap<String, (String, Arc<classfile_parser::ClassFile>, Arc<Code>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +151,47 @@ impl JVM {
 
     pub fn reference_values_equal(val1: &JvmStackValue, val2: &JvmStackValue) -> bool {
         val1 == val2
+    }
+
+    fn integer_value_from_object(obj: &JvmObject) -> Option<i32> {
+        if obj.class_name != "java/lang/Integer" {
+            return None;
+        }
+
+        match obj.fields.get("value") {
+            Some(JvmStackValue::Int(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn integer_value_from_ref(state: &JvmState, value: &JvmStackValue) -> Option<i32> {
+        let JvmStackValue::ObjectRef(id) = value else {
+            return None;
+        };
+
+        match state.heap.get(*id as usize) {
+            Some(HeapObject::Instance(obj)) => JVM::integer_value_from_object(obj),
+            _ => None,
+        }
+    }
+
+    fn java_values_equal_in_state(
+        state: &JvmState,
+        left: &JvmStackValue,
+        right: &JvmStackValue,
+    ) -> bool {
+        if left == right {
+            return true;
+        }
+
+        if let (Some(left), Some(right)) = (
+            JVM::integer_value_from_ref(state, left),
+            JVM::integer_value_from_ref(state, right),
+        ) {
+            return left == right;
+        }
+
+        false
     }
 
     fn method_label(class_name: &str, method_name: &str, descriptor: &str) -> String {
@@ -509,7 +551,9 @@ impl JVM {
 
         pause_state.paused = true;
         pause_state.pause_started = Some(Instant::now());
-        self.pause_control.paused_fast.store(true, Ordering::Release);
+        self.pause_control
+            .paused_fast
+            .store(true, Ordering::Release);
         drop(pause_state);
         player::pause_all();
     }
@@ -524,7 +568,9 @@ impl JVM {
             pause_state.total_paused += started.elapsed();
         }
         pause_state.paused = false;
-        self.pause_control.paused_fast.store(false, Ordering::Release);
+        self.pause_control
+            .paused_fast
+            .store(false, Ordering::Release);
         drop(pause_state);
 
         player::resume_all();
@@ -550,9 +596,13 @@ impl JVM {
         }
 
         pause_state.stopped = true;
-        self.pause_control.stopped_fast.store(true, Ordering::Release);
+        self.pause_control
+            .stopped_fast
+            .store(true, Ordering::Release);
         pause_state.paused = false;
-        self.pause_control.paused_fast.store(false, Ordering::Release);
+        self.pause_control
+            .paused_fast
+            .store(false, Ordering::Release);
         if let Some(started) = pause_state.pause_started.take() {
             pause_state.total_paused += started.elapsed();
         }
@@ -677,23 +727,15 @@ impl JVM {
             let desc = JVM::resolve_utf8(field.descriptor_index, pool);
             let key = format!("{}.{}:{}", class_name, name, desc);
 
-            let default_val = if desc.starts_with('L') || desc.starts_with('[') {
-                JvmStackValue::Null
-            } else if desc == "F" {
-                JvmStackValue::Float(0.0)
-            } else if desc == "D" {
-                JvmStackValue::Double(0.0)
-            } else if desc == "J" {
-                JvmStackValue::Long(0)
-            } else {
-                JvmStackValue::Int(0)
-            };
+            let default_val = JVM::default_value_for_descriptor(&desc);
 
             static_entries.push((key, default_val));
         }
 
         let mut state = self.state.lock();
-        state.classes.insert(class_name.clone(), Arc::new(class.clone()));
+        state
+            .classes
+            .insert(class_name.clone(), Arc::new(class.clone()));
         for (k, v) in static_entries {
             state.static_fields.insert(k, v);
         }
@@ -858,11 +900,13 @@ impl JVM {
 
             op_count += 1;
             // Only check for pause and yield periodically to save CPU cycles in the hot loop
-            if op_count & 0x3FF == 0 { // Every 1024 instructions
+            if op_count & 0x3FF == 0 {
+                // Every 1024 instructions
                 if !jvm.wait_if_paused() {
                     return Ok(None);
                 }
-                if op_count & 0xFFFF == 0 { // Every ~65000 instructions
+                if op_count & 0xFFFF == 0 {
+                    // Every ~65000 instructions
                     std::thread::yield_now();
                 }
             }
@@ -1308,6 +1352,34 @@ impl JVM {
                     stack.push(value1.clone());
                     stack.push(value2);
                     stack.push(value1);
+
+                    pc += 1;
+                }
+                0x5b => {
+                    // dup_x2
+                    let value1 = stack.pop().ok_or("dup_x2: stack underflow (value1)")?;
+                    if JVM::is_category_2_value(&value1) {
+                        return Err("dup_x2: value1 must be category 1".into());
+                    }
+
+                    let value2 = stack.pop().ok_or("dup_x2: stack underflow (value2)")?;
+                    if JVM::is_category_2_value(&value2) {
+                        stack.push(value1.clone());
+                        stack.push(value2);
+                        stack.push(value1);
+                    } else {
+                        let value3 = stack.pop().ok_or("dup_x2: stack underflow (value3)")?;
+                        if JVM::is_category_2_value(&value3) {
+                            return Err(
+                                "dup_x2: invalid category 2 value at insertion point".into()
+                            );
+                        }
+
+                        stack.push(value1.clone());
+                        stack.push(value3);
+                        stack.push(value2);
+                        stack.push(value1);
+                    }
 
                     pc += 1;
                 }
@@ -1831,6 +1903,24 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x82 => {
+                    // ixor
+                    let val2 = stack.pop().ok_or("ixor: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("ixor: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Int(v1), JvmStackValue::Int(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Int(v1 ^ v2));
+                    } else {
+                        return Err(format!(
+                            "ixor: expected two Ints, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x84 => {
                     // iinc
                     let index = bytecode[pc + 1] as usize;
@@ -2103,41 +2193,15 @@ impl JVM {
                     // ldc
 
                     let cp_index = bytecode[pc + 1] as usize;
-                    let entry = cp
-                        .get(
-                            cp_index
-                                .checked_sub(1)
-                                .ok_or_else(|| "Invalid CP index 0 for LDC".to_string())?,
-                        )
-                        .ok_or_else(|| format!("Invalid CP index for LDC: {}", cp_index))?;
-
-                    stack.push(match entry {
-                        ConstantInfo::Integer(int_info) => JvmStackValue::Int(int_info.value),
-                        ConstantInfo::Float(float_info) => JvmStackValue::Float(float_info.value),
-                        ConstantInfo::String(str_info) => {
-                            if let ConstantInfo::Utf8(utf8_info) =
-                                &cp[str_info.string_index as usize - 1]
-                            {
-                                JvmStackValue::String(utf8_info.utf8_string.clone())
-                            } else {
-                                return Err(format!(
-                                    "Expected Utf8 for String constant at CP index {}, found {:?}",
-                                    str_info.string_index,
-                                    cp[str_info.string_index as usize - 1]
-                                ));
-                            }
-                        }
-                        ConstantInfo::Utf8(utf8_info) => {
-                            JvmStackValue::String(utf8_info.utf8_string.clone())
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Unsupported constant type for LDC at CP index {}: {:?}",
-                                cp_index, entry
-                            ));
-                        }
-                    });
+                    stack.push(JVM::constant_pool_load_value(cp, cp_index, jvm, "ldc")?);
                     pc += 2;
+                }
+                0x13 => {
+                    // ldc_w
+                    let cp_index =
+                        u16::from_be_bytes([bytecode[pc + 1], bytecode[pc + 2]]) as usize;
+                    stack.push(JVM::constant_pool_load_value(cp, cp_index, jvm, "ldc_w")?);
+                    pc += 3;
                 }
                 0xB4 => {
                     // getfield
@@ -2166,7 +2230,7 @@ impl JVM {
                             &field_key,
                             &legacy_field_name,
                         );
-                        
+
                         let obj = state
                             .heap
                             .get(heap_idx)
@@ -2217,7 +2281,11 @@ impl JVM {
 
                     {
                         let mut state = jvm.state.lock();
-                        let resolved_field_key = JVM::resolve_instance_field_key(&mut state, &field_key, &legacy_field_name);
+                        let resolved_field_key = JVM::resolve_instance_field_key(
+                            &mut state,
+                            &field_key,
+                            &legacy_field_name,
+                        );
 
                         let obj = state
                             .heap
@@ -2354,18 +2422,19 @@ impl JVM {
                         if let Some(val) = return_value {
                             stack.push(val);
                         }
-                    } else if class_name == "java/lang/StringBuffer" {
+                    } else if class_name == "java/lang/StringBuffer"
+                        || class_name == "java/lang/StringBuilder"
+                    {
                         if let JvmStackValue::ObjectRef(id) = &objectref {
-                            args.insert(0, objectref.clone());
                             let res = {
                                 let mut state = jvm.state.lock();
-                                let heap_obj = state.heap.get_mut(*id as usize).ok_or_else(|| {
-                                    format!(
-                                        "invokevirtual on java/lang/StringBuffer with id {}, but no object found in heap",
-                                        id
-                                    )
-                                })?;
-                                JVM::handle_str_buffer_fns(heap_obj, &method_name, &args)
+                                JVM::handle_str_buffer_fns(
+                                    &mut state,
+                                    *id as usize,
+                                    &method_name,
+                                    &descriptor,
+                                    &args,
+                                )
                             };
 
                             let return_value = match res {
@@ -2374,7 +2443,7 @@ impl JVM {
                                     let error = JVM::append_invoke_context(
                                         format!("Error handling StringBuffer method: {}", e),
                                         "invokevirtual",
-                                        "java/lang/StringBuffer",
+                                        &class_name,
                                         &method_name,
                                         &descriptor,
                                         pc,
@@ -3114,6 +3183,25 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x7B => {
+                    // lshr
+                    let val2 = stack.pop().ok_or("lshr: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("lshr: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Long(v1), JvmStackValue::Int(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        let s = (v2 & 0x3f) as u32;
+                        stack.push(JvmStackValue::Long(v1 >> s));
+                    } else {
+                        return Err(format!(
+                            "lshr: expected Long and Int, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x7C => {
                     // iushr
                     let val2 = stack.pop().ok_or("iushr: stack underflow (val2)")?;
@@ -3413,6 +3501,47 @@ impl JVM {
         res
     }
 
+    fn constant_pool_load_value(
+        cp: &[ConstantInfo],
+        cp_index: usize,
+        jvm: &JVM,
+        instruction: &str,
+    ) -> Result<JvmStackValue, String> {
+        let entry = cp
+            .get(
+                cp_index
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("Invalid CP index 0 for {}", instruction))?,
+            )
+            .ok_or_else(|| format!("Invalid CP index for {}: {}", instruction, cp_index))?;
+
+        match entry {
+            ConstantInfo::Integer(int_info) => Ok(JvmStackValue::Int(int_info.value)),
+            ConstantInfo::Float(float_info) => Ok(JvmStackValue::Float(float_info.value)),
+            ConstantInfo::String(str_info) => {
+                let value = match cp.get(str_info.string_index as usize - 1) {
+                    Some(ConstantInfo::Utf8(utf8_info)) => utf8_info.utf8_string.clone(),
+                    value => {
+                        return Err(format!(
+                            "{}: expected Utf8 for String constant at CP index {}, found {:?}",
+                            instruction, str_info.string_index, value
+                        ));
+                    }
+                };
+                Ok(JvmStackValue::String(value))
+            }
+            ConstantInfo::Utf8(utf8_info) => Ok(JvmStackValue::String(utf8_info.utf8_string.clone())),
+            ConstantInfo::Class(class_info) => {
+                let class_name = JVM::resolve_utf8(class_info.name_index, cp);
+                Ok(JVM::allocate_class_object(jvm, class_name))
+            }
+            _ => Err(format!(
+                "Unsupported constant type for {} at CP index {}: {:?}",
+                instruction, cp_index, entry
+            )),
+        }
+    }
+
     fn count_arguments(descriptor: &str) -> usize {
         let mut count = 0;
         let mut chars = descriptor.chars().peekable();
@@ -3576,19 +3705,74 @@ impl JVM {
         }
     }
 
-    fn handle_hashtable_fns(
-        object_ref: &mut HeapObject,
-        method: &str,
-        args: &[JvmStackValue],
-    ) -> Result<Option<JvmStackValue>, String> {
-        let heap_obj = if let HeapObject::Instance(obj) = object_ref {
+    fn hashtable_entries(
+        state: &JvmState,
+        this_id: usize,
+    ) -> Result<(Vec<JvmStackValue>, Vec<JvmStackValue>), String> {
+        let heap_obj = state
+            .heap
+            .get(this_id)
+            .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+        let heap_obj = if let HeapObject::Instance(obj) = heap_obj {
             obj
         } else {
             return Err("Expected instance for Hashtable object".into());
         };
 
+        let keys = match heap_obj.fields.get("keys") {
+            Some(JvmStackValue::Vector(v)) => v.clone(),
+            _ => return Err("Hashtable instance missing 'keys' field".into()),
+        };
+        let values = match heap_obj.fields.get("values") {
+            Some(JvmStackValue::Vector(v)) => v.clone(),
+            _ => return Err("Hashtable instance missing 'values' field".into()),
+        };
+
+        Ok((keys, values))
+    }
+
+    fn set_hashtable_entries(
+        state: &mut JvmState,
+        this_id: usize,
+        keys: Vec<JvmStackValue>,
+        values: Vec<JvmStackValue>,
+    ) -> Result<(), String> {
+        let heap_obj = state
+            .heap
+            .get_mut(this_id)
+            .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
+        let heap_obj = if let HeapObject::Instance(obj) = heap_obj {
+            obj
+        } else {
+            return Err("Expected instance for Hashtable object".into());
+        };
+
+        heap_obj
+            .fields
+            .insert("keys".to_string(), JvmStackValue::Vector(keys));
+        heap_obj
+            .fields
+            .insert("values".to_string(), JvmStackValue::Vector(values));
+
+        Ok(())
+    }
+
+    fn handle_hashtable_fns(
+        state: &mut JvmState,
+        this_id: usize,
+        method: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<JvmStackValue>, String> {
+        if !matches!(state.heap.get(this_id), Some(HeapObject::Instance(_))) {
+            return Err("Expected instance for Hashtable object".into());
+        }
+
         match method {
             "<init>" => {
+                let heap_obj = match state.heap.get_mut(this_id) {
+                    Some(HeapObject::Instance(obj)) => obj,
+                    _ => return Err("Expected instance for Hashtable object".into()),
+                };
                 heap_obj
                     .fields
                     .insert("keys".to_string(), JvmStackValue::Vector(Vec::new()));
@@ -3598,20 +3782,16 @@ impl JVM {
                 Ok(None)
             }
             "put" => {
-                let key = args[0].clone();
-                let value = args[1].clone();
+                let key = args.get(0).ok_or("Hashtable.put: missing key")?.clone();
+                let value = args.get(1).ok_or("Hashtable.put: missing value")?.clone();
                 let mut old_value = JvmStackValue::Null;
 
-                let mut keys = match heap_obj.fields.get("keys").unwrap() {
-                    JvmStackValue::Vector(v) => v.clone(),
-                    _ => unreachable!(),
-                };
-                let mut values = match heap_obj.fields.get("values").unwrap() {
-                    JvmStackValue::Vector(v) => v.clone(),
-                    _ => unreachable!(),
-                };
+                let (mut keys, mut values) = JVM::hashtable_entries(state, this_id)?;
 
-                if let Some(pos) = keys.iter().position(|k| k == &key) {
+                if let Some(pos) = keys
+                    .iter()
+                    .position(|k| JVM::java_values_equal_in_state(state, k, &key))
+                {
                     old_value = values[pos].clone();
                     values[pos] = value;
                 } else {
@@ -3619,51 +3799,35 @@ impl JVM {
                     values.push(value);
                 }
 
-                heap_obj
-                    .fields
-                    .insert("keys".to_string(), JvmStackValue::Vector(keys));
-                heap_obj
-                    .fields
-                    .insert("values".to_string(), JvmStackValue::Vector(values));
+                JVM::set_hashtable_entries(state, this_id, keys, values)?;
 
                 Ok(Some(old_value))
             }
             "get" => {
-                let key = args[0].clone();
-                let keys = match heap_obj.fields.get("keys").unwrap() {
-                    JvmStackValue::Vector(v) => v,
-                    _ => unreachable!(),
-                };
-                let values = match heap_obj.fields.get("values").unwrap() {
-                    JvmStackValue::Vector(v) => v,
-                    _ => unreachable!(),
-                };
+                let key = args.get(0).ok_or("Hashtable.get: missing key")?.clone();
+                let (keys, values) = JVM::hashtable_entries(state, this_id)?;
 
-                if let Some(pos) = keys.iter().position(|k| k == &key) {
+                if let Some(pos) = keys
+                    .iter()
+                    .position(|k| JVM::java_values_equal_in_state(state, k, &key))
+                {
                     Ok(Some(values[pos].clone()))
                 } else {
                     Ok(Some(JvmStackValue::Null))
                 }
             }
             "size" => {
-                let keys = match heap_obj.fields.get("keys").unwrap() {
-                    JvmStackValue::Vector(v) => v,
-                    _ => unreachable!(),
-                };
+                let (keys, _) = JVM::hashtable_entries(state, this_id)?;
                 Ok(Some(JvmStackValue::Int(keys.len() as i32)))
             }
             "remove" => {
-                let key = args[0].clone();
-                let mut keys = match heap_obj.fields.get("keys").unwrap() {
-                    JvmStackValue::Vector(v) => v.clone(),
-                    _ => unreachable!(),
-                };
-                let mut values = match heap_obj.fields.get("values").unwrap() {
-                    JvmStackValue::Vector(v) => v.clone(),
-                    _ => unreachable!(),
-                };
+                let key = args.get(0).ok_or("Hashtable.remove: missing key")?.clone();
+                let (mut keys, mut values) = JVM::hashtable_entries(state, this_id)?;
 
-                let old_value = if let Some(pos) = keys.iter().position(|k| k == &key) {
+                let old_value = if let Some(pos) = keys
+                    .iter()
+                    .position(|k| JVM::java_values_equal_in_state(state, k, &key))
+                {
                     keys.remove(pos);
                     let val = values.remove(pos);
                     val
@@ -3671,29 +3835,16 @@ impl JVM {
                     JvmStackValue::Null
                 };
 
-                heap_obj
-                    .fields
-                    .insert("keys".to_string(), JvmStackValue::Vector(keys));
-                heap_obj
-                    .fields
-                    .insert("values".to_string(), JvmStackValue::Vector(values));
+                JVM::set_hashtable_entries(state, this_id, keys, values)?;
 
                 Ok(Some(old_value))
             }
             "clear" => {
-                heap_obj
-                    .fields
-                    .insert("keys".to_string(), JvmStackValue::Vector(Vec::new()));
-                heap_obj
-                    .fields
-                    .insert("values".to_string(), JvmStackValue::Vector(Vec::new()));
+                JVM::set_hashtable_entries(state, this_id, Vec::new(), Vec::new())?;
                 Ok(None)
             }
             "isEmpty" => {
-                let keys = match heap_obj.fields.get("keys").unwrap() {
-                    JvmStackValue::Vector(v) => v,
-                    _ => unreachable!(),
-                };
+                let (keys, _) = JVM::hashtable_entries(state, this_id)?;
                 Ok(Some(JvmStackValue::Int(if keys.is_empty() {
                     1
                 } else {
@@ -3701,21 +3852,25 @@ impl JVM {
                 })))
             }
             "contains" | "containsValue" => {
-                let value = args[0].clone();
-                let values = match heap_obj.fields.get("values").unwrap() {
-                    JvmStackValue::Vector(v) => v,
-                    _ => unreachable!(),
-                };
-                let res = values.contains(&value);
+                let value = args
+                    .get(0)
+                    .ok_or("Hashtable.contains: missing value")?
+                    .clone();
+                let (_, values) = JVM::hashtable_entries(state, this_id)?;
+                let res = values
+                    .iter()
+                    .any(|v| JVM::java_values_equal_in_state(state, v, &value));
                 Ok(Some(JvmStackValue::Int(if res { 1 } else { 0 })))
             }
             "containsKey" => {
-                let key = args[0].clone();
-                let keys = match heap_obj.fields.get("keys").unwrap() {
-                    JvmStackValue::Vector(v) => v,
-                    _ => unreachable!(),
-                };
-                let res = keys.contains(&key);
+                let key = args
+                    .get(0)
+                    .ok_or("Hashtable.containsKey: missing key")?
+                    .clone();
+                let (keys, _) = JVM::hashtable_entries(state, this_id)?;
+                let res = keys
+                    .iter()
+                    .any(|k| JVM::java_values_equal_in_state(state, k, &key));
                 Ok(Some(JvmStackValue::Int(if res { 1 } else { 0 })))
             }
             _ => {
@@ -3872,6 +4027,27 @@ impl JVM {
             "intValue" => {
                 let val = heap_obj.fields.get("value").unwrap().clone();
                 Ok(Some(val))
+            }
+            "byteValue" => {
+                let val = match heap_obj.fields.get("value").unwrap() {
+                    JvmStackValue::Int(v) => *v,
+                    _ => unreachable!(),
+                };
+                Ok(Some(JvmStackValue::Int((val as i8) as i32)))
+            }
+            "shortValue" => {
+                let val = match heap_obj.fields.get("value").unwrap() {
+                    JvmStackValue::Int(v) => *v,
+                    _ => unreachable!(),
+                };
+                Ok(Some(JvmStackValue::Int((val as i16) as i32)))
+            }
+            "hashCode" => {
+                let val = match heap_obj.fields.get("value").unwrap() {
+                    JvmStackValue::Int(v) => *v,
+                    _ => unreachable!(),
+                };
+                Ok(Some(JvmStackValue::Int(val)))
             }
             "toString" => {
                 let val = match heap_obj.fields.get("value").unwrap() {
@@ -4107,6 +4283,16 @@ impl JVM {
         value.chars().fold(0i32, |hash, ch| {
             hash.wrapping_mul(31).wrapping_add(ch as i32)
         })
+    }
+
+    fn default_value_for_descriptor(descriptor: &str) -> JvmStackValue {
+        match descriptor.chars().next() {
+            Some('L') | Some('[') => JvmStackValue::Null,
+            Some('F') => JvmStackValue::Float(0.0),
+            Some('D') => JvmStackValue::Double(0.0),
+            Some('J') => JvmStackValue::Long(0),
+            _ => JvmStackValue::Int(0),
+        }
     }
 
     fn allocate_class_object(jvm: &JVM, class_name: String) -> JvmStackValue {
@@ -4353,7 +4539,10 @@ impl JVM {
 
         let elapsed = start_time.elapsed();
         if elapsed > std::time::Duration::from_millis(50) {
-            println!("[PROFILE] {}.{} took {:?}", class_name, method_name, elapsed);
+            println!(
+                "[PROFILE] {}.{} took {:?}",
+                class_name, method_name, elapsed
+            );
         }
 
         res
@@ -4647,11 +4836,7 @@ impl JVM {
 
             let res = {
                 let mut state = jvm.state.lock();
-                let object_ref = state
-                    .heap
-                    .get_mut(this_id as usize)
-                    .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
-                JVM::handle_hashtable_fns(object_ref, method_name, args)
+                JVM::handle_hashtable_fns(&mut state, this_id as usize, method_name, args)
             };
 
             if let Err(e) = res {
@@ -4714,22 +4899,22 @@ impl JVM {
             }
 
             return Ok(());
-        } else if class_name == "java/lang/StringBuffer" {
+        } else if class_name == "java/lang/StringBuffer" || class_name == "java/lang/StringBuilder"
+        {
             let this_id = match objectref {
                 JvmStackValue::ObjectRef(id) => id,
                 _ => return Err("StringBuffer: NullPointerException".into()),
             };
 
-            let mut call_args: Vec<JvmStackValue> = args.into();
-            call_args.insert(0, objectref.clone());
-
             let res = {
                 let mut state = jvm.state.lock();
-                let object_ref = state
-                    .heap
-                    .get_mut(this_id as usize)
-                    .ok_or_else(|| format!("Invalid heap reference: {}", this_id))?;
-                JVM::handle_str_buffer_fns(object_ref, method_name, &call_args)
+                JVM::handle_str_buffer_fns(
+                    &mut state,
+                    this_id as usize,
+                    method_name,
+                    descriptor,
+                    args,
+                )
             };
 
             if let Err(e) = res {
@@ -5088,7 +5273,7 @@ impl JVM {
         }
 
         let mut current_class = Some(class_name.to_string());
-        
+
         while let Some(name) = current_class {
             let class_data_opt = {
                 let state = jvm.state.lock();
@@ -5518,12 +5703,7 @@ impl JVM {
                                 field_info.descriptor_index,
                                 &class_data.const_pool,
                             );
-                            let default_val =
-                                if descriptor.starts_with('L') || descriptor.starts_with('[') {
-                                    JvmStackValue::Null
-                                } else {
-                                    JvmStackValue::Int(0)
-                                };
+                            let default_val = JVM::default_value_for_descriptor(&descriptor);
                             let f_name =
                                 JVM::resolve_utf8(field_info.name_index, &class_data.const_pool);
                             let key = format!("{}.{}:{}", name, f_name, descriptor);
@@ -5575,77 +5755,205 @@ impl JVM {
     }
 
     pub fn handle_str_buffer_fns(
-        object_ref: &mut HeapObject,
+        state: &mut JvmState,
+        this_id: usize,
         method: &str,
+        descriptor: &str,
         args: &[JvmStackValue],
     ) -> Result<Option<JvmStackValue>, String> {
-        // 0th contains the objectref in args
-
-        let heap_obj = if let HeapObject::Instance(obj) = object_ref {
-            obj
-        } else {
-            println!(
-                "Expected instance for StringBuffer, but got something else: {:?} | method = {} | args = {:?}",
-                object_ref, method, args
-            );
-
-            return Err("Expected instance for StringBuffer object".into());
-        };
-
-        match method {
-            "append" => {
-                JVM::ensure_string_buffer_field(heap_obj);
-
-                let val = args.get(1).cloned().unwrap_or(JvmStackValue::Null);
-                let append_str = match val {
-                    JvmStackValue::String(s) => s,
-                    JvmStackValue::Int(i) => i.to_string(),
-                    JvmStackValue::Float(f) => f.to_string(),
-                    JvmStackValue::Long(l) => l.to_string(),
-                    JvmStackValue::Double(d) => d.to_string(),
-                    JvmStackValue::Null => "null".to_string(),
-                    _ => format!("{:?}", val),
-                };
-
-                let buffer = match heap_obj.fields.get_mut("buffer") {
-                    Some(JvmStackValue::String(s)) => s,
-                    _ => return Err("StringBuffer instance has invalid 'buffer' field".into()),
-                };
-                buffer.push_str(&append_str);
-                Ok(Some(args[0].clone()))
-            }
-            "toString" => {
-                JVM::ensure_string_buffer_field(heap_obj);
-                let buffer = match heap_obj.fields.get("buffer") {
-                    Some(JvmStackValue::String(s)) => s,
-                    _ => return Err("StringBuffer instance has invalid 'buffer' field".into()),
-                };
-
-                Ok(Some(JvmStackValue::String(buffer.clone())))
-            }
-            "<init>" => {
-                let initial_value = match args.get(1) {
-                    Some(JvmStackValue::String(s)) => s.clone(),
-                    Some(JvmStackValue::Null) | None => String::new(),
-                    Some(value) => format!("{:?}", value),
-                };
-                heap_obj
-                    .fields
-                    .insert("buffer".to_string(), JvmStackValue::String(initial_value));
+        match (method, descriptor) {
+            ("<init>", "()V") => {
+                JVM::set_string_buffer_value(state, this_id, String::new(), 16)?;
                 Ok(None)
             }
-            _ => {
-                println!(
-                    "[-] Unknown StringBuffer method: {} | args = {:?}",
-                    method, args
-                );
-                panic!();
+            ("<init>", "(I)V") => {
+                let capacity = JVM::int_arg(args, 0, "StringBuffer.<init>(I): capacity")?;
+                if capacity < 0 {
+                    return Err(format!("NegativeArraySizeException: {}", capacity));
+                }
+                JVM::set_string_buffer_value(state, this_id, String::new(), capacity)?;
                 Ok(None)
             }
+            ("<init>", "(Ljava/lang/String;)V") => {
+                let initial_value = JVM::char_sequence_arg_in_state(
+                    state,
+                    args,
+                    0,
+                    "StringBuffer.<init>(String): value",
+                )?;
+                let capacity = initial_value.chars().count() as i32 + 16;
+                JVM::set_string_buffer_value(state, this_id, initial_value, capacity)?;
+                Ok(None)
+            }
+            ("append", _) => {
+                let append_str =
+                    JVM::string_buffer_value_arg_to_string(state, args, 0, descriptor)?;
+                {
+                    let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                    JVM::ensure_string_buffer_fields(heap_obj);
+                    let new_len = {
+                        let buffer = JVM::string_buffer_text_mut(heap_obj)?;
+                        buffer.push_str(&append_str);
+                        buffer.chars().count() as i32
+                    };
+                    JVM::ensure_string_buffer_capacity(heap_obj, new_len);
+                }
+                Ok(Some(JvmStackValue::ObjectRef(this_id as u32)))
+            }
+            ("length", "()I") => {
+                let buffer = JVM::string_buffer_text(state, this_id)?;
+                Ok(Some(JvmStackValue::Int(buffer.chars().count() as i32)))
+            }
+            ("capacity", "()I") => {
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                Ok(Some(JvmStackValue::Int(JVM::string_buffer_capacity(
+                    heap_obj,
+                ))))
+            }
+            ("ensureCapacity", "(I)V") => {
+                let min_capacity =
+                    JVM::int_arg(args, 0, "StringBuffer.ensureCapacity: minCapacity")?;
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                JVM::ensure_string_buffer_capacity(heap_obj, min_capacity);
+                Ok(None)
+            }
+            ("setLength", "(I)V") => {
+                let new_len = JVM::int_arg(args, 0, "StringBuffer.setLength: newLength")?;
+                if new_len < 0 {
+                    return Err(format!("StringIndexOutOfBoundsException: {}", new_len));
+                }
+
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                let buffer = JVM::string_buffer_text_mut(heap_obj)?;
+                let current_len = buffer.chars().count();
+                let new_len = new_len as usize;
+                if new_len < current_len {
+                    *buffer = buffer.chars().take(new_len).collect();
+                } else {
+                    buffer.extend(std::iter::repeat('\0').take(new_len - current_len));
+                }
+                JVM::ensure_string_buffer_capacity(heap_obj, new_len as i32);
+                Ok(None)
+            }
+            ("charAt", "(I)C") => {
+                let index = JVM::int_arg(args, 0, "StringBuffer.charAt: index")?;
+                let buffer = JVM::string_buffer_text(state, this_id)?;
+                let ch = JVM::char_at(&buffer, index, "StringBuffer.charAt")?;
+                Ok(Some(JvmStackValue::Int(ch as i32)))
+            }
+            ("setCharAt", "(IC)V") => {
+                let index = JVM::int_arg(args, 0, "StringBuffer.setCharAt: index")?;
+                let ch = JVM::char_arg(args, 1, "StringBuffer.setCharAt: ch")?;
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                let buffer = JVM::string_buffer_text_mut(heap_obj)?;
+                JVM::replace_char_at(buffer, index, ch, "StringBuffer.setCharAt")?;
+                Ok(None)
+            }
+            ("delete", "(II)Ljava/lang/StringBuffer;")
+            | ("delete", "(II)Ljava/lang/StringBuilder;") => {
+                let start = JVM::int_arg(args, 0, "StringBuffer.delete: start")?;
+                let end = JVM::int_arg(args, 1, "StringBuffer.delete: end")?;
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                let buffer = JVM::string_buffer_text_mut(heap_obj)?;
+                JVM::delete_char_range(buffer, start, end, "StringBuffer.delete")?;
+                Ok(Some(JvmStackValue::ObjectRef(this_id as u32)))
+            }
+            ("deleteCharAt", "(I)Ljava/lang/StringBuffer;")
+            | ("deleteCharAt", "(I)Ljava/lang/StringBuilder;") => {
+                let index = JVM::int_arg(args, 0, "StringBuffer.deleteCharAt: index")?;
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                let buffer = JVM::string_buffer_text_mut(heap_obj)?;
+                let _ = JVM::char_at(buffer, index, "StringBuffer.deleteCharAt")?;
+                JVM::delete_char_range(buffer, index, index + 1, "StringBuffer.deleteCharAt")?;
+                Ok(Some(JvmStackValue::ObjectRef(this_id as u32)))
+            }
+            ("insert", _) => {
+                let offset = JVM::int_arg(args, 0, "StringBuffer.insert: offset")?;
+                let insert_str =
+                    JVM::string_buffer_value_arg_to_string(state, args, 1, descriptor)?;
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                let new_len = {
+                    let buffer = JVM::string_buffer_text_mut(heap_obj)?;
+                    JVM::insert_chars(buffer, offset, &insert_str, "StringBuffer.insert")?;
+                    buffer.chars().count() as i32
+                };
+                JVM::ensure_string_buffer_capacity(heap_obj, new_len);
+                Ok(Some(JvmStackValue::ObjectRef(this_id as u32)))
+            }
+            ("reverse", "()Ljava/lang/StringBuffer;")
+            | ("reverse", "()Ljava/lang/StringBuilder;") => {
+                let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+                JVM::ensure_string_buffer_fields(heap_obj);
+                let buffer = JVM::string_buffer_text_mut(heap_obj)?;
+                *buffer = buffer.chars().rev().collect();
+                Ok(Some(JvmStackValue::ObjectRef(this_id as u32)))
+            }
+            ("substring", "(I)Ljava/lang/String;") => {
+                let start = JVM::int_arg(args, 0, "StringBuffer.substring: start")?;
+                let buffer = JVM::string_buffer_text(state, this_id)?;
+                let end = buffer.chars().count() as i32;
+                Ok(Some(JvmStackValue::String(JVM::substring_by_char_range(
+                    &buffer, start, end,
+                )?)))
+            }
+            ("substring", "(II)Ljava/lang/String;")
+            | ("subSequence", "(II)Ljava/lang/CharSequence;") => {
+                let start = JVM::int_arg(args, 0, "StringBuffer.substring: start")?;
+                let end = JVM::int_arg(args, 1, "StringBuffer.substring: end")?;
+                let buffer = JVM::string_buffer_text(state, this_id)?;
+                Ok(Some(JvmStackValue::String(JVM::substring_by_char_range(
+                    &buffer, start, end,
+                )?)))
+            }
+            ("getChars", "(II[CI)V") => {
+                let start = JVM::int_arg(args, 0, "StringBuffer.getChars: srcBegin")?;
+                let end = JVM::int_arg(args, 1, "StringBuffer.getChars: srcEnd")?;
+                let dst = args
+                    .get(2)
+                    .ok_or("StringBuffer.getChars: missing destination")?
+                    .clone();
+                let dst_begin = JVM::int_arg(args, 3, "StringBuffer.getChars: dstBegin")?;
+                let buffer = JVM::string_buffer_text(state, this_id)?;
+                let chars: Vec<char> = JVM::substring_by_char_range(&buffer, start, end)?
+                    .chars()
+                    .collect();
+                JVM::copy_chars_to_array(state, &dst, dst_begin, &chars)?;
+                Ok(None)
+            }
+            ("toString", "()Ljava/lang/String;") => {
+                Ok(Some(JvmStackValue::String(JVM::string_buffer_text(
+                    state, this_id,
+                )?)))
+            }
+            _ => Err(format!(
+                "Unsupported StringBuffer method: {}{} | args = {:?}",
+                method, descriptor, args
+            )),
         }
     }
 
-    fn ensure_string_buffer_field(heap_obj: &mut JvmObject) {
+    fn string_buffer_object_mut(
+        state: &mut JvmState,
+        this_id: usize,
+    ) -> Result<&mut JvmObject, String> {
+        match state.heap.get_mut(this_id) {
+            Some(HeapObject::Instance(obj)) => Ok(obj),
+            Some(other) => Err(format!(
+                "Expected instance for StringBuffer, found {:?}",
+                other
+            )),
+            None => Err(format!("Invalid heap reference: {}", this_id)),
+        }
+    }
+
+    fn ensure_string_buffer_fields(heap_obj: &mut JvmObject) {
         if !matches!(
             heap_obj.fields.get("buffer"),
             Some(JvmStackValue::String(_))
@@ -5653,6 +5961,295 @@ impl JVM {
             heap_obj
                 .fields
                 .insert("buffer".to_string(), JvmStackValue::String(String::new()));
+        }
+
+        let buffer_len = match heap_obj.fields.get("buffer") {
+            Some(JvmStackValue::String(buffer)) => buffer.chars().count() as i32,
+            _ => 0,
+        };
+        let capacity = match heap_obj.fields.get("capacity") {
+            Some(JvmStackValue::Int(capacity)) => *capacity,
+            _ => 16,
+        }
+        .max(buffer_len);
+        heap_obj
+            .fields
+            .insert("capacity".to_string(), JvmStackValue::Int(capacity));
+    }
+
+    fn set_string_buffer_value(
+        state: &mut JvmState,
+        this_id: usize,
+        value: String,
+        capacity: i32,
+    ) -> Result<(), String> {
+        let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+        let min_capacity = value.chars().count() as i32;
+        heap_obj
+            .fields
+            .insert("buffer".to_string(), JvmStackValue::String(value));
+        heap_obj.fields.insert(
+            "capacity".to_string(),
+            JvmStackValue::Int(capacity.max(min_capacity)),
+        );
+        Ok(())
+    }
+
+    fn string_buffer_text(state: &mut JvmState, this_id: usize) -> Result<String, String> {
+        let heap_obj = JVM::string_buffer_object_mut(state, this_id)?;
+        JVM::ensure_string_buffer_fields(heap_obj);
+        match heap_obj.fields.get("buffer") {
+            Some(JvmStackValue::String(buffer)) => Ok(buffer.clone()),
+            _ => Err("StringBuffer instance has invalid 'buffer' field".into()),
+        }
+    }
+
+    fn string_buffer_text_mut(heap_obj: &mut JvmObject) -> Result<&mut String, String> {
+        match heap_obj.fields.get_mut("buffer") {
+            Some(JvmStackValue::String(buffer)) => Ok(buffer),
+            _ => Err("StringBuffer instance has invalid 'buffer' field".into()),
+        }
+    }
+
+    fn string_buffer_capacity(heap_obj: &JvmObject) -> i32 {
+        match heap_obj.fields.get("capacity") {
+            Some(JvmStackValue::Int(capacity)) => *capacity,
+            _ => 16,
+        }
+    }
+
+    fn ensure_string_buffer_capacity(heap_obj: &mut JvmObject, min_capacity: i32) {
+        if min_capacity <= 0 {
+            return;
+        }
+
+        let current = JVM::string_buffer_capacity(heap_obj).max(0);
+        if min_capacity <= current {
+            return;
+        }
+
+        let grown = current.saturating_mul(2).saturating_add(2);
+        heap_obj.fields.insert(
+            "capacity".to_string(),
+            JvmStackValue::Int(grown.max(min_capacity)),
+        );
+    }
+
+    fn int_arg(args: &[JvmStackValue], index: usize, context: &str) -> Result<i32, String> {
+        match args.get(index) {
+            Some(JvmStackValue::Int(value)) => Ok(*value),
+            value => Err(format!("{}: invalid/missing int {:?}", context, value)),
+        }
+    }
+
+    fn char_arg(args: &[JvmStackValue], index: usize, context: &str) -> Result<char, String> {
+        let value = JVM::int_arg(args, index, context)?;
+        char::from_u32(value as u32)
+            .ok_or_else(|| format!("{}: invalid char value {}", context, value))
+    }
+
+    fn char_at(value: &str, index: i32, context: &str) -> Result<char, String> {
+        if index < 0 {
+            return Err(format!("StringIndexOutOfBoundsException: {}", index));
+        }
+
+        value
+            .chars()
+            .nth(index as usize)
+            .ok_or_else(|| format!("StringIndexOutOfBoundsException: {}", context))
+    }
+
+    fn replace_char_at(
+        value: &mut String,
+        index: i32,
+        ch: char,
+        context: &str,
+    ) -> Result<(), String> {
+        if index < 0 {
+            return Err(format!("StringIndexOutOfBoundsException: {}", index));
+        }
+
+        let mut chars: Vec<char> = value.chars().collect();
+        let Some(slot) = chars.get_mut(index as usize) else {
+            return Err(format!("StringIndexOutOfBoundsException: {}", context));
+        };
+        *slot = ch;
+        *value = chars.into_iter().collect();
+        Ok(())
+    }
+
+    fn delete_char_range(
+        value: &mut String,
+        start: i32,
+        end: i32,
+        context: &str,
+    ) -> Result<(), String> {
+        let len = value.chars().count() as i32;
+        if start < 0 || start > len || start > end {
+            return Err(format!(
+                "StringIndexOutOfBoundsException: {} start {}, end {}, length {}",
+                context, start, end, len
+            ));
+        }
+
+        let end = end.min(len);
+        let mut chars: Vec<char> = value.chars().collect();
+        chars.drain(start as usize..end as usize);
+        *value = chars.into_iter().collect();
+        Ok(())
+    }
+
+    fn insert_chars(
+        value: &mut String,
+        offset: i32,
+        inserted: &str,
+        context: &str,
+    ) -> Result<(), String> {
+        let len = value.chars().count() as i32;
+        if offset < 0 || offset > len {
+            return Err(format!(
+                "StringIndexOutOfBoundsException: {} offset {}, length {}",
+                context, offset, len
+            ));
+        }
+
+        let mut chars: Vec<char> = value.chars().collect();
+        chars.splice(offset as usize..offset as usize, inserted.chars());
+        *value = chars.into_iter().collect();
+        Ok(())
+    }
+
+    fn char_sequence_arg_in_state(
+        state: &JvmState,
+        args: &[JvmStackValue],
+        index: usize,
+        context: &str,
+    ) -> Result<String, String> {
+        let value = args
+            .get(index)
+            .ok_or_else(|| format!("{}: missing argument {}", context, index))?;
+        Ok(JVM::char_sequence_to_string_in_state(value, state))
+    }
+
+    fn char_sequence_to_string_in_state(value: &JvmStackValue, state: &JvmState) -> String {
+        match value {
+            JvmStackValue::ObjectRef(id) => match state.heap.get(*id as usize) {
+                Some(HeapObject::Instance(obj)) => {
+                    if let Some(JvmStackValue::String(buffer)) = obj.fields.get("buffer") {
+                        buffer.clone()
+                    } else {
+                        format!("{}@{:x}", obj.class_name.replace('/', "."), id)
+                    }
+                }
+                _ => format!("ObjectRef({})", id),
+            },
+            other => JVM::char_sequence_to_string_without_heap(other),
+        }
+    }
+
+    fn string_buffer_value_arg_to_string(
+        state: &JvmState,
+        args: &[JvmStackValue],
+        arg_index: usize,
+        descriptor: &str,
+    ) -> Result<String, String> {
+        if descriptor.contains("[CII") {
+            let array = args
+                .get(arg_index)
+                .ok_or("StringBuffer char[] method: missing array")?;
+            let offset = JVM::int_arg(args, arg_index + 1, "StringBuffer char[] method: offset")?;
+            let length = JVM::int_arg(args, arg_index + 2, "StringBuffer char[] method: length")?;
+            let chars = JVM::chars_from_array_ref(state, array)?;
+            let range =
+                JVM::string_constructor_range(chars.len(), offset, length, "StringBuffer char[]")?;
+            return Ok(chars[range].iter().collect());
+        }
+
+        if descriptor.contains("[C") {
+            let array = args
+                .get(arg_index)
+                .ok_or("StringBuffer char[] method: missing array")?;
+            return Ok(JVM::chars_from_array_ref(state, array)?.iter().collect());
+        }
+
+        if descriptor.starts_with("(C)") || descriptor.starts_with("(IC)") {
+            return JVM::char_arg(args, arg_index, "StringBuffer char method")
+                .map(|ch| ch.to_string());
+        }
+
+        if descriptor.starts_with("(Z)") || descriptor.starts_with("(IZ)") {
+            let value = JVM::int_arg(args, arg_index, "StringBuffer boolean method")?;
+            return Ok(if value == 0 { "false" } else { "true" }.to_string());
+        }
+
+        let value = args.get(arg_index).unwrap_or(&JvmStackValue::Null);
+        Ok(JVM::char_sequence_to_string_in_state(value, state))
+    }
+
+    fn chars_from_array_ref(
+        state: &JvmState,
+        arrayref: &JvmStackValue,
+    ) -> Result<Vec<char>, String> {
+        let heap_idx = match arrayref {
+            JvmStackValue::ObjectRef(id) => *id as usize,
+            JvmStackValue::Null => return Err("NullPointerException: null char array".into()),
+            value => return Err(format!("expected char array reference, found {:?}", value)),
+        };
+
+        match state.heap.get(heap_idx) {
+            Some(HeapObject::Array { data, .. }) => data
+                .iter()
+                .map(|item| match item {
+                    JvmStackValue::Int(value) => char::from_u32(*value as u32)
+                        .ok_or_else(|| format!("invalid char value {}", value)),
+                    value => Err(format!("expected char in array, found {:?}", value)),
+                })
+                .collect(),
+            _ => Err("expected char array object".into()),
+        }
+    }
+
+    fn copy_chars_to_array(
+        state: &mut JvmState,
+        arrayref: &JvmStackValue,
+        dst_begin: i32,
+        chars: &[char],
+    ) -> Result<(), String> {
+        if dst_begin < 0 {
+            return Err(format!(
+                "ArrayIndexOutOfBoundsException: destination offset {}",
+                dst_begin
+            ));
+        }
+
+        let heap_idx = match arrayref {
+            JvmStackValue::ObjectRef(id) => *id as usize,
+            JvmStackValue::Null => return Err("NullPointerException: null char array".into()),
+            value => return Err(format!("expected char array reference, found {:?}", value)),
+        };
+
+        match state.heap.get_mut(heap_idx) {
+            Some(HeapObject::Array { data, .. }) => {
+                let dst_begin = dst_begin as usize;
+                let Some(end) = dst_begin.checked_add(chars.len()) else {
+                    return Err("ArrayIndexOutOfBoundsException: destination overflow".into());
+                };
+                if end > data.len() {
+                    return Err(format!(
+                        "ArrayIndexOutOfBoundsException: range {}..{} out of bounds for length {}",
+                        dst_begin,
+                        end,
+                        data.len()
+                    ));
+                }
+
+                for (index, ch) in chars.iter().enumerate() {
+                    data[dst_begin + index] = JvmStackValue::Int(*ch as i32);
+                }
+
+                Ok(())
+            }
+            _ => Err("expected char array object".into()),
         }
     }
 
@@ -5698,6 +6295,88 @@ impl JVM {
         }
     }
 
+    fn string_constructor_int_arg(
+        args: &[JvmStackValue],
+        index: usize,
+        context: &str,
+        name: &str,
+    ) -> Result<i32, String> {
+        match args.get(index) {
+            Some(JvmStackValue::Int(value)) => Ok(*value),
+            value => Err(format!(
+                "String.<init>{}: invalid/missing {} {:?}",
+                context, name, value
+            )),
+        }
+    }
+
+    fn string_constructor_range(
+        array_len: usize,
+        offset: i32,
+        length: i32,
+        context: &str,
+    ) -> Result<std::ops::Range<usize>, String> {
+        if offset < 0 || length < 0 {
+            return Err(format!(
+                "StringIndexOutOfBoundsException: offset {}, length {}, array len {}",
+                offset, length, array_len
+            ));
+        }
+
+        let offset = offset as usize;
+        let length = length as usize;
+        let Some(end) = offset.checked_add(length) else {
+            return Err(format!(
+                "StringIndexOutOfBoundsException: offset {}, length {}, array len {}",
+                offset, length, array_len
+            ));
+        };
+
+        if end > array_len {
+            return Err(format!(
+                "StringIndexOutOfBoundsException: offset {}, length {}, array len {}",
+                offset, length, array_len
+            ));
+        }
+
+        if is_debug_enabled() {
+            jvm_debug!(
+                "String.<init>{}: slicing array len {} at {}..{}",
+                context,
+                array_len,
+                offset,
+                end
+            );
+        }
+
+        Ok(offset..end)
+    }
+
+    fn string_constructor_charset_arg(
+        args: &[JvmStackValue],
+        index: usize,
+        context: &str,
+        jvm: &JVM,
+    ) -> Result<String, String> {
+        match args.get(index) {
+            Some(JvmStackValue::Null) => Err(format!(
+                "String.<init>{}: NullPointerException: charset is null",
+                context
+            )),
+            Some(value) => Ok(JVM::char_sequence_to_string(value, jvm).to_ascii_uppercase()),
+            None => Err(format!("String.<init>{}: missing charset", context)),
+        }
+    }
+
+    fn decode_hibyte_bytes(bytes: &[u8], hibyte: i32) -> String {
+        let high = ((hibyte & 0xff) as u16) << 8;
+        let units: Vec<u16> = bytes
+            .iter()
+            .map(|byte| high | (*byte as u16 & 0xff))
+            .collect();
+        String::from_utf16_lossy(&units)
+    }
+
     fn handle_string_fns(
         objectref: JvmStackValue,
         method: &str,
@@ -5712,47 +6391,81 @@ impl JVM {
                     let other = args.first().ok_or("String.<init>(String): missing arg")?;
                     JVM::char_sequence_to_string(other, jvm)
                 }
+                "(Ljava/lang/StringBuffer;)V" | "(Ljava/lang/StringBuilder;)V" => {
+                    let other = args
+                        .first()
+                        .ok_or("String.<init>(StringBuffer/StringBuilder): missing arg")?;
+                    JVM::char_sequence_to_string(other, jvm)
+                }
                 "([B)V" => {
                     let bytes_ref = args.first().ok_or("String.<init>(byte[]): missing arg")?;
                     let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
                     String::from_utf8_lossy(&bytes).into_owned()
                 }
                 "([BII)V" => {
-                    let bytes_ref = args.first().ok_or("String.<init>(byte[], int, int): missing arg 1")?;
-                    let offset = match args.get(1) {
-                        Some(JvmStackValue::Int(o)) => *o as usize,
-                        _ => return Err("String.<init>(byte[], int, int): invalid/missing offset".into()),
-                    };
-                    let length = match args.get(2) {
-                        Some(JvmStackValue::Int(l)) => *l as usize,
-                        _ => return Err("String.<init>(byte[], int, int): invalid/missing length".into()),
-                    };
+                    let bytes_ref = args
+                        .first()
+                        .ok_or("String.<init>(byte[], int, int): missing arg 1")?;
+                    let context = "(byte[], int, int)";
+                    let offset =
+                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length =
+                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
                     let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
-                    if offset + length > bytes.len() {
-                        return Err(format!("StringIndexOutOfBoundsException: offset {}, length {}, bytes len {}", offset, length, bytes.len()));
-                    }
-                    String::from_utf8_lossy(&bytes[offset..offset+length]).into_owned()
+                    let range =
+                        JVM::string_constructor_range(bytes.len(), offset, length, context)?;
+                    String::from_utf8_lossy(&bytes[range]).into_owned()
                 }
-                "([BIILjava/lang/String;)V" => {
-                    let bytes_ref = args.first().ok_or("String.<init>(byte[], int, int, String): missing arg 1")?;
-                    let offset = match args.get(1) {
-                        Some(JvmStackValue::Int(o)) => *o as usize,
-                        _ => return Err("String.<init>(byte[], int, int, String): invalid/missing offset".into()),
-                    };
-                    let length = match args.get(2) {
-                        Some(JvmStackValue::Int(l)) => *l as usize,
-                        _ => return Err("String.<init>(byte[], int, int, String): invalid/missing length".into()),
-                    };
-                    let charset_ref = args.get(3).ok_or("String.<init>(byte[], int, int, String): missing charset")?;
-                    let charset = JVM::char_sequence_to_string(charset_ref, jvm).to_ascii_uppercase();
-
+                "([BLjava/lang/String;)V" | "([BLjava/nio/charset/Charset;)V" => {
+                    let bytes_ref = args
+                        .first()
+                        .ok_or("String.<init>(byte[], String): missing arg 1")?;
+                    let context = "(byte[], charset)";
+                    let charset = JVM::string_constructor_charset_arg(args, 1, context, jvm)?;
                     let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
-                    if offset + length > bytes.len() {
-                        return Err(format!("StringIndexOutOfBoundsException: offset {}, length {}, bytes len {}", offset, length, bytes.len()));
-                    }
-                    let sub_bytes = &bytes[offset..offset+length];
+                    JVM::decode_bytes_with_charset(&bytes, &charset)?
+                }
+                "([BIILjava/lang/String;)V" | "([BIILjava/nio/charset/Charset;)V" => {
+                    let bytes_ref = args
+                        .first()
+                        .ok_or("String.<init>(byte[], int, int, String): missing arg 1")?;
+                    let context = "(byte[], int, int, charset)";
+                    let offset =
+                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length =
+                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
+                    let charset = JVM::string_constructor_charset_arg(args, 3, context, jvm)?;
+                    let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
+                    let range =
+                        JVM::string_constructor_range(bytes.len(), offset, length, context)?;
 
-                    JVM::decode_bytes_with_charset(sub_bytes, &charset)?
+                    JVM::decode_bytes_with_charset(&bytes[range], &charset)?
+                }
+                "([BI)V" => {
+                    let bytes_ref = args
+                        .first()
+                        .ok_or("String.<init>(byte[], int): missing arg 1")?;
+                    let context = "(byte[], int)";
+                    let hibyte =
+                        JVM::string_constructor_int_arg(args, 1, context, "hibyte")?;
+                    let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
+                    JVM::decode_hibyte_bytes(&bytes, hibyte)
+                }
+                "([BIII)V" => {
+                    let bytes_ref = args
+                        .first()
+                        .ok_or("String.<init>(byte[], int, int, int): missing arg 1")?;
+                    let context = "(byte[], int, int, int)";
+                    let hibyte =
+                        JVM::string_constructor_int_arg(args, 1, context, "hibyte")?;
+                    let offset =
+                        JVM::string_constructor_int_arg(args, 2, context, "offset")?;
+                    let length =
+                        JVM::string_constructor_int_arg(args, 3, context, "length")?;
+                    let bytes = JVM::extract_byte_array(bytes_ref, jvm)?;
+                    let range =
+                        JVM::string_constructor_range(bytes.len(), offset, length, context)?;
+                    JVM::decode_hibyte_bytes(&bytes[range], hibyte)
                 }
                 "([C)V" => {
                     let chars_ref = args.first().ok_or("String.<init>(char[]): missing arg")?;
@@ -5760,34 +6473,58 @@ impl JVM {
                     chars.into_iter().collect::<String>()
                 }
                 "([CII)V" => {
-                    let chars_ref = args.first().ok_or("String.<init>(char[], int, int): missing arg 1")?;
-                    let offset = match args.get(1) {
-                        Some(JvmStackValue::Int(o)) => *o as usize,
-                        _ => return Err("String.<init>(char[], int, int): invalid/missing offset".into()),
-                    };
-                    let length = match args.get(2) {
-                        Some(JvmStackValue::Int(l)) => *l as usize,
-                        _ => return Err("String.<init>(char[], int, int): invalid/missing length".into()),
-                    };
+                    let chars_ref = args
+                        .first()
+                        .ok_or("String.<init>(char[], int, int): missing arg 1")?;
+                    let context = "(char[], int, int)";
+                    let offset =
+                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length =
+                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
                     let chars = JVM::extract_char_array(chars_ref, jvm)?;
-                    if offset + length > chars.len() {
-                        return Err(format!("StringIndexOutOfBoundsException: offset {}, length {}, chars len {}", offset, length, chars.len()));
+                    let range =
+                        JVM::string_constructor_range(chars.len(), offset, length, context)?;
+                    chars[range].iter().collect::<String>()
+                }
+                "([III)V" => {
+                    let code_points_ref = args
+                        .first()
+                        .ok_or("String.<init>(int[], int, int): missing arg 1")?;
+                    let context = "(int[], int, int)";
+                    let offset =
+                        JVM::string_constructor_int_arg(args, 1, context, "offset")?;
+                    let length =
+                        JVM::string_constructor_int_arg(args, 2, context, "length")?;
+                    let code_points = JVM::extract_int_array(code_points_ref, jvm)?;
+                    let range =
+                        JVM::string_constructor_range(code_points.len(), offset, length, context)?;
+                    let mut out = String::new();
+                    for code_point in &code_points[range] {
+                        let ch = char::from_u32(*code_point as u32).ok_or_else(|| {
+                            format!(
+                                "IllegalArgumentException: invalid Unicode code point {}",
+                                code_point
+                            )
+                        })?;
+                        out.push(ch);
                     }
-                    chars[offset..offset+length].iter().collect::<String>()
+                    out
                 }
-                "([Ljava/lang/String;)V" => {
-                    "".to_string()
-                }
+                "([Ljava/lang/String;)V" => "".to_string(),
                 _ => return Err(format!("Unsupported String constructor: {}", descriptor)),
             };
 
             if let JvmStackValue::ObjectRef(id) = objectref {
                 let mut state = jvm.state.lock();
                 if let Some(HeapObject::Instance(obj)) = state.heap.get_mut(id as usize) {
-                    obj.fields.insert("buffer".to_string(), JvmStackValue::String(parsed_string));
+                    obj.fields
+                        .insert("buffer".to_string(), JvmStackValue::String(parsed_string));
                     return Ok(None);
                 } else {
-                    return Err(format!("String.<init>: object ref {} is not a heap instance", id));
+                    return Err(format!(
+                        "String.<init>: object ref {} is not a heap instance",
+                        id
+                    ));
                 }
             } else {
                 return Err("String.<init>: expected ObjectRef for 'this'".into());
@@ -5806,7 +6543,12 @@ impl JVM {
                             "".to_string()
                         }
                     }
-                    _ => return Err(format!("String: expected string object instance, found {:?}", objectref)),
+                    _ => {
+                        return Err(format!(
+                            "String: expected string object instance, found {:?}",
+                            objectref
+                        ));
+                    }
                 }
             }
             JvmStackValue::Null => return Err("String: NullPointerException".into()),
@@ -6143,9 +6885,26 @@ impl JVM {
             }
 
             return Ok(());
-        } else if class_name == "java/lang/Thread" && method_name == "sleep" {
-            if let Some(JvmStackValue::Long(ms)) = args.first() {
-                jvm.sleep_emulated(Duration::from_millis(*ms as u64));
+        } else if class_name == "java/lang/Thread" {
+            match (method_name, descriptor) {
+                ("sleep", "(J)V") => {
+                    let ms = match args.first() {
+                        Some(JvmStackValue::Long(ms)) => *ms,
+                        value => return Err(format!("Thread.sleep: invalid millis {:?}", value)),
+                    };
+                    if ms > 0 {
+                        jvm.sleep_emulated(Duration::from_millis(ms as u64));
+                    }
+                }
+                ("yield", "()V") => {
+                    std::thread::yield_now();
+                }
+                _ => {
+                    return Err(format!(
+                        "Unsupported Thread static method: {}{}",
+                        method_name, descriptor
+                    ));
+                }
             }
             return Ok(());
         } else if class_name == "java/lang/System" {
@@ -6284,6 +7043,55 @@ impl JVM {
         let res = game_canvas::paint(&self);
         IS_PAINTING.store(false, std::sync::atomic::Ordering::SeqCst);
         res
+    }
+
+    pub fn handle_key_event(&self, keycode: i32, is_pressed: bool) -> Result<(), String> {
+        if self.is_paused() || self.is_shutdown() {
+            return Ok(());
+        }
+
+        let displayable_ref = {
+            let res = crate::jvm::javax::lcdui::display::get_display_safe(self);
+            if let Ok(disp) = res {
+                if let Ok(Some(d)) =
+                    crate::jvm::javax::lcdui::display::get_displayable_obj_safe(disp, self)
+                {
+                    d
+                } else {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        };
+
+        let class_name = if let JvmStackValue::ObjectRef(id) = &displayable_ref {
+            let state = self.state.lock();
+            if let Some(HeapObject::Instance(inst)) = state.heap.get(*id as usize) {
+                inst.class_name.clone()
+            } else {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        };
+
+        let method_name = if is_pressed {
+            "keyPressed"
+        } else {
+            "keyReleased"
+        };
+
+        JVM::execute_method(
+            displayable_ref,
+            &class_name,
+            method_name,
+            "(I)V",
+            &[JvmStackValue::Int(keycode)],
+            self,
+            &mut Vec::new(),
+        )
+        .map_err(|err| format!("{}({}) failed: {}", method_name, keycode, err))
     }
 
     fn allocate_calendar_object(jvm: &JVM, time: i64, timezone: String) -> JvmStackValue {
@@ -7286,7 +8094,9 @@ impl JVM {
                                         .unwrap_or(char::REPLACEMENT_CHARACTER);
                                     chars.push(ch);
                                 }
-                                _ => return Err(format!("expected char in array, found {:?}", item)),
+                                _ => {
+                                    return Err(format!("expected char in array, found {:?}", item));
+                                }
                             }
                         }
                         Ok(chars)
@@ -7296,6 +8106,26 @@ impl JVM {
             }
             JvmStackValue::Null => Err("NullPointerException: null char array".into()),
             _ => Err("expected object reference for char array".into()),
+        }
+    }
+
+    fn extract_int_array(val: &JvmStackValue, jvm: &JVM) -> Result<Vec<i32>, String> {
+        match val {
+            JvmStackValue::ObjectRef(id) => {
+                let state = jvm.state.lock();
+                match state.heap.get(*id as usize) {
+                    Some(HeapObject::Array { data, .. }) => data
+                        .iter()
+                        .map(|item| match item {
+                            JvmStackValue::Int(value) => Ok(*value),
+                            value => Err(format!("expected int in array, found {:?}", value)),
+                        })
+                        .collect(),
+                    _ => Err("expected int array object".into()),
+                }
+            }
+            JvmStackValue::Null => Err("NullPointerException: null int array".into()),
+            _ => Err("expected object reference for int array".into()),
         }
     }
 
