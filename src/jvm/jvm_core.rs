@@ -10,7 +10,7 @@ use crate::{
     jvm::javax::{
         lcdui::{display, game::game_canvas, graphics, image},
         media::player,
-        midlet,
+        midlet, rms,
     },
     services::jar_extractor::JarFileData,
 };
@@ -249,6 +249,26 @@ impl JVM {
             ("InterruptedException", "java/lang/InterruptedException"),
             ("OutOfMemoryError", "java/lang/OutOfMemoryError"),
             ("NoClassDefFoundError", "java/lang/NoClassDefFoundError"),
+            (
+                "RecordStoreNotFoundException",
+                "javax/microedition/rms/RecordStoreNotFoundException",
+            ),
+            (
+                "RecordStoreNotOpenException",
+                "javax/microedition/rms/RecordStoreNotOpenException",
+            ),
+            (
+                "RecordStoreFullException",
+                "javax/microedition/rms/RecordStoreFullException",
+            ),
+            (
+                "InvalidRecordIDException",
+                "javax/microedition/rms/InvalidRecordIDException",
+            ),
+            (
+                "RecordStoreException",
+                "javax/microedition/rms/RecordStoreException",
+            ),
             ("Exception", "java/lang/Exception"),
             ("Throwable", "java/lang/Throwable"),
         ];
@@ -264,7 +284,7 @@ impl JVM {
             .map(|token| token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '[' | ']')))
             .map(JVM::normalize_class_name)
             .find(|token| {
-                token.starts_with("java/")
+                (token.starts_with("java/") || token.starts_with("javax/microedition/rms/"))
                     && (token.ends_with("Exception")
                         || token.ends_with("Error")
                         || token == "java/lang/Throwable")
@@ -296,6 +316,18 @@ impl JVM {
                 matches!(catch_class, "java/lang/Exception" | "java/lang/Throwable")
             }
             "java/io/IOException" | "java/lang/InterruptedException" => {
+                matches!(catch_class, "java/lang/Exception" | "java/lang/Throwable")
+            }
+            "javax/microedition/rms/RecordStoreNotFoundException"
+            | "javax/microedition/rms/RecordStoreNotOpenException"
+            | "javax/microedition/rms/RecordStoreFullException"
+            | "javax/microedition/rms/InvalidRecordIDException" => matches!(
+                catch_class,
+                "javax/microedition/rms/RecordStoreException"
+                    | "java/lang/Exception"
+                    | "java/lang/Throwable"
+            ),
+            "javax/microedition/rms/RecordStoreException" => {
                 matches!(catch_class, "java/lang/Exception" | "java/lang/Throwable")
             }
             "java/lang/Exception" => catch_class == "java/lang/Throwable",
@@ -1758,6 +1790,24 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x81 => {
+                    // lor
+                    let val2 = stack.pop().ok_or("lor: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("lor: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Long(v1), JvmStackValue::Long(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Long(v1 | v2));
+                    } else {
+                        return Err(format!(
+                            "lor: expected two Longs, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x84 => {
                     // iinc
                     let index = bytecode[pc + 1] as usize;
@@ -3005,6 +3055,25 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x79 => {
+                    // lshl
+                    let val2 = stack.pop().ok_or("lshl: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("lshl: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Long(v1), JvmStackValue::Int(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        let s = (v2 & 0x3f) as u32;
+                        stack.push(JvmStackValue::Long(v1.wrapping_shl(s)));
+                    } else {
+                        return Err(format!(
+                            "lshl: expected Long and Int, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x7A => {
                     // ishr
                     let val2 = stack.pop().ok_or("ishr: stack underflow (val2)")?;
@@ -3043,6 +3112,25 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x7D => {
+                    // lushr
+                    let val2 = stack.pop().ok_or("lushr: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("lushr: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Long(v1), JvmStackValue::Int(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        let s = (v2 & 0x3f) as u32;
+                        stack.push(JvmStackValue::Long(((v1 as u64) >> s) as i64));
+                    } else {
+                        return Err(format!(
+                            "lushr: expected Long and Int, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x7E => {
                     // iand
                     let val2 = stack.pop().ok_or("iand: stack underflow (val2)")?;
@@ -3061,6 +3149,24 @@ impl JVM {
                         .into());
                     }
                     pc += 1
+                }
+                0x7F => {
+                    // land
+                    let val2 = stack.pop().ok_or("land: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("land: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Long(v1), JvmStackValue::Long(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Long(v1 & v2));
+                    } else {
+                        return Err(format!(
+                            "land: expected two Longs, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
                 }
                 0x15 | 0x16 | 0x17 | 0x18 | 0x19 => {
                     // iload, lload, fload, dload, aload
@@ -3182,6 +3288,16 @@ impl JVM {
 
                     jvm_debug!("Execution finished with return value: {:?}", val);
                     return Ok(Some(val));
+                }
+                0xAD => {
+                    // lreturn
+                    let val = stack.pop().ok_or("lreturn: Stack underflow")?;
+                    if let JvmStackValue::Long(_) = val {
+                        jvm_debug!("Execution finished with long return value: {:?}", val);
+                        return Ok(Some(val));
+                    }
+
+                    return Err(format!("lreturn: expected Long, found {:?}", val));
                 }
                 0x36 | 0x37 | 0x38 | 0x39 | 0x3a => {
                     // istore, lstore, fstore, dstore, astore
@@ -4358,6 +4474,39 @@ impl JVM {
 
                 if let Err(e) = &return_value {
                     return Err(format!("Error handling VolumeControl method: {}", e).into());
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == rms::RECORD_STORE_CLASS_NAME {
+                let return_value =
+                    rms::handle_record_store_method(&objectref, method_name, descriptor, args, jvm);
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling RecordStore method: {}", e));
+                }
+
+                if let Some(val) = return_value.unwrap() {
+                    caller_stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == rms::RECORD_ENUMERATION_CLASS_NAME {
+                let return_value = rms::handle_record_enumeration_method_with_args(
+                    &objectref,
+                    method_name,
+                    descriptor,
+                    args,
+                    jvm,
+                );
+
+                if let Err(e) = &return_value {
+                    return Err(format!("Error handling RecordEnumeration method: {}", e));
                 }
 
                 if let Some(val) = return_value.unwrap() {
@@ -5676,6 +5825,12 @@ impl JVM {
             ("trim", "()Ljava/lang/String;") => {
                 Ok(Some(JvmStackValue::String(string.trim().to_string())))
             }
+            ("toUpperCase", "()Ljava/lang/String;") => {
+                Ok(Some(JvmStackValue::String(string.to_uppercase())))
+            }
+            ("toLowerCase", "()Ljava/lang/String;") => {
+                Ok(Some(JvmStackValue::String(string.to_lowercase())))
+            }
             ("endsWith", "(Ljava/lang/String;)Z") => {
                 let Some(JvmStackValue::String(suffix)) = args.first() else {
                     return Err(format!("String.endsWith: invalid arg {:?}", args.first()));
@@ -5737,6 +5892,15 @@ impl JVM {
             if class_name == player::MANAGER_CLASS_NAME {
                 let return_value =
                     player::handle_manager_static_method(method_name, descriptor, args, jvm)?;
+
+                if let Some(val) = return_value {
+                    stack.push(val);
+                }
+
+                return Ok(());
+            }
+            if class_name == rms::RECORD_STORE_CLASS_NAME {
+                let return_value = rms::handle_static_method(method_name, descriptor, args, jvm)?;
 
                 if let Some(val) = return_value {
                     stack.push(val);
