@@ -91,6 +91,53 @@ pub struct JVM {
     pub state: SharedJvmState,
     pub thread_handles: Arc<Mutex<HashMap<u32, std::thread::JoinHandle<()>>>>,
     pause_control: Arc<PauseControl>,
+    object_monitors: Arc<Mutex<HashMap<ObjectMonitorKey, Arc<ObjectMonitor>>>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ObjectMonitorKey {
+    Object(u32),
+    String(String),
+}
+
+struct ObjectMonitor {
+    state: StdMutex<ObjectMonitorState>,
+    wake: Condvar,
+}
+
+struct ObjectMonitorState {
+    generation: u64,
+}
+
+impl ObjectMonitor {
+    fn new() -> Self {
+        Self {
+            state: StdMutex::new(ObjectMonitorState { generation: 0 }),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn notify_one(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Object.notify: monitor lock poisoned".to_string())?;
+        state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn notify_all(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Object.notifyAll: monitor lock poisoned".to_string())?;
+        state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        self.wake.notify_all();
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +164,7 @@ impl Clone for JVM {
             state: Arc::clone(&self.state),
             thread_handles: Arc::clone(&self.thread_handles),
             pause_control: Arc::clone(&self.pause_control),
+            object_monitors: Arc::clone(&self.object_monitors),
         }
     }
 }
@@ -540,6 +588,7 @@ impl JVM {
                 paused_fast: AtomicBool::new(false),
                 stopped_fast: AtomicBool::new(false),
             }),
+            object_monitors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -611,6 +660,9 @@ impl JVM {
         player::stop_all();
         self.thread_handles.lock().clear();
         self.pause_control.wake.notify_all();
+        for monitor in self.object_monitors.lock().values() {
+            let _ = monitor.notify_all();
+        }
     }
 
     fn is_shutdown(&self) -> bool {
@@ -1921,6 +1973,24 @@ impl JVM {
                     }
                     pc += 1;
                 }
+                0x83 => {
+                    // lxor
+                    let val2 = stack.pop().ok_or("lxor: stack underflow (val2)")?;
+                    let val1 = stack.pop().ok_or("lxor: stack underflow (val1)")?;
+
+                    if let (JvmStackValue::Long(v1), JvmStackValue::Long(v2)) =
+                        (val1.clone(), val2.clone())
+                    {
+                        stack.push(JvmStackValue::Long(v1 ^ v2));
+                    } else {
+                        return Err(format!(
+                            "lxor: expected two Longs, found {:?} and {:?}",
+                            val1, val2
+                        )
+                        .into());
+                    }
+                    pc += 1;
+                }
                 0x84 => {
                     // iinc
                     let index = bytecode[pc + 1] as usize;
@@ -2834,6 +2904,18 @@ impl JVM {
                     }
 
                     pc += 3;
+                }
+                0xC2 | 0xC3 => {
+                    // monitorenter, monitorexit
+                    let objectref = stack.pop().ok_or("monitor: stack underflow")?;
+                    if matches!(objectref, JvmStackValue::Null) {
+                        return Err(
+                            "java.lang.NullPointerException: monitor on null reference".into()
+                        );
+                    }
+
+                    JVM::object_monitor(jvm, &objectref, "monitor")?;
+                    pc += 1;
                 }
                 0xC6 | 0xC7 => {
                     // ifnull, ifnonnull
@@ -4312,6 +4394,132 @@ impl JVM {
         JvmStackValue::ObjectRef((state.heap.len() - 1) as u32)
     }
 
+    fn object_monitor_key(
+        objectref: &JvmStackValue,
+        method: &str,
+    ) -> Result<ObjectMonitorKey, String> {
+        match objectref {
+            JvmStackValue::ObjectRef(id) => Ok(ObjectMonitorKey::Object(*id)),
+            JvmStackValue::String(value) => Ok(ObjectMonitorKey::String(value.clone())),
+            JvmStackValue::Null => Err(format!("Object.{}: NullPointerException", method)),
+            value => Err(format!(
+                "Object.{}: expected reference, found {:?}",
+                method, value
+            )),
+        }
+    }
+
+    fn object_monitor(
+        jvm: &JVM,
+        objectref: &JvmStackValue,
+        method: &str,
+    ) -> Result<Arc<ObjectMonitor>, String> {
+        let key = JVM::object_monitor_key(objectref, method)?;
+        let mut monitors = jvm.object_monitors.lock();
+        Ok(Arc::clone(
+            monitors
+                .entry(key)
+                .or_insert_with(|| Arc::new(ObjectMonitor::new())),
+        ))
+    }
+
+    fn object_wait_duration(
+        descriptor: &str,
+        args: &[JvmStackValue],
+    ) -> Result<Option<Duration>, String> {
+        match descriptor {
+            "()V" => Ok(None),
+            "(J)V" | "(JI)V" => {
+                let millis = match args.first() {
+                    Some(JvmStackValue::Long(value)) => *value,
+                    value => {
+                        return Err(format!(
+                            "Object.wait: expected Long millis, found {:?}",
+                            value
+                        ))
+                    }
+                };
+
+                if millis < 0 {
+                    return Err(
+                        "java.lang.IllegalArgumentException: timeout value is negative".into(),
+                    );
+                }
+
+                let nanos = if descriptor == "(JI)V" {
+                    match args.get(1) {
+                        Some(JvmStackValue::Int(value)) => *value,
+                        value => {
+                            return Err(format!(
+                                "Object.wait: expected Int nanos, found {:?}",
+                                value
+                            ));
+                        }
+                    }
+                } else {
+                    0
+                };
+
+                if !(0..=999_999).contains(&nanos) {
+                    return Err(
+                        "java.lang.IllegalArgumentException: nanosecond timeout out of range"
+                            .into(),
+                    );
+                }
+
+                if millis == 0 && nanos == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        Duration::from_millis(millis as u64)
+                            .saturating_add(Duration::from_nanos(nanos as u64)),
+                    ))
+                }
+            }
+            _ => Err(format!(
+                "Unsupported Object.wait descriptor: {}",
+                descriptor
+            )),
+        }
+    }
+
+    fn handle_object_wait(
+        objectref: &JvmStackValue,
+        descriptor: &str,
+        args: &[JvmStackValue],
+        jvm: &JVM,
+    ) -> Result<Option<JvmStackValue>, String> {
+        let monitor = JVM::object_monitor(jvm, objectref, "wait")?;
+        let timeout = JVM::object_wait_duration(descriptor, args)?;
+        let mut state = monitor
+            .state
+            .lock()
+            .map_err(|_| "Object.wait: monitor lock poisoned".to_string())?;
+        let observed_generation = state.generation;
+
+        match timeout {
+            Some(timeout) => {
+                let (new_state, _) = monitor
+                    .wake
+                    .wait_timeout_while(state, timeout, |state| {
+                        state.generation == observed_generation && !jvm.is_shutdown()
+                    })
+                    .map_err(|_| "Object.wait: monitor lock poisoned".to_string())?;
+                drop(new_state);
+            }
+            None => {
+                while state.generation == observed_generation && !jvm.is_shutdown() {
+                    state = monitor
+                        .wake
+                        .wait(state)
+                        .map_err(|_| "Object.wait: monitor lock poisoned".to_string())?;
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn handle_object_fns(
         objectref: &JvmStackValue,
         method: &str,
@@ -4321,6 +4529,19 @@ impl JVM {
     ) -> Result<Option<JvmStackValue>, String> {
         match (method, descriptor) {
             ("<init>", "()V") => Ok(None),
+            ("wait", "()V") | ("wait", "(J)V") | ("wait", "(JI)V") => {
+                JVM::handle_object_wait(objectref, descriptor, args, jvm)
+            }
+            ("notify", "()V") => {
+                let monitor = JVM::object_monitor(jvm, objectref, method)?;
+                monitor.notify_one()?;
+                Ok(None)
+            }
+            ("notifyAll", "()V") => {
+                let monitor = JVM::object_monitor(jvm, objectref, method)?;
+                monitor.notify_all()?;
+                Ok(None)
+            }
             ("getClass", "()Ljava/lang/Class;") => {
                 let class_name = match objectref {
                     JvmStackValue::ObjectRef(id) => {
@@ -4569,7 +4790,7 @@ impl JVM {
         if class_name.starts_with("javax/microedition") {
             if class_name == image::CLASS_NAME {
                 let return_value =
-                    image::handle_virtual_method(objectref, method_name, descriptor, jvm);
+                    image::handle_virtual_method(objectref, method_name, descriptor, args, jvm);
 
                 let res = match return_value {
                     Ok(val) => val,
@@ -5005,6 +5226,11 @@ impl JVM {
                     | ("toString", "()Ljava/lang/String;")
                     | ("equals", "(Ljava/lang/Object;)Z")
                     | ("hashCode", "()I")
+                    | ("wait", "()V")
+                    | ("wait", "(J)V")
+                    | ("wait", "(JI)V")
+                    | ("notify", "()V")
+                    | ("notifyAll", "()V")
             ) {
                 let return_value =
                     JVM::handle_object_fns(&objectref, method_name, descriptor, args, jvm)?;

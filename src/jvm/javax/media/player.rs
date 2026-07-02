@@ -6,7 +6,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use crate::jvm::jvm_core::{HeapObject, JVM, JvmStackValue};
+use crate::jvm::jvm_core::{HeapObject, JvmStackValue, JVM};
 
 pub const CLASS_NAME: &str = "javax/microedition/media/Player";
 pub const MANAGER_CLASS_NAME: &str = "javax/microedition/media/Manager";
@@ -35,6 +35,7 @@ struct PlayerRuntime {
     loop_count: i32,
     volume: i32,
     state: i32,
+    listeners: Vec<u32>,
 }
 
 static PLAYERS: LazyLock<Mutex<HashMap<usize, PlayerRuntime>>> =
@@ -125,11 +126,15 @@ pub fn handle_virtual_method(
         ("start", "()V") => {
             let state = start_player(player_id);
             set_state(player_id, state, jvm);
+            if state == STATE_STARTED {
+                notify_player_listeners(jvm, player_id, "started");
+            }
             Ok(None)
         }
         ("stop", "()V") => {
             stop_player(player_id);
             set_state(player_id, STATE_PREFETCHED, jvm);
+            notify_player_listeners(jvm, player_id, "stopped");
             Ok(None)
         }
         ("deallocate", "()V") => {
@@ -138,6 +143,7 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("close", "()V") => {
+            notify_player_listeners(jvm, player_id, "closed");
             close_player(player_id);
             set_state(player_id, STATE_CLOSED, jvm);
             Ok(None)
@@ -147,6 +153,16 @@ pub fn handle_virtual_method(
             if let Some(player) = PLAYERS.lock().unwrap().get_mut(&player_id) {
                 player.loop_count = loop_count;
             }
+            Ok(None)
+        }
+        ("addPlayerListener", "(Ljavax/microedition/media/PlayerListener;)V") => {
+            let listener_id = listener_arg(args, 0, "Player.addPlayerListener")?;
+            add_player_listener(player_id, listener_id, jvm);
+            Ok(None)
+        }
+        ("removePlayerListener", "(Ljavax/microedition/media/PlayerListener;)V") => {
+            let listener_id = listener_arg(args, 0, "Player.removePlayerListener")?;
+            remove_player_listener(player_id, listener_id, jvm);
             Ok(None)
         }
         ("getMediaTime", "()J") => Ok(Some(JvmStackValue::Long(0))),
@@ -350,6 +366,10 @@ fn register_player(
         "locator:Ljava/lang/String;".to_string(),
         JvmStackValue::String(locator.clone().unwrap_or_default()),
     );
+    fields.insert(
+        "listeners:Ljava/util/Vector;".to_string(),
+        JvmStackValue::Vector(Vec::new()),
+    );
 
     let player_id = {
         let mut state = jvm.state.lock();
@@ -367,6 +387,7 @@ fn register_player(
             loop_count: 1,
             volume: 100,
             state: STATE_UNREALIZED,
+            listeners: Vec::new(),
         },
     );
 
@@ -382,6 +403,103 @@ fn allocate_volume_control(jvm: &JVM, player_id: usize) -> u32 {
 
     let mut state = jvm.state.lock();
     JVM::allocate_internal(&mut state, VOLUME_CONTROL_CLASS_NAME.to_string(), fields)
+}
+
+fn add_player_listener(player_id: usize, listener_id: u32, jvm: &JVM) {
+    let listeners = {
+        let mut players = PLAYERS.lock().unwrap();
+        let Some(player) = players.get_mut(&player_id) else {
+            return;
+        };
+
+        if !player.listeners.contains(&listener_id) {
+            player.listeners.push(listener_id);
+        }
+        player.listeners.clone()
+    };
+
+    sync_heap_listeners(player_id, &listeners, jvm);
+}
+
+fn remove_player_listener(player_id: usize, listener_id: u32, jvm: &JVM) {
+    let listeners = {
+        let mut players = PLAYERS.lock().unwrap();
+        let Some(player) = players.get_mut(&player_id) else {
+            return;
+        };
+
+        player.listeners.retain(|id| *id != listener_id);
+        player.listeners.clone()
+    };
+
+    sync_heap_listeners(player_id, &listeners, jvm);
+}
+
+fn sync_heap_listeners(player_id: usize, listeners: &[u32], jvm: &JVM) {
+    let mut state = jvm.state.lock();
+    if let Some(HeapObject::Instance(obj)) = state.heap.get_mut(player_id) {
+        obj.fields.insert(
+            "listeners:Ljava/util/Vector;".to_string(),
+            JvmStackValue::Vector(
+                listeners
+                    .iter()
+                    .copied()
+                    .map(JvmStackValue::ObjectRef)
+                    .collect(),
+            ),
+        );
+    }
+}
+
+fn player_listeners(player_id: usize) -> Vec<u32> {
+    PLAYERS
+        .lock()
+        .unwrap()
+        .get(&player_id)
+        .map(|player| player.listeners.clone())
+        .unwrap_or_default()
+}
+
+fn notify_player_listeners(jvm: &JVM, player_id: usize, event: &str) {
+    let listeners = player_listeners(player_id);
+    if listeners.is_empty() {
+        return;
+    }
+
+    let listener_classes: Vec<(u32, String)> = {
+        let state = jvm.state.lock();
+        listeners
+            .iter()
+            .filter_map(|listener_id| match state.heap.get(*listener_id as usize) {
+                Some(HeapObject::Instance(listener)) => {
+                    Some((*listener_id, listener.class_name.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    for (listener_id, class_name) in listener_classes {
+        let mut callback_stack = Vec::new();
+        if let Err(err) = JVM::execute_method(
+            JvmStackValue::ObjectRef(listener_id),
+            &class_name,
+            "playerUpdate",
+            "(Ljavax/microedition/media/Player;Ljava/lang/String;Ljava/lang/Object;)V",
+            &[
+                JvmStackValue::ObjectRef(player_id as u32),
+                JvmStackValue::String(event.to_string()),
+                JvmStackValue::Null,
+            ],
+            jvm,
+            &mut callback_stack,
+        ) {
+            eprintln!(
+                "[Media] Player listener {}.playerUpdate({}) failed: {}",
+                class_name, event, err
+            );
+        }
+    }
 }
 
 fn start_player(player_id: usize) -> i32 {
@@ -450,6 +568,7 @@ fn set_heap_state(player_id: usize, state_value: i32, jvm: &JVM) {
 
 fn current_player_state(player_id: usize, jvm: &JVM) -> i32 {
     let mut state_to_sync = None;
+    let mut notify_end_of_media = false;
     let state_value = {
         let mut players = PLAYERS.lock().unwrap();
         let Some(player) = players.get_mut(&player_id) else {
@@ -459,6 +578,7 @@ fn current_player_state(player_id: usize, jvm: &JVM) -> i32 {
         if reap_finished_child(player) {
             player.state = STATE_PREFETCHED;
             state_to_sync = Some(player.state);
+            notify_end_of_media = true;
         }
 
         player.state
@@ -466,6 +586,10 @@ fn current_player_state(player_id: usize, jvm: &JVM) -> i32 {
 
     if let Some(state_value) = state_to_sync {
         set_heap_state(player_id, state_value, jvm);
+    }
+
+    if notify_end_of_media {
+        notify_player_listeners(jvm, player_id, "endOfMedia");
     }
 
     state_value
@@ -658,13 +782,27 @@ fn get_int_arg(args: &[JvmStackValue], index: usize, name: &str) -> Result<i32, 
     }
 }
 
+fn listener_arg(args: &[JvmStackValue], index: usize, name: &str) -> Result<u32, String> {
+    match args.get(index) {
+        Some(JvmStackValue::ObjectRef(id)) => Ok(*id),
+        Some(JvmStackValue::Null) => Err(format!("{}: NullPointerException", name)),
+        value => Err(format!(
+            "{}: expected PlayerListener object, found {:?}",
+            name, value
+        )),
+    }
+}
+
 fn jvm_byte_values_to_bytes(values: &[JvmStackValue], context: &str) -> Result<Vec<u8>, String> {
     values
         .iter()
         .map(|value| match value {
             JvmStackValue::Byte(byte) => Ok(*byte),
             JvmStackValue::Int(int_value) => Ok(*int_value as u8),
-            value => Err(format!("{}: expected byte value, found {:?}", context, value)),
+            value => Err(format!(
+                "{}: expected byte value, found {:?}",
+                context, value
+            )),
         })
         .collect()
 }
