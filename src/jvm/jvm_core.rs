@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -62,9 +63,11 @@ pub enum HeapObject {
 pub struct JvmState {
     pub static_fields: HashMap<String, JvmStackValue>,
     pub heap: Vec<HeapObject>,
-    pub classes: HashMap<String, classfile_parser::ClassFile>,
+    pub classes: HashMap<String, Arc<classfile_parser::ClassFile>>,
     pub resources: HashMap<String, Vec<u8>>,
     pub initialized_classes: HashSet<String>,
+    pub field_resolution_cache: HashMap<String, String>,
+    pub method_resolution_cache: HashMap<String, (String, Arc<classfile_parser::ClassFile>, Arc<Code>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +96,9 @@ pub struct JVM {
 struct PauseControl {
     state: StdMutex<PauseState>,
     wake: Condvar,
+    // Atomic fast-path flags to avoid mutex lock on every bytecode instruction
+    paused_fast: AtomicBool,
+    stopped_fast: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -122,7 +128,7 @@ pub struct ExceptionHandler {
     pub catch_type: u16,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Code {
     #[allow(dead_code)]
     pub max_stack: u16,
@@ -448,6 +454,8 @@ impl JVM {
             classes: HashMap::new(),
             resources: HashMap::new(),
             initialized_classes: HashSet::new(),
+            field_resolution_cache: HashMap::new(),
+            method_resolution_cache: HashMap::new(),
         };
 
         state.static_fields.insert(
@@ -487,6 +495,8 @@ impl JVM {
                     total_paused: Duration::ZERO,
                 }),
                 wake: Condvar::new(),
+                paused_fast: AtomicBool::new(false),
+                stopped_fast: AtomicBool::new(false),
             }),
         }
     }
@@ -499,6 +509,7 @@ impl JVM {
 
         pause_state.paused = true;
         pause_state.pause_started = Some(Instant::now());
+        self.pause_control.paused_fast.store(true, Ordering::Release);
         drop(pause_state);
         player::pause_all();
     }
@@ -513,6 +524,7 @@ impl JVM {
             pause_state.total_paused += started.elapsed();
         }
         pause_state.paused = false;
+        self.pause_control.paused_fast.store(false, Ordering::Release);
         drop(pause_state);
 
         player::resume_all();
@@ -538,7 +550,9 @@ impl JVM {
         }
 
         pause_state.stopped = true;
+        self.pause_control.stopped_fast.store(true, Ordering::Release);
         pause_state.paused = false;
+        self.pause_control.paused_fast.store(false, Ordering::Release);
         if let Some(started) = pause_state.pause_started.take() {
             pause_state.total_paused += started.elapsed();
         }
@@ -550,10 +564,17 @@ impl JVM {
     }
 
     fn is_shutdown(&self) -> bool {
-        self.pause_control.state.lock().unwrap().stopped
+        self.pause_control.stopped_fast.load(Ordering::Acquire)
     }
 
     fn wait_if_paused(&self) -> bool {
+        // Fast path: skip mutex if not paused and not stopped
+        if !self.pause_control.paused_fast.load(Ordering::Acquire)
+            && !self.pause_control.stopped_fast.load(Ordering::Acquire)
+        {
+            return true;
+        }
+
         let mut pause_state = self.pause_control.state.lock().unwrap();
         while pause_state.paused && !pause_state.stopped {
             pause_state = self.pause_control.wake.wait(pause_state).unwrap();
@@ -637,7 +658,7 @@ impl JVM {
                 .clone()
         };
 
-        return self.execute_class(main_class, Some("startApp".into()));
+        return self.execute_class(&main_class, Some("startApp".into()));
     }
 
     pub fn add_class(&self, class: classfile_parser::ClassFile) -> Result<(), String> {
@@ -672,7 +693,7 @@ impl JVM {
         }
 
         let mut state = self.state.lock();
-        state.classes.insert(class_name.clone(), class.clone());
+        state.classes.insert(class_name.clone(), Arc::new(class.clone()));
         for (k, v) in static_entries {
             state.static_fields.insert(k, v);
         }
@@ -687,7 +708,7 @@ impl JVM {
             }
 
             if let Some(class_data) = state.classes.get(class_name) {
-                class_data.clone()
+                Arc::clone(class_data)
             } else if JVM::is_builtin_static_class(class_name) {
                 state.initialized_classes.insert(class_name.to_string());
                 return Ok(());
@@ -734,7 +755,7 @@ impl JVM {
     // but we can pass our own
     pub fn execute_class(
         &self,
-        class: classfile_parser::ClassFile,
+        class: &classfile_parser::ClassFile,
         main_method_name: Option<String>,
     ) -> Result<Option<JvmStackValue>, String> {
         let pool = &class.const_pool;
@@ -840,7 +861,7 @@ impl JVM {
             let opcode = bytecode[pc];
 
             op_count += 1;
-            if op_count % 1000 == 0 {
+            if op_count % 50_000 == 0 {
                 std::thread::yield_now();
             }
 
@@ -2137,18 +2158,19 @@ impl JVM {
                     };
 
                     let field_value = {
-                        let state = jvm.state.lock();
+                        let mut state = jvm.state.lock();
+                        let resolved_field_key = JVM::resolve_instance_field_key(
+                            &mut state,
+                            &field_key,
+                            &legacy_field_name,
+                        );
+                        
                         let obj = state
                             .heap
                             .get(heap_idx)
                             .ok_or_else(|| format!("Invalid heap access at index {}", heap_idx))?;
 
                         if let HeapObject::Instance(obj) = obj {
-                            let resolved_field_key = JVM::resolve_instance_field_key(
-                                &state,
-                                &field_key,
-                                &legacy_field_name,
-                            );
                             obj.fields
                                 .get(&resolved_field_key)
                                 .or_else(|| obj.fields.get(&field_key))
@@ -2191,13 +2213,10 @@ impl JVM {
                         _ => return Err("putfield: objectref is not a reference".into()),
                     };
 
-                    let resolved_field_key = {
-                        let state = jvm.state.lock();
-                        JVM::resolve_instance_field_key(&state, &field_key, &legacy_field_name)
-                    };
-
                     {
                         let mut state = jvm.state.lock();
+                        let resolved_field_key = JVM::resolve_instance_field_key(&mut state, &field_key, &legacy_field_name);
+
                         let obj = state
                             .heap
                             .get_mut(heap_idx)
@@ -3345,12 +3364,19 @@ impl JVM {
     }
 
     fn resolve_instance_field_key(
-        state: &JvmState,
+        state: &mut JvmState,
         field_key: &str,
         legacy_field_name: &str,
     ) -> String {
+        let cache_key = format!("{}|{}", field_key, legacy_field_name);
+        if let Some(cached) = state.field_resolution_cache.get(&cache_key) {
+            return cached.clone();
+        }
+
         let Some((referenced_class_name, _)) = field_key.rsplit_once('.') else {
-            return field_key.to_string();
+            let res = field_key.to_string();
+            state.field_resolution_cache.insert(cache_key, res.clone());
+            return res;
         };
 
         let mut current_class = Some(referenced_class_name.to_string());
@@ -3371,14 +3397,18 @@ impl JVM {
                 let descriptor =
                     JVM::resolve_utf8(field_info.descriptor_index, &class_data.const_pool);
                 if format!("{}:{}", field_name, descriptor) == legacy_field_name {
-                    return format!("{}.{}:{}", class_name, field_name, descriptor);
+                    let res = format!("{}.{}:{}", class_name, field_name, descriptor);
+                    state.field_resolution_cache.insert(cache_key, res.clone());
+                    return res;
                 }
             }
 
             current_class = JVM::get_super_class_name(class_data);
         }
 
-        field_key.to_string()
+        let res = field_key.to_string();
+        state.field_resolution_cache.insert(cache_key, res.clone());
+        res
     }
 
     fn count_arguments(descriptor: &str) -> usize {
@@ -4773,7 +4803,7 @@ impl JVM {
             return Ok(());
         }
 
-        let Some((_resolved_class_name, const_pool, code_attr)) =
+        let Some((_resolved_class_name, class_arc, code_attr)) =
             JVM::find_method_code_in_hierarchy(jvm, class_name, method_name, descriptor)?
         else {
             if matches!(
@@ -4967,7 +4997,7 @@ impl JVM {
 
         let return_value = JVM::run_frame(
             &code_attr.code,
-            &const_pool,
+            &class_arc.const_pool,
             &code_attr.exception_table,
             &mut locals,
             jvm,
@@ -5038,16 +5068,28 @@ impl JVM {
         class_name: &str,
         method_name: &str,
         descriptor: &str,
-    ) -> Result<Option<(String, Vec<ConstantInfo>, Code)>, String> {
-        let mut current_class = Some(class_name.to_string());
-        let state = jvm.state.lock();
+    ) -> Result<Option<(String, Arc<classfile_parser::ClassFile>, Arc<Code>)>, String> {
+        let cache_key = format!("{}|{}|{}", class_name, method_name, descriptor);
+        {
+            let state = jvm.state.lock();
+            if let Some(cached) = state.method_resolution_cache.get(&cache_key) {
+                return Ok(Some(cached.clone()));
+            }
+        }
 
+        let mut current_class = Some(class_name.to_string());
+        
         while let Some(name) = current_class {
-            let Some(class_data) = state.classes.get(&name) else {
+            let class_data_opt = {
+                let state = jvm.state.lock();
+                state.classes.get(&name).map(Arc::clone)
+            };
+
+            let Some(class_data) = class_data_opt else {
                 return Ok(None);
             };
 
-            if let Some(method) = JVM::find_method_in_class(class_data, method_name, descriptor) {
+            if let Some(method) = JVM::find_method_in_class(&class_data, method_name, descriptor) {
                 let code_attr = JVM::get_code_attribute(method, &class_data.const_pool)
                     .ok_or_else(|| {
                         format!(
@@ -5056,10 +5098,13 @@ impl JVM {
                         )
                     })?;
 
-                return Ok(Some((name, class_data.const_pool.clone(), code_attr)));
+                let res = (name, Arc::clone(&class_data), Arc::new(code_attr));
+                let mut state = jvm.state.lock();
+                state.method_resolution_cache.insert(cache_key, res.clone());
+                return Ok(Some(res));
             }
 
-            current_class = JVM::get_super_class_name(class_data);
+            current_class = JVM::get_super_class_name(&class_data);
         }
 
         Ok(None)
@@ -6141,27 +6186,28 @@ impl JVM {
             return Ok(());
         }
 
-        let class_data = {
+        let class_arc = {
             let state = jvm.state.lock();
-            state
-                .classes
-                .get(class_name)
-                .ok_or_else(|| format!("ClassDef not found in VM: {}", class_name))?
-                .clone()
+            Arc::clone(
+                state
+                    .classes
+                    .get(class_name)
+                    .ok_or_else(|| format!("ClassDef not found in VM: {}", class_name))?,
+            )
         };
 
-        let mut current_class_data = class_data.clone();
+        let mut current_class_arc = class_arc;
         let mut method_opt =
-            JVM::find_method_in_class(&current_class_data, method_name, descriptor).cloned();
+            JVM::find_method_in_class(&current_class_arc, method_name, descriptor).cloned();
 
         while method_opt.is_none() {
-            let super_name = JVM::get_super_class_name(&current_class_data);
+            let super_name = JVM::get_super_class_name(&current_class_arc);
             if let Some(s_name) = super_name {
                 let state = jvm.state.lock();
                 if let Some(s_data) = state.classes.get(&s_name) {
-                    current_class_data = s_data.clone();
+                    current_class_arc = Arc::clone(s_data);
                     method_opt =
-                        JVM::find_method_in_class(&current_class_data, method_name, descriptor)
+                        JVM::find_method_in_class(&current_class_arc, method_name, descriptor)
                             .cloned();
                     continue;
                 }
@@ -6176,7 +6222,7 @@ impl JVM {
             )
         })?;
 
-        let code_attr = JVM::get_code_attribute(&method, &current_class_data.const_pool)
+        let code_attr = JVM::get_code_attribute(&method, &current_class_arc.const_pool)
             .ok_or_else(|| {
                 "Static method has no Code attribute (is it abstract or native?)".to_string()
             })?;
@@ -6201,7 +6247,7 @@ impl JVM {
 
         let return_value = JVM::run_frame(
             &code_attr.code,
-            &current_class_data.const_pool,
+            &current_class_arc.const_pool,
             &code_attr.exception_table,
             &mut locals,
             jvm,

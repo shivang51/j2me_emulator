@@ -1,7 +1,7 @@
 use crate::{
     app::DRAW_STATE,
     jvm::{
-        javax::lcdui::image::{clone_image_buffer, get_or_create_buffer},
+        javax::lcdui::image::get_or_create_buffer,
         jvm_core::{HeapObject, JVM, JvmStackValue},
     },
     profile::Profile,
@@ -682,12 +682,16 @@ fn draw_region(
     anchor: i32,
     jvm: &JVM,
 ) {
-    let (img_w, img_h, img_pixels) = match clone_image_buffer(img_ref, jvm) {
-        Some(buffer) => (buffer.width, buffer.height, buffer.pixels),
+    let img_buffer = match get_or_create_buffer(img_ref, jvm) {
+        Some(buf) => buf,
         None => {
             panic!("draw_region: failed to load image resource");
         }
     };
+    let img_guard = img_buffer.lock().unwrap();
+    let img_w = img_guard.width;
+    let img_h = img_guard.height;
+    let img_pixels = &img_guard.pixels;
 
     let (dest_w, dest_h) = match transform {
         4 | 5 | 6 | 7 => (height, width),

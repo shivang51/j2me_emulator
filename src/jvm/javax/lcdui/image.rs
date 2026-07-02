@@ -192,11 +192,6 @@ pub fn get_or_create_buffer(img_ref: &JvmStackValue, jvm: &JVM) -> Option<Shared
     Some(buffer)
 }
 
-pub fn clone_image_buffer(img_ref: &JvmStackValue, jvm: &JVM) -> Option<ImageBufferData> {
-    let buffer = get_or_create_buffer(img_ref, jvm)?;
-    let buffer = buffer.lock().unwrap();
-    Some(buffer.clone())
-}
 
 fn get_int_field(image: &HeapObject, keys: &[&str]) -> Result<JvmStackValue, String> {
     let HeapObject::Instance(obj) = image else {
