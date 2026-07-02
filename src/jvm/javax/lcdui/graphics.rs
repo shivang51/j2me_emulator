@@ -70,7 +70,15 @@ pub fn handle_virtual_method(
             let width = get_int_arg(args, 2)?;
             let height = get_int_arg(args, 3)?;
             let color = get_color(objectref, jvm);
-            fill_rect(objectref, jvm, x, y, width, height, color);
+            fill_rect(
+                objectref,
+                jvm,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                width,
+                height,
+                color,
+            );
             Ok(None)
         }
         ("drawRect", "(IIII)V") => {
@@ -81,7 +89,16 @@ pub fn handle_virtual_method(
             let height = get_int_arg(args, 3)?;
             let color = get_color(objectref, jvm);
             let style = get_int_field(objectref, jvm, "strokeStyle", 0);
-            draw_rect(objectref, jvm, x, y, width, height, color, style == 1);
+            draw_rect(
+                objectref,
+                jvm,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                width,
+                height,
+                color,
+                style == 1,
+            );
             Ok(None)
         }
         ("drawLine", "(IIII)V") => {
@@ -92,7 +109,16 @@ pub fn handle_virtual_method(
             let y2 = get_int_arg(args, 3)?;
             let color = get_color(objectref, jvm);
             let style = get_int_field(objectref, jvm, "strokeStyle", 0);
-            draw_line(objectref, jvm, x1, y1, x2, y2, color, style == 1);
+            draw_line(
+                objectref,
+                jvm,
+                x1 + get_translate_x(objectref, jvm),
+                y1 + get_translate_y(objectref, jvm),
+                x2 + get_translate_x(objectref, jvm),
+                y2 + get_translate_y(objectref, jvm),
+                color,
+                style == 1,
+            );
             Ok(None)
         }
         ("drawRegion", "(Ljavax/microedition/lcdui/Image;IIIIIIII)V") => {
@@ -108,7 +134,16 @@ pub fn handle_virtual_method(
             let anchor = get_int_arg(args, 8)?;
 
             draw_region(
-                objectref, img_ref, x_src, y_src, width, height, transform, x_dest, y_dest, anchor,
+                objectref,
+                img_ref,
+                x_src,
+                y_src,
+                width,
+                height,
+                transform,
+                x_dest + get_translate_x(objectref, jvm),
+                y_dest + get_translate_y(objectref, jvm),
+                anchor,
                 jvm,
             );
             Ok(None)
@@ -121,7 +156,19 @@ pub fn handle_virtual_method(
             let anchor = get_int_arg(args, 3)?;
 
             let (w, h) = get_image_dim(img_ref, jvm);
-            draw_region(objectref, img_ref, 0, 0, w, h, 0, x, y, anchor, jvm);
+            draw_region(
+                objectref,
+                img_ref,
+                0,
+                0,
+                w,
+                h,
+                0,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                anchor,
+                jvm,
+            );
             Ok(None)
         }
         ("fillTriangle", "(IIIIII)V") => {
@@ -133,7 +180,17 @@ pub fn handle_virtual_method(
             let x3 = get_int_arg(args, 4)?;
             let y3 = get_int_arg(args, 5)?;
             let color = get_color(objectref, jvm);
-            fill_triangle(objectref, jvm, x1, y1, x2, y2, x3, y3, color);
+            fill_triangle(
+                objectref,
+                jvm,
+                x1 + get_translate_x(objectref, jvm),
+                y1 + get_translate_y(objectref, jvm),
+                x2 + get_translate_x(objectref, jvm),
+                y2 + get_translate_y(objectref, jvm),
+                x3 + get_translate_x(objectref, jvm),
+                y3 + get_translate_y(objectref, jvm),
+                color,
+            );
             Ok(None)
         }
         ("drawArc", "(IIIIII)V") => {
@@ -149,8 +206,8 @@ pub fn handle_virtual_method(
             draw_arc(
                 objectref,
                 jvm,
-                x,
-                y,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
                 width,
                 height,
                 start_angle,
@@ -161,13 +218,65 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("drawString", "(Ljava/lang/String;III)V") => todo!("Graphics.drawString"),
+        ("drawRGB", "([IIIIIIIZ)V") => {
+            Profile::this("drawRGB([IIIIIIIZ)V");
+            let rgb_ref = args.get(0).ok_or("drawRGB: missing rgbData")?;
+            let offset = get_int_arg(args, 1)?;
+            let scanline = get_int_arg(args, 2)?;
+            let x = get_int_arg(args, 3)?;
+            let y = get_int_arg(args, 4)?;
+            let width = get_int_arg(args, 5)?;
+            let height = get_int_arg(args, 6)?;
+            let process_alpha = match args.get(7) {
+                Some(JvmStackValue::Int(value)) => *value != 0,
+                Some(value) => {
+                    return Err(format!(
+                        "Graphics.drawRGB: expected boolean int argument, found {:?}",
+                        value
+                    ));
+                }
+                None => return Err("Graphics.drawRGB: missing processAlpha argument".into()),
+            };
+
+            let rgb_values = read_rgb_int_array(rgb_ref, jvm)?;
+            validate_draw_rgb_bounds(offset, scanline, width, height, rgb_values.len())?;
+
+            draw_rgb(
+                objectref,
+                jvm,
+                &rgb_values,
+                offset,
+                scanline,
+                x + get_translate_x(objectref, jvm),
+                y + get_translate_y(objectref, jvm),
+                width,
+                height,
+                process_alpha,
+            );
+
+            Ok(None)
+        }
         ("drawSubstring", "(Ljava/lang/String;IIIII)V") => todo!("Graphics.drawSubstring"),
         ("setFont", "(Ljavax/microedition/lcdui/Font;)V") => todo!("Graphics.setFont"),
         ("setClip", "(IIII)V") => todo!("Graphics.setClip"),
         ("clipRect", "(IIII)V") => todo!("Graphics.clipRect"),
-        ("translate", "(II)V") => todo!("Graphics.translate"),
-        ("getClipX", "()I") => todo!("Graphics.getClipX"),
-        ("getClipY", "()I") => todo!("Graphics.getClipY"),
+        ("translate", "(II)V") => {
+            let x = get_int_arg(args, 0)?;
+            let y = get_int_arg(args, 1)?;
+            let translate_x = get_translate_x(objectref, jvm);
+            let translate_y = get_translate_y(objectref, jvm);
+            set_int_field(objectref, jvm, "translateX", translate_x + x);
+            set_int_field(objectref, jvm, "translateY", translate_y + y);
+            Ok(None)
+        }
+        ("getClipX", "()I") => Ok(Some(JvmStackValue::Int(0))),
+        ("getClipY", "()I") => Ok(Some(JvmStackValue::Int(0))),
+        ("getTranslateX", "()I") => {
+            Ok(Some(JvmStackValue::Int(get_translate_x(objectref, jvm))))
+        }
+        ("getTranslateY", "()I") => {
+            Ok(Some(JvmStackValue::Int(get_translate_y(objectref, jvm))))
+        }
         ("getClipWidth", "()I") => {
             let draw_state = DRAW_STATE.lock();
             Ok(Some(JvmStackValue::Int(draw_state.width as i32)))
@@ -300,6 +409,155 @@ fn get_image_dim(img_ref: &JvmStackValue, jvm: &JVM) -> (i32, i32) {
 
 fn set_color_field(objectref: &JvmStackValue, jvm: &JVM, color: i32) {
     set_int_field(objectref, jvm, "color", color);
+}
+
+fn get_translate_x(objectref: &JvmStackValue, jvm: &JVM) -> i32 {
+    get_int_field(objectref, jvm, "translateX", 0)
+}
+
+fn get_translate_y(objectref: &JvmStackValue, jvm: &JVM) -> i32 {
+    get_int_field(objectref, jvm, "translateY", 0)
+}
+
+fn read_rgb_int_array(rgb_ref: &JvmStackValue, jvm: &JVM) -> Result<Vec<i32>, String> {
+    let rgb_id = match rgb_ref {
+        JvmStackValue::ObjectRef(id) => *id as usize,
+        JvmStackValue::Null => return Err("Graphics.drawRGB: rgbData is null".into()),
+        value => {
+            return Err(format!(
+                "Graphics.drawRGB: expected int[] reference, found {:?}",
+                value
+            ));
+        }
+    };
+
+    let state = jvm.state.lock();
+    match state.heap.get(rgb_id) {
+        Some(HeapObject::Array { element_type, data }) => {
+            if element_type != "primitive_10" {
+                return Err(format!(
+                    "Graphics.drawRGB: expected int array, found array of type {}",
+                    element_type
+                ));
+            }
+
+            data.iter()
+                .map(|value| match value {
+                    JvmStackValue::Int(argb) => Ok(*argb),
+                    value => Err(format!(
+                        "Graphics.drawRGB: expected int pixel, found {:?}",
+                        value
+                    )),
+                })
+                .collect()
+        }
+        Some(_) => Err("Graphics.drawRGB: rgbData is not an array".into()),
+        None => Err(format!(
+            "Graphics.drawRGB: invalid rgb array reference {}",
+            rgb_id
+        )),
+    }
+}
+
+fn validate_draw_rgb_bounds(
+    offset: i32,
+    scanline: i32,
+    width: i32,
+    height: i32,
+    len: usize,
+) -> Result<(), String> {
+    let len = len as i64;
+
+    for row in 0..height {
+        let row_start = offset as i64 + row as i64 * scanline as i64;
+        for col in 0..width {
+            let index = row_start + col as i64;
+            if index < 0 || index >= len {
+                return Err(format!(
+                    "java.lang.ArrayIndexOutOfBoundsException: rgbData index {} out of bounds for length {}",
+                    index,
+                    len
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn draw_rgb(
+    objectref: &JvmStackValue,
+    jvm: &JVM,
+    rgb_values: &[i32],
+    offset: i32,
+    scanline: i32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    process_alpha: bool,
+) {
+    let _ = with_draw_target(objectref, jvm, |frame, dw, dh| {
+        let mut row_start = offset as i64;
+
+        for row in 0..height {
+            let dest_y = y + row;
+            if dest_y < 0 || dest_y >= dh {
+                row_start += scanline as i64;
+                continue;
+            }
+
+            let mut src_index = row_start;
+            for col in 0..width {
+                let dest_x = x + col;
+                if dest_x < 0 || dest_x >= dw {
+                    src_index += 1;
+                    continue;
+                }
+
+                let rgb_index = src_index as usize;
+                if let Some(argb) = rgb_values.get(rgb_index) {
+                    let alpha = if process_alpha {
+                        ((argb >> 24) & 0xFF) as u8
+                    } else {
+                        0xFF
+                    };
+
+                    if alpha != 0 {
+                        let offset = ((dest_y * dw + dest_x) * 4) as usize;
+                        if offset + 4 <= frame.len() {
+                            let src = [
+                                ((argb >> 16) & 0xFF) as u8,
+                                ((argb >> 8) & 0xFF) as u8,
+                                (argb & 0xFF) as u8,
+                                0xFF,
+                            ];
+
+                            if alpha == 255 {
+                                frame[offset..offset + 4].copy_from_slice(&src);
+                            } else {
+                                let alpha_u32 = alpha as u32;
+                                let inv_alpha = 255 - alpha_u32;
+
+                                for channel in 0..3 {
+                                    let src_c = src[channel] as u32;
+                                    let dest_c = frame[offset + channel] as u32;
+                                    frame[offset + channel] =
+                                        ((src_c * alpha_u32 + dest_c * inv_alpha) / 255) as u8;
+                                }
+
+                                frame[offset + 3] = 255;
+                            }
+                        }
+                    }
+                }
+
+                src_index += 1;
+            }
+
+            row_start += scanline as i64;
+        }
+    });
 }
 
 fn fill_rect(
