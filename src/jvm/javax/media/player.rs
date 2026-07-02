@@ -274,11 +274,22 @@ fn create_player_from_stream(
             _ => None,
         };
 
-        let data = locator
-            .as_ref()
-            .and_then(|path| state.resources.get(path))
-            .cloned()
-            .unwrap_or_default();
+        let data = match stream.fields.get("jvm_data") {
+            Some(JvmStackValue::Vector(values)) => {
+                jvm_byte_values_to_bytes(values, "Manager.createPlayer stream jvm_data")?
+            }
+            Some(value) => {
+                return Err(format!(
+                    "Manager.createPlayer: invalid stream jvm_data field {:?}",
+                    value
+                ));
+            }
+            None => locator
+                .as_ref()
+                .and_then(|path| state.resources.get(path))
+                .cloned()
+                .unwrap_or_default(),
+        };
 
         (locator, data)
     };
@@ -645,6 +656,17 @@ fn get_int_arg(args: &[JvmStackValue], index: usize, name: &str) -> Result<i32, 
         Some(JvmStackValue::Int(value)) => Ok(*value),
         value => Err(format!("{}: expected int, found {:?}", name, value)),
     }
+}
+
+fn jvm_byte_values_to_bytes(values: &[JvmStackValue], context: &str) -> Result<Vec<u8>, String> {
+    values
+        .iter()
+        .map(|value| match value {
+            JvmStackValue::Byte(byte) => Ok(*byte),
+            JvmStackValue::Int(int_value) => Ok(*int_value as u8),
+            value => Err(format!("{}: expected byte value, found {:?}", context, value)),
+        })
+        .collect()
 }
 
 fn object_id(value: &JvmStackValue, class_name: &str) -> Result<usize, String> {
