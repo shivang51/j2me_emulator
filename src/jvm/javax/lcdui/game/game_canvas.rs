@@ -24,6 +24,8 @@ const BUFFER_IMAGE_FIELD: &str =
     "javax/microedition/lcdui/game/GameCanvas.bufferImage:Ljavax/microedition/lcdui/Image;";
 const BUFFER_GRAPHICS_FIELD: &str =
     "javax/microedition/lcdui/game/GameCanvas.bufferGraphics:Ljavax/microedition/lcdui/Graphics;";
+const USES_FLUSH_GRAPHICS_FIELD: &str =
+    "javax/microedition/lcdui/game/GameCanvas.jvmUsesFlushGraphics:Z";
 
 pub fn canvas_size() -> (i32, i32) {
     (
@@ -195,6 +197,21 @@ fn set_object_field(
     Ok(())
 }
 
+pub fn uses_flush_graphics(jvm: &JVM, object_id: u32) -> Result<bool, String> {
+    let state = jvm.state.lock();
+    let Some(HeapObject::Instance(object)) = state.heap.get(object_id as usize) else {
+        return Err(format!(
+            "GameCanvas method call on non-instance object ref {}",
+            object_id
+        ));
+    };
+
+    Ok(matches!(
+        object.fields.get(USES_FLUSH_GRAPHICS_FIELD),
+        Some(JvmStackValue::Int(value)) if *value != 0
+    ))
+}
+
 fn set_object_field_with_state(
     state: &mut crate::jvm::jvm_core::JvmState,
     object_id: u32,
@@ -355,6 +372,12 @@ fn paint_buffer_to_graphics(
 }
 
 fn flush_buffer(object_id: u32, jvm: &JVM) -> Result<Option<JvmStackValue>, String> {
+    set_object_field(
+        jvm,
+        object_id,
+        USES_FLUSH_GRAPHICS_FIELD,
+        JvmStackValue::Int(1),
+    )?;
     let graphics_ref = JvmStackValue::ObjectRef(get_screen_graphics_handle(jvm));
     paint_buffer_to_graphics(object_id, &graphics_ref, jvm)
 }
@@ -368,6 +391,12 @@ fn flush_buffer_region(
     let y = get_int_arg(args, 1, "GameCanvas.flushGraphics")?;
     let width = get_int_arg(args, 2, "GameCanvas.flushGraphics")?;
     let height = get_int_arg(args, 3, "GameCanvas.flushGraphics")?;
+    set_object_field(
+        jvm,
+        object_id,
+        USES_FLUSH_GRAPHICS_FIELD,
+        JvmStackValue::Int(1),
+    )?;
     let image_handle = ensure_buffer_image(object_id, jvm)?;
     let graphics_ref = JvmStackValue::ObjectRef(get_screen_graphics_handle(jvm));
 
@@ -417,6 +446,12 @@ pub fn handle_virtual_method(
     match (method_name, descriptor) {
         ("<init>", "()V") => {
             set_object_field(jvm, object_id, "suppressKeyEvents:Z", JvmStackValue::Int(0))?;
+            set_object_field(
+                jvm,
+                object_id,
+                USES_FLUSH_GRAPHICS_FIELD,
+                JvmStackValue::Int(0),
+            )?;
             Ok(None)
         }
         ("<init>", "(Z)V") => {
@@ -426,6 +461,12 @@ pub fn handle_virtual_method(
                     object_id,
                     "suppressKeyEvents:Z",
                     JvmStackValue::Int(*suppress_key_evts),
+                )?;
+                set_object_field(
+                    jvm,
+                    object_id,
+                    USES_FLUSH_GRAPHICS_FIELD,
+                    JvmStackValue::Int(0),
                 )?;
                 return Ok(None);
             } else {

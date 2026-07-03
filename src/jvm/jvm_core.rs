@@ -7321,10 +7321,14 @@ impl JVM {
 
         player::poll_finished(self);
 
-        // Active-rendered GameCanvas screens present completed frames via flushGraphics().
-        // Auto-blitting here can expose the off-screen buffer while the game is still drawing it.
-        if self.current_displayable_extends(game_canvas::CLASS_NAME)? {
-            return Ok(());
+        if let Some((displayable_id, class_name)) = self.current_displayable_object()? {
+            // Active-rendered GameCanvas screens present completed frames via flushGraphics().
+            // Repaint-driven GameCanvas screens still need paint(Graphics) calls.
+            if JVM::class_extends(self, &class_name, game_canvas::CLASS_NAME)
+                && game_canvas::uses_flush_graphics(self, displayable_id)?
+            {
+                return Ok(());
+            }
         }
 
         static IS_PAINTING: std::sync::atomic::AtomicBool =
@@ -7338,16 +7342,16 @@ impl JVM {
         res
     }
 
-    fn current_displayable_extends(&self, target_class_name: &str) -> Result<bool, String> {
+    fn current_displayable_object(&self) -> Result<Option<(u32, String)>, String> {
         let disp = crate::jvm::javax::lcdui::display::get_display_safe(self)?;
         let Some(displayable_ref) =
             crate::jvm::javax::lcdui::display::get_displayable_obj_safe(disp, self)?
         else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let JvmStackValue::ObjectRef(displayable_id) = displayable_ref else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let class_name = {
@@ -7359,7 +7363,7 @@ impl JVM {
             }
         };
 
-        Ok(JVM::class_extends(self, &class_name, target_class_name))
+        Ok(Some((displayable_id, class_name)))
     }
 
     pub fn handle_key_event(&self, keycode: i32, is_pressed: bool) -> Result<(), String> {
