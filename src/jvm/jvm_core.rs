@@ -39,6 +39,7 @@ pub enum JvmStackValue {
     Long(i64),
     Double(f64),
     ObjectRef(u32),
+    ReturnAddress(usize),
     String(String),             // Or a pointer to a Heap-allocated string
     Vector(Vec<JvmStackValue>), // For array representations
     Null,
@@ -221,6 +222,96 @@ mod tests {
         .expect("missing resource should return null, not fail");
 
         assert_eq!(missing, Some(JvmStackValue::Null));
+    }
+
+    #[test]
+    fn wide_iinc_and_load_use_16_bit_local_index() {
+        let jvm = JVM::new();
+        let mut locals = vec![JvmStackValue::Null; 301];
+        locals[300] = JvmStackValue::Int(7);
+
+        let result = JVM::run_frame(
+            &[
+                0xC4, 0x84, 0x01, 0x2C, 0x03, 0xE8, // wide iinc 300 by 1000
+                0xC4, 0x15, 0x01, 0x2C, // wide iload 300
+                0xAC, // ireturn
+            ],
+            &[],
+            &[],
+            &mut locals,
+            &jvm,
+        )
+        .expect("wide iinc frame should run");
+
+        assert_eq!(result, Some(JvmStackValue::Int(1007)));
+    }
+
+    #[test]
+    fn wide_store_can_address_16_bit_local_index() {
+        let jvm = JVM::new();
+        let mut locals = Vec::new();
+
+        let result = JVM::run_frame(
+            &[
+                0x10, 0x2A, // bipush 42
+                0xC4, 0x36, 0x01, 0x2C, // wide istore 300
+                0xC4, 0x15, 0x01, 0x2C, // wide iload 300
+                0xAC, // ireturn
+            ],
+            &[],
+            &[],
+            &mut locals,
+            &jvm,
+        )
+        .expect("wide store frame should run");
+
+        assert_eq!(result, Some(JvmStackValue::Int(42)));
+    }
+
+    #[test]
+    fn jsr_and_ret_use_return_address_locals() {
+        let jvm = JVM::new();
+        let mut locals = vec![JvmStackValue::Null; 2];
+
+        let result = JVM::run_frame(
+            &[
+                0xA8, 0x00, 0x06, // jsr 6
+                0x08, // iconst_5
+                0xAC, // ireturn
+                0x03, // unreachable iconst_0
+                0x4C, // astore_1
+                0xA9, 0x01, // ret 1
+            ],
+            &[],
+            &[],
+            &mut locals,
+            &jvm,
+        )
+        .expect("jsr/ret frame should run");
+
+        assert_eq!(result, Some(JvmStackValue::Int(5)));
+    }
+
+    #[test]
+    fn wide_ret_uses_16_bit_local_index() {
+        let jvm = JVM::new();
+        let mut locals = vec![JvmStackValue::Null; 301];
+        locals[300] = JvmStackValue::ReturnAddress(4);
+
+        let result = JVM::run_frame(
+            &[
+                0xC4, 0xA9, 0x01, 0x2C, // wide ret 300
+                0x06, // iconst_3
+                0xAC, // ireturn
+            ],
+            &[],
+            &[],
+            &mut locals,
+            &jvm,
+        )
+        .expect("wide ret frame should run");
+
+        assert_eq!(result, Some(JvmStackValue::Int(3)));
     }
 }
 
@@ -2271,6 +2362,35 @@ impl JVM {
                         (((bytecode[pc + 1] as i16) << 8) | (bytecode[pc + 2] as i16)) as i32;
                     pc = (pc as i32 + offset) as usize;
                 }
+                0xA8 => {
+                    // jsr
+                    if pc + 2 >= bytecode.len() {
+                        return Err("jsr: bytecode truncated".into());
+                    }
+                    let offset = i16::from_be_bytes([bytecode[pc + 1], bytecode[pc + 2]]) as i32;
+                    stack.push(JvmStackValue::ReturnAddress(pc + 3));
+                    pc = (pc as i32 + offset) as usize;
+                    continue;
+                }
+                0xA9 => {
+                    // ret
+                    if pc + 1 >= bytecode.len() {
+                        return Err("ret: bytecode truncated".into());
+                    }
+                    let index = bytecode[pc + 1] as usize;
+                    let target = match locals.get(index) {
+                        Some(JvmStackValue::ReturnAddress(target)) => *target,
+                        Some(value) => {
+                            return Err(format!(
+                                "ret: expected ReturnAddress in local {}, found {:?}",
+                                index, value
+                            ));
+                        }
+                        None => return Err(format!("ret: invalid local index {}", index)),
+                    };
+                    pc = target;
+                    continue;
+                }
                 0xB0 => {
                     // areturn
                     let return_val = stack.pop().ok_or("areturn: Stack underflow")?;
@@ -3561,6 +3681,117 @@ impl JVM {
                     }
                     locals[index] = val;
                     pc += 2;
+                }
+                0xC4 => {
+                    // wide
+                    if pc + 3 >= bytecode.len() {
+                        return Err("wide: bytecode truncated".into());
+                    }
+
+                    let modified_opcode = bytecode[pc + 1];
+                    let index = u16::from_be_bytes([bytecode[pc + 2], bytecode[pc + 3]]) as usize;
+
+                    match modified_opcode {
+                        0x15 | 0x17 | 0x19 => {
+                            // wide iload, fload, aload
+                            let value = locals.get(index).cloned().ok_or_else(|| {
+                                format!("wide load: invalid local index {}", index)
+                            })?;
+                            stack.push(value);
+                            pc += 4;
+                        }
+                        0x16 | 0x18 => {
+                            // wide lload, dload
+                            if index + 1 >= locals.len() {
+                                return Err(format!(
+                                    "wide load: invalid category 2 local index {}",
+                                    index
+                                ));
+                            }
+                            stack.push(locals[index].clone());
+                            pc += 4;
+                        }
+                        0x36 | 0x38 | 0x3A => {
+                            // wide istore, fstore, astore
+                            let value = stack.pop().ok_or("wide store: stack underflow")?;
+                            if locals.len() <= index {
+                                locals.resize(index + 1, JvmStackValue::Null);
+                            }
+                            locals[index] = value;
+                            pc += 4;
+                        }
+                        0x37 | 0x39 => {
+                            // wide lstore, dstore
+                            let value = stack.pop().ok_or("wide store: stack underflow")?;
+                            if locals.len() <= index + 1 {
+                                locals.resize(index + 2, JvmStackValue::Null);
+                            }
+                            locals[index] = value;
+                            pc += 4;
+                        }
+                        0x84 => {
+                            // wide iinc
+                            if pc + 5 >= bytecode.len() {
+                                return Err("wide iinc: bytecode truncated".into());
+                            }
+                            let constant =
+                                i16::from_be_bytes([bytecode[pc + 4], bytecode[pc + 5]]) as i32;
+
+                            if index >= locals.len() {
+                                return Err(format!("wide iinc: invalid local index {}", index));
+                            }
+
+                            match &mut locals[index] {
+                                JvmStackValue::Int(value) => *value += constant,
+                                value => {
+                                    return Err(format!(
+                                        "wide iinc: expected Int in local {}, found {:?}",
+                                        index, value
+                                    ));
+                                }
+                            }
+
+                            pc += 6;
+                        }
+                        0xA9 => {
+                            // wide ret
+                            let target = match locals.get(index) {
+                                Some(JvmStackValue::ReturnAddress(target)) => *target,
+                                Some(value) => {
+                                    return Err(format!(
+                                        "wide ret: expected ReturnAddress in local {}, found {:?}",
+                                        index, value
+                                    ));
+                                }
+                                None => {
+                                    return Err(format!("wide ret: invalid local index {}", index));
+                                }
+                            };
+                            pc = target;
+                            continue;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "wide: unsupported modified opcode 0x{:02X}",
+                                modified_opcode
+                            ));
+                        }
+                    }
+                }
+                0xC9 => {
+                    // jsr_w
+                    if pc + 4 >= bytecode.len() {
+                        return Err("jsr_w: bytecode truncated".into());
+                    }
+                    let offset = i32::from_be_bytes([
+                        bytecode[pc + 1],
+                        bytecode[pc + 2],
+                        bytecode[pc + 3],
+                        bytecode[pc + 4],
+                    ]);
+                    stack.push(JvmStackValue::ReturnAddress(pc + 5));
+                    pc = (pc as i32 + offset) as usize;
+                    continue;
                 }
                 _ => {
                     println!("Unknown Opcode: {:02X}", opcode);
