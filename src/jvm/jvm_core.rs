@@ -7233,6 +7233,12 @@ impl JVM {
             return Ok(());
         }
 
+        // Active-rendered GameCanvas screens present completed frames via flushGraphics().
+        // Auto-blitting here can expose the off-screen buffer while the game is still drawing it.
+        if self.current_displayable_extends(game_canvas::CLASS_NAME)? {
+            return Ok(());
+        }
+
         static IS_PAINTING: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if IS_PAINTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -7242,6 +7248,30 @@ impl JVM {
         let res = game_canvas::paint(&self);
         IS_PAINTING.store(false, std::sync::atomic::Ordering::SeqCst);
         res
+    }
+
+    fn current_displayable_extends(&self, target_class_name: &str) -> Result<bool, String> {
+        let disp = crate::jvm::javax::lcdui::display::get_display_safe(self)?;
+        let Some(displayable_ref) =
+            crate::jvm::javax::lcdui::display::get_displayable_obj_safe(disp, self)?
+        else {
+            return Ok(false);
+        };
+
+        let JvmStackValue::ObjectRef(displayable_id) = displayable_ref else {
+            return Ok(false);
+        };
+
+        let class_name = {
+            let state = self.state.lock();
+            match state.heap.get(displayable_id as usize) {
+                Some(HeapObject::Instance(inst)) => inst.class_name.clone(),
+                Some(_) => return Err("Displayable is not an instance".into()),
+                None => return Err("Displayable heap reference is invalid".into()),
+            }
+        };
+
+        Ok(JVM::class_extends(self, &class_name, target_class_name))
     }
 
     pub fn handle_key_event(&self, keycode: i32, is_pressed: bool) -> Result<(), String> {
