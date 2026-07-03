@@ -66,7 +66,55 @@ pub enum MidpKey {
     Pound,
 }
 
+const MIDP_KEY_DISPLAY_ORDER: &[MidpKey] = &[
+    MidpKey::ArrowUp,
+    MidpKey::ArrowDown,
+    MidpKey::ArrowLeft,
+    MidpKey::ArrowRight,
+    MidpKey::Fire,
+    MidpKey::SoftLeft,
+    MidpKey::SoftRight,
+    MidpKey::Clear,
+    MidpKey::Num0,
+    MidpKey::Num1,
+    MidpKey::Num2,
+    MidpKey::Num3,
+    MidpKey::Num4,
+    MidpKey::Num5,
+    MidpKey::Num6,
+    MidpKey::Num7,
+    MidpKey::Num8,
+    MidpKey::Num9,
+    MidpKey::Star,
+    MidpKey::Pound,
+];
+
 impl MidpKey {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ArrowUp => "Up",
+            Self::ArrowDown => "Down",
+            Self::ArrowLeft => "Left",
+            Self::ArrowRight => "Right",
+            Self::Fire => "Fire",
+            Self::SoftLeft => "Soft Left",
+            Self::SoftRight => "Soft Right",
+            Self::Clear => "Clear",
+            Self::Num0 => "0",
+            Self::Num1 => "1",
+            Self::Num2 => "2",
+            Self::Num3 => "3",
+            Self::Num4 => "4",
+            Self::Num5 => "5",
+            Self::Num6 => "6",
+            Self::Num7 => "7",
+            Self::Num8 => "8",
+            Self::Num9 => "9",
+            Self::Star => "*",
+            Self::Pound => "#",
+        }
+    }
+
     pub const fn keycode(self) -> MidpKeyCode {
         match self {
             Self::ArrowUp => MidpKeyCode::from_raw(raw_midp_keycode::ARROW_UP),
@@ -228,6 +276,11 @@ pub struct KeyBindings {
     characters: HashMap<char, MidpKey>,
 }
 
+pub struct KeyBindingDisplay {
+    pub midp_key: MidpKey,
+    pub host_keys: Vec<String>,
+}
+
 impl KeyBindings {
     pub fn new() -> Self {
         Self {
@@ -265,6 +318,33 @@ impl KeyBindings {
             .or_else(|| self.physical_keys.get(&physical_key).copied())
     }
 
+    pub fn display_rows(&self) -> Vec<KeyBindingDisplay> {
+        MIDP_KEY_DISPLAY_ORDER
+            .iter()
+            .copied()
+            .filter_map(|midp_key| {
+                let mut host_keys = Vec::new();
+
+                for (host_key, mapped_key) in &self.physical_keys {
+                    if *mapped_key == midp_key {
+                        push_unique_sorted(&mut host_keys, host_key_label(*host_key));
+                    }
+                }
+
+                for (character, mapped_key) in &self.characters {
+                    if *mapped_key == midp_key {
+                        push_unique_sorted(&mut host_keys, character_label(*character));
+                    }
+                }
+
+                (!host_keys.is_empty()).then_some(KeyBindingDisplay {
+                    midp_key,
+                    host_keys,
+                })
+            })
+            .collect()
+    }
+
     fn bind_physical_keys(&mut self, host_keys: &[KeyCode], midp_key: MidpKey) {
         for host_key in host_keys {
             self.bind_physical_key(*host_key, midp_key);
@@ -283,6 +363,61 @@ impl KeyBindings {
         }
 
         self.characters.get(&character).copied()
+    }
+}
+
+fn push_unique_sorted(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+        values.sort();
+    }
+}
+
+fn character_label(character: char) -> String {
+    character.to_string()
+}
+
+fn host_key_label(host_key: KeyCode) -> String {
+    match host_key {
+        KeyCode::ArrowUp => "Arrow Up".to_string(),
+        KeyCode::ArrowDown => "Arrow Down".to_string(),
+        KeyCode::ArrowLeft => "Arrow Left".to_string(),
+        KeyCode::ArrowRight => "Arrow Right".to_string(),
+        KeyCode::Space => "Space".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::NumpadEnter => "Numpad Enter".to_string(),
+        KeyCode::Escape => "Esc".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::KeyA => "A".to_string(),
+        KeyCode::KeyD => "D".to_string(),
+        KeyCode::KeyE => "E".to_string(),
+        KeyCode::KeyF => "F".to_string(),
+        KeyCode::KeyQ => "Q".to_string(),
+        KeyCode::KeyS => "S".to_string(),
+        KeyCode::Digit0 => "0".to_string(),
+        KeyCode::Digit1 => "1".to_string(),
+        KeyCode::Digit2 => "2".to_string(),
+        KeyCode::Digit3 => "3".to_string(),
+        KeyCode::Digit4 => "4".to_string(),
+        KeyCode::Digit5 => "5".to_string(),
+        KeyCode::Digit6 => "6".to_string(),
+        KeyCode::Digit7 => "7".to_string(),
+        KeyCode::Digit8 => "8".to_string(),
+        KeyCode::Digit9 => "9".to_string(),
+        KeyCode::Numpad0 => "Numpad 0".to_string(),
+        KeyCode::Numpad1 => "Numpad 1".to_string(),
+        KeyCode::Numpad2 => "Numpad 2".to_string(),
+        KeyCode::Numpad3 => "Numpad 3".to_string(),
+        KeyCode::Numpad4 => "Numpad 4".to_string(),
+        KeyCode::Numpad5 => "Numpad 5".to_string(),
+        KeyCode::Numpad6 => "Numpad 6".to_string(),
+        KeyCode::Numpad7 => "Numpad 7".to_string(),
+        KeyCode::Numpad8 => "Numpad 8".to_string(),
+        KeyCode::Numpad9 => "Numpad 9".to_string(),
+        KeyCode::NumpadMultiply | KeyCode::NumpadStar => "Numpad *".to_string(),
+        KeyCode::NumpadHash => "Numpad #".to_string(),
+        _ => format!("{:?}", host_key),
     }
 }
 

@@ -451,6 +451,19 @@ impl App {
                         ui.separator();
                         ui.label(message);
                     }
+                    ui.separator();
+                    ui.heading("Key Mapping");
+                    egui::Grid::new("key_mapping_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for row in self.key_bindings.display_rows() {
+                                ui.monospace(row.midp_key.label());
+                                ui.label(row.host_keys.join(", "));
+                                ui.end_row();
+                            }
+                        });
                     ui.take_available_space();
                 });
 
