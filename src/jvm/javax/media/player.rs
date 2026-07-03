@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{LazyLock, Mutex},
 };
 
@@ -30,8 +29,7 @@ struct PlayerRuntime {
     content_type: String,
     locator: Option<String>,
     media_data: Vec<u8>,
-    media_file: Option<PathBuf>,
-    child: Option<Child>,
+    playback: Option<audio_backend::PlaybackHandle>,
     loop_count: i32,
     volume: i32,
     state: i32,
@@ -44,8 +42,8 @@ static PLAYERS: LazyLock<Mutex<HashMap<usize, PlayerRuntime>>> =
 pub fn pause_all() {
     let players = PLAYERS.lock().unwrap();
     for player in players.values() {
-        if let Some(child) = &player.child {
-            signal_child(child, ChildSignal::Stop);
+        if let Some(playback) = &player.playback {
+            playback.pause();
         }
     }
 }
@@ -53,8 +51,8 @@ pub fn pause_all() {
 pub fn resume_all() {
     let players = PLAYERS.lock().unwrap();
     for player in players.values() {
-        if let Some(child) = &player.child {
-            signal_child(child, ChildSignal::Continue);
+        if let Some(playback) = &player.playback {
+            playback.resume();
         }
     }
 }
@@ -65,13 +63,8 @@ pub fn stop_all() {
     drop(players);
 
     for mut player in players_to_stop.into_values() {
-        if let Some(mut child) = player.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        if let Some(path) = player.media_file {
-            let _ = fs::remove_file(path);
+        if let Some(playback) = player.playback.take() {
+            playback.stop();
         }
     }
 }
@@ -94,7 +87,7 @@ pub fn handle_manager_static_method(
             let note = get_int_arg(args, 0, "Manager.playTone note")?;
             let duration_ms = get_int_arg(args, 1, "Manager.playTone duration")?;
             let volume = get_int_arg(args, 2, "Manager.playTone volume")?;
-            spawn_tone(note, duration_ms, volume);
+            audio_backend::play_tone(note, duration_ms, volume);
             Ok(None)
         }
         _ => Err(format!(
@@ -119,7 +112,6 @@ pub fn handle_virtual_method(
             Ok(None)
         }
         ("prefetch", "()V") => {
-            let _ = ensure_player_media_file(player_id);
             set_state(player_id, STATE_PREFETCHED, jvm);
             Ok(None)
         }
@@ -239,6 +231,9 @@ pub fn handle_volume_control_method(
             let level = get_int_arg(args, 0, "VolumeControl.setLevel")?.clamp(0, 100);
             if let Some(player) = PLAYERS.lock().unwrap().get_mut(&player_id) {
                 player.volume = level;
+                if let Some(playback) = &player.playback {
+                    playback.set_volume(level);
+                }
             }
             Ok(Some(JvmStackValue::Int(level)))
         }
@@ -382,8 +377,7 @@ fn register_player(
             content_type,
             locator,
             media_data,
-            media_file: None,
-            child: None,
+            playback: None,
             loop_count: 1,
             volume: 100,
             state: STATE_UNREALIZED,
@@ -510,18 +504,21 @@ fn start_player(player_id: usize) -> i32 {
         return STATE_CLOSED;
     };
 
-    let Some(media_file) = ensure_media_file(player_id, player) else {
+    if player.media_data.is_empty() {
+        if let Some(locator) = &player.locator {
+            eprintln!("[Media] No media bytes available for {}", locator);
+        }
         player.state = STATE_PREFETCHED;
         return player.state;
-    };
+    }
 
-    player.child = spawn_decoder(
-        &media_file,
+    player.playback = audio_backend::start_player(
+        &player.media_data,
         &player.content_type,
         player.loop_count,
         player.volume,
     );
-    player.state = if player.child.is_some() {
+    player.state = if player.playback.is_some() {
         STATE_STARTED
     } else {
         STATE_PREFETCHED
@@ -535,19 +532,14 @@ fn stop_player(player_id: usize) {
         return;
     };
 
-    if let Some(mut child) = player.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Some(playback) = player.playback.take() {
+        playback.stop();
     }
 }
 
 fn close_player(player_id: usize) {
     stop_player(player_id);
-    if let Some(player) = PLAYERS.lock().unwrap().remove(&player_id) {
-        if let Some(path) = player.media_file {
-            let _ = fs::remove_file(path);
-        }
-    }
+    PLAYERS.lock().unwrap().remove(&player_id);
 }
 
 fn set_state(player_id: usize, state_value: i32, jvm: &JVM) {
@@ -575,7 +567,7 @@ fn current_player_state(player_id: usize, jvm: &JVM) -> i32 {
             return STATE_CLOSED;
         };
 
-        if reap_finished_child(player) {
+        if reap_finished_playback(player) {
             player.state = STATE_PREFETCHED;
             state_to_sync = Some(player.state);
             notify_end_of_media = true;
@@ -595,184 +587,17 @@ fn current_player_state(player_id: usize, jvm: &JVM) -> i32 {
     state_value
 }
 
-fn reap_finished_child(player: &mut PlayerRuntime) -> bool {
-    let Some(child) = player.child.as_mut() else {
+fn reap_finished_playback(player: &mut PlayerRuntime) -> bool {
+    let Some(playback) = player.playback.as_ref() else {
         return false;
     };
 
-    match child.try_wait() {
-        Ok(Some(_status)) => {
-            if let Some(mut child) = player.child.take() {
-                let _ = child.wait();
-            }
-            true
-        }
-        Ok(None) => false,
-        Err(err) => {
-            eprintln!("[Media] Failed to query decoder process: {}", err);
-            if let Some(mut child) = player.child.take() {
-                let _ = child.wait();
-            }
-            true
-        }
+    if playback.is_finished() {
+        player.playback.take();
+        true
+    } else {
+        false
     }
-}
-
-fn ensure_player_media_file(player_id: usize) -> Option<PathBuf> {
-    let mut players = PLAYERS.lock().unwrap();
-    let player = players.get_mut(&player_id)?;
-    ensure_media_file(player_id, player)
-}
-
-fn ensure_media_file(player_id: usize, player: &mut PlayerRuntime) -> Option<PathBuf> {
-    if player.media_data.is_empty() {
-        if let Some(locator) = &player.locator {
-            eprintln!("[Media] No media bytes available for {}", locator);
-        }
-        return None;
-    }
-
-    if let Some(path) = &player.media_file {
-        return Some(path.clone());
-    }
-
-    let extension = media_extension(
-        player.locator.as_deref(),
-        &player.content_type,
-        &player.media_data,
-    );
-    let mut path = env::temp_dir();
-    path.push(format!(
-        "j2me_emulator_audio_{}_{}.{}",
-        std::process::id(),
-        player_id,
-        extension
-    ));
-
-    if fs::write(&path, &player.media_data).is_err() {
-        eprintln!(
-            "[Media] Failed to write media temp file: {}",
-            path.display()
-        );
-        return None;
-    }
-
-    player.media_file = Some(path.clone());
-    Some(path)
-}
-
-fn spawn_decoder(
-    media_file: &Path,
-    content_type: &str,
-    loop_count: i32,
-    volume: i32,
-) -> Option<Child> {
-    let file = media_file.to_string_lossy().to_string();
-    let mut attempts = Vec::new();
-    let is_midi = is_midi_media(content_type, media_file);
-    let is_wav = is_wav_media(content_type, media_file);
-
-    if is_midi {
-        if let Some(soundfont) = find_soundfont() {
-            attempts.push((
-                vec!["fluidsynth", "/usr/bin/fluidsynth", "/usr/sbin/fluidsynth"],
-                vec!["-q".to_string(), "-i".to_string(), soundfont, file.clone()],
-            ));
-        }
-
-        attempts.push((
-            vec!["aplaymidi", "/usr/bin/aplaymidi", "/usr/sbin/aplaymidi"],
-            vec![file.clone()],
-        ));
-    }
-
-    let mut ffplay_args = vec![
-        "-nodisp".to_string(),
-        "-autoexit".to_string(),
-        "-loglevel".to_string(),
-        "quiet".to_string(),
-        "-volume".to_string(),
-        volume.clamp(0, 100).to_string(),
-    ];
-    if loop_count == -1 {
-        ffplay_args.push("-loop".to_string());
-        ffplay_args.push("0".to_string());
-    } else if loop_count > 1 {
-        ffplay_args.push("-loop".to_string());
-        ffplay_args.push(loop_count.to_string());
-    }
-    ffplay_args.push(file.clone());
-    attempts.push((
-        vec!["ffplay", "/usr/bin/ffplay", "/usr/sbin/ffplay"],
-        ffplay_args,
-    ));
-
-    if is_wav {
-        attempts.push((
-            vec!["paplay", "/usr/bin/paplay", "/usr/sbin/paplay"],
-            vec![file.clone()],
-        ));
-        attempts.push((
-            vec!["pw-play", "/usr/bin/pw-play", "/usr/sbin/pw-play"],
-            vec![file.clone()],
-        ));
-        attempts.push((
-            vec!["aplay", "/usr/bin/aplay", "/usr/sbin/aplay"],
-            vec!["-q".to_string(), file.clone()],
-        ));
-    }
-
-    for (commands, args) in attempts {
-        let Some(command) = find_command(&commands) else {
-            continue;
-        };
-
-        match Command::new(&command)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => return Some(child),
-            Err(err) => eprintln!("[Media] Failed to start {}: {}", command, err),
-        }
-    }
-
-    eprintln!(
-        "[Media] No usable decoder found for {} ({})",
-        media_file.display(),
-        content_type
-    );
-    None
-}
-
-fn spawn_tone(note: i32, duration_ms: i32, volume: i32) {
-    let Some(ffplay) = find_command(&["ffplay", "/usr/bin/ffplay", "/usr/sbin/ffplay"]) else {
-        return;
-    };
-
-    let frequency = 8.175_798_915_6_f64 * 2_f64.powf(note as f64 / 12.0);
-    let duration = (duration_ms.max(1) as f64 / 1000.0).max(0.001);
-    let volume = volume.clamp(0, 100) as f64 / 100.0;
-
-    let _ = Command::new(ffplay)
-        .args([
-            "-nodisp",
-            "-autoexit",
-            "-loglevel",
-            "quiet",
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("sine=frequency={:.3}:duration={:.3}", frequency, duration),
-            "-af",
-            &format!("volume={:.2}", volume),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 fn get_int_arg(args: &[JvmStackValue], index: usize, name: &str) -> Result<i32, String> {
@@ -880,94 +705,9 @@ fn infer_content_type(locator: Option<&str>, data: &[u8]) -> String {
     }
 }
 
-fn media_extension(locator: Option<&str>, content_type: &str, data: &[u8]) -> &'static str {
-    if data.starts_with(b"MThd") {
-        return "mid";
-    }
-    if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WAVE") {
-        return "wav";
-    }
-
-    if let Some(ext) = locator
-        .and_then(|path| Path::new(path).extension())
-        .and_then(|ext| ext.to_str())
-    {
-        if matches!(
-            ext.to_ascii_lowercase().as_str(),
-            "mid" | "midi" | "wav" | "mp3" | "amr" | "ogg"
-        ) {
-            return match ext.to_ascii_lowercase().as_str() {
-                "midi" => "mid",
-                "wav" => "wav",
-                "mp3" => "mp3",
-                "amr" => "amr",
-                "ogg" => "ogg",
-                _ => "mid",
-            };
-        }
-    }
-
-    let normalized = content_type.to_ascii_lowercase();
-    if normalized.contains("midi") || normalized.contains("mid") {
-        "mid"
-    } else if normalized.contains("wav") || normalized.contains("wave") {
-        "wav"
-    } else if normalized.contains("mpeg") || normalized.contains("mp3") {
-        "mp3"
-    } else if normalized.contains("amr") {
-        "amr"
-    } else if normalized.contains("ogg") {
-        "ogg"
-    } else {
-        "bin"
-    }
-}
-
-fn is_midi_media(content_type: &str, path: &Path) -> bool {
+fn is_midi_media(content_type: &str, data: &[u8]) -> bool {
     let content_type = content_type.to_ascii_lowercase();
-    content_type.contains("midi")
-        || content_type.contains("audio/mid")
-        || path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("mid") || ext.eq_ignore_ascii_case("midi"))
-            .unwrap_or(false)
-}
-
-fn is_wav_media(content_type: &str, path: &Path) -> bool {
-    let content_type = content_type.to_ascii_lowercase();
-    content_type.contains("wav")
-        || content_type.contains("wave")
-        || path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("wav"))
-            .unwrap_or(false)
-}
-
-fn find_command(candidates: &[&str]) -> Option<String> {
-    for candidate in candidates {
-        let path = Path::new(candidate);
-        if path.is_absolute() && path.exists() {
-            return Some((*candidate).to_string());
-        }
-    }
-
-    let path = env::var_os("PATH")?;
-    for dir in env::split_paths(&path) {
-        for candidate in candidates {
-            if candidate.contains('/') {
-                continue;
-            }
-
-            let full_path = dir.join(candidate);
-            if full_path.exists() {
-                return Some(full_path.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    None
+    data.starts_with(b"MThd") || content_type.contains("midi") || content_type.contains("audio/mid")
 }
 
 fn find_soundfont() -> Option<String> {
@@ -1033,31 +773,227 @@ fn existing_soundfont_file(path: PathBuf) -> Option<String> {
     }
 }
 
-enum ChildSignal {
-    Stop,
-    Continue,
-}
-
-#[cfg(unix)]
-fn signal_child(child: &Child, signal: ChildSignal) {
-    use std::os::raw::c_int;
-
-    const SIGSTOP: c_int = 19;
-    const SIGCONT: c_int = 18;
-
-    unsafe extern "C" {
-        fn kill(pid: c_int, sig: c_int) -> c_int;
-    }
-
-    let signal = match signal {
-        ChildSignal::Stop => SIGSTOP,
-        ChildSignal::Continue => SIGCONT,
+#[cfg(not(target_arch = "wasm32"))]
+mod audio_backend {
+    use std::{
+        fs,
+        io::Cursor,
+        sync::{Arc, LazyLock, Mutex},
+        time::Duration,
     };
 
-    unsafe {
-        let _ = kill(child.id() as c_int, signal);
+    use rodio::{
+        buffer::SamplesBuffer,
+        source::{SineWave, Source},
+        Decoder, DeviceSinkBuilder, MixerDeviceSink, Player,
+    };
+    use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, SynthesizerSettings};
+
+    use super::{find_soundfont, is_midi_media, BUNDLED_SOUNDFONT_DIR, SOUNDFONT_ENV_VAR};
+
+    const SAMPLE_RATE: i32 = 44_100;
+
+    static AUDIO_OUTPUT: LazyLock<Mutex<Option<MixerDeviceSink>>> =
+        LazyLock::new(|| Mutex::new(None));
+    static SOUND_FONT: LazyLock<Mutex<Option<Arc<SoundFont>>>> = LazyLock::new(|| Mutex::new(None));
+
+    pub struct PlaybackHandle {
+        player: Player,
+    }
+
+    impl PlaybackHandle {
+        pub fn pause(&self) {
+            self.player.pause();
+        }
+
+        pub fn resume(&self) {
+            self.player.play();
+        }
+
+        pub fn stop(self) {
+            self.player.stop();
+        }
+
+        pub fn is_finished(&self) -> bool {
+            self.player.empty()
+        }
+
+        pub fn set_volume(&self, volume: i32) {
+            self.player.set_volume(volume_to_gain(volume));
+        }
+    }
+
+    pub fn start_player(
+        data: &[u8],
+        content_type: &str,
+        loop_count: i32,
+        volume: i32,
+    ) -> Option<PlaybackHandle> {
+        let player = match open_player(volume) {
+            Ok(player) => player,
+            Err(err) => {
+                eprintln!("[Media] Failed to open audio output: {}", err);
+                return None;
+            }
+        };
+
+        if is_midi_media(content_type, data) {
+            let source = match synthesize_midi(data) {
+                Ok(source) => source,
+                Err(err) => {
+                    eprintln!("[Media] Failed to synthesize MIDI: {}", err);
+                    return None;
+                }
+            };
+            append_looping_source(&player, source, loop_count);
+        } else {
+            let repeats = finite_loop_count(loop_count);
+            if loop_count == -1 {
+                let source = decode_audio(data)?;
+                player.append(source.repeat_infinite());
+            } else {
+                for _ in 0..repeats {
+                    player.append(decode_audio(data)?);
+                }
+            }
+        }
+
+        Some(PlaybackHandle { player })
+    }
+
+    pub fn play_tone(note: i32, duration_ms: i32, volume: i32) {
+        let Ok(player) = open_player(volume) else {
+            return;
+        };
+
+        let frequency = 8.175_798_915_6_f32 * 2_f32.powf(note as f32 / 12.0);
+        let duration = Duration::from_millis(duration_ms.max(1) as u64);
+        player.append(SineWave::new(frequency).take_duration(duration));
+        player.detach();
+    }
+
+    fn open_player(volume: i32) -> Result<Player, String> {
+        let mut output = AUDIO_OUTPUT.lock().unwrap();
+        if output.is_none() {
+            *output = Some(
+                DeviceSinkBuilder::open_default_sink()
+                    .map_err(|err| format!("open default sink failed: {}", err))?,
+            );
+        }
+
+        let output = output
+            .as_ref()
+            .ok_or_else(|| "audio output was not initialized".to_string())?;
+        let player = Player::connect_new(&output.mixer());
+        player.set_volume(volume_to_gain(volume));
+        Ok(player)
+    }
+
+    fn decode_audio(data: &[u8]) -> Option<Decoder<Cursor<Vec<u8>>>> {
+        match Decoder::try_from(Cursor::new(data.to_vec())) {
+            Ok(decoder) => Some(decoder),
+            Err(err) => {
+                eprintln!("[Media] Failed to decode audio data: {}", err);
+                None
+            }
+        }
+    }
+
+    fn synthesize_midi(data: &[u8]) -> Result<SamplesBuffer, String> {
+        let sound_font = load_sound_font()?;
+        let mut midi_data = Cursor::new(data.to_vec());
+        let midi_file = Arc::new(
+            MidiFile::new(&mut midi_data).map_err(|err| format!("invalid MIDI file: {}", err))?,
+        );
+        let settings = SynthesizerSettings::new(SAMPLE_RATE);
+        let synthesizer = Synthesizer::new(&sound_font, &settings)
+            .map_err(|err| format!("synthesizer init failed: {}", err))?;
+        let mut sequencer = MidiFileSequencer::new(synthesizer);
+        sequencer.play(&midi_file, false);
+
+        let sample_count = ((SAMPLE_RATE as f64 * midi_file.get_length()).ceil() as usize)
+            .max((SAMPLE_RATE / 10) as usize);
+        let mut left = vec![0.0f32; sample_count];
+        let mut right = vec![0.0f32; sample_count];
+        sequencer.render(&mut left, &mut right);
+
+        let mut interleaved = Vec::with_capacity(sample_count * 2);
+        for (left, right) in left.into_iter().zip(right) {
+            interleaved.push(left);
+            interleaved.push(right);
+        }
+
+        Ok(SamplesBuffer::new(
+            rodio::nz!(2),
+            rodio::nz!(44_100),
+            interleaved,
+        ))
+    }
+
+    fn load_sound_font() -> Result<Arc<SoundFont>, String> {
+        let mut cached = SOUND_FONT.lock().unwrap();
+        if let Some(sound_font) = cached.as_ref() {
+            return Ok(sound_font.clone());
+        }
+
+        let path = find_soundfont().ok_or_else(|| {
+            format!(
+                "MIDI playback needs a SoundFont in {} or {}",
+                BUNDLED_SOUNDFONT_DIR, SOUNDFONT_ENV_VAR
+            )
+        })?;
+        let bytes =
+            fs::read(&path).map_err(|err| format!("failed to read SoundFont {}: {}", path, err))?;
+        let mut cursor = Cursor::new(bytes);
+        let sound_font = Arc::new(
+            SoundFont::new(&mut cursor).map_err(|err| format!("invalid SoundFont: {}", err))?,
+        );
+        *cached = Some(sound_font.clone());
+        Ok(sound_font)
+    }
+
+    fn append_looping_source(player: &Player, source: SamplesBuffer, loop_count: i32) {
+        if loop_count == -1 {
+            player.append(source.repeat_infinite());
+        } else {
+            for _ in 0..finite_loop_count(loop_count) {
+                player.append(source.clone());
+            }
+        }
+    }
+
+    fn finite_loop_count(loop_count: i32) -> i32 {
+        loop_count.max(1)
+    }
+
+    fn volume_to_gain(volume: i32) -> f32 {
+        volume.clamp(0, 100) as f32 / 100.0
     }
 }
 
-#[cfg(not(unix))]
-fn signal_child(_child: &Child, _signal: ChildSignal) {}
+#[cfg(target_arch = "wasm32")]
+mod audio_backend {
+    pub struct PlaybackHandle;
+
+    impl PlaybackHandle {
+        pub fn pause(&self) {}
+        pub fn resume(&self) {}
+        pub fn stop(self) {}
+        pub fn is_finished(&self) -> bool {
+            true
+        }
+        pub fn set_volume(&self, _volume: i32) {}
+    }
+
+    pub fn start_player(
+        _data: &[u8],
+        _content_type: &str,
+        _loop_count: i32,
+        _volume: i32,
+    ) -> Option<PlaybackHandle> {
+        eprintln!("[Media] Web audio backend is not wired yet");
+        None
+    }
+
+    pub fn play_tone(_note: i32, _duration_ms: i32, _volume: i32) {}
+}
