@@ -7233,6 +7233,8 @@ impl JVM {
             return Ok(());
         }
 
+        player::poll_finished(self);
+
         // Active-rendered GameCanvas screens present completed frames via flushGraphics().
         // Auto-blitting here can expose the off-screen buffer while the game is still drawing it.
         if self.current_displayable_extends(game_canvas::CLASS_NAME)? {

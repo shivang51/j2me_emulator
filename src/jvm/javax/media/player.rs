@@ -69,6 +69,28 @@ pub fn stop_all() {
     }
 }
 
+pub fn poll_finished(jvm: &JVM) {
+    let finished_players = {
+        let mut players = PLAYERS.lock().unwrap();
+        players
+            .iter_mut()
+            .filter_map(|(player_id, player)| {
+                if reap_finished_playback(player) {
+                    player.state = STATE_PREFETCHED;
+                    Some(*player_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for player_id in finished_players {
+        set_heap_state(player_id, STATE_PREFETCHED, jvm);
+        notify_player_listeners(jvm, player_id, "endOfMedia");
+    }
+}
+
 pub fn handle_manager_static_method(
     method_name: &str,
     descriptor: &str,
