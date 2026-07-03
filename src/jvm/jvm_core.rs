@@ -140,6 +140,90 @@ impl ObjectMonitor {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn static_object_ref(state: &JvmState, field_name: &str) -> u32 {
+        match state.static_fields.get(field_name) {
+            Some(JvmStackValue::ObjectRef(id)) => *id,
+            value => panic!("expected object ref for {}, found {:?}", field_name, value),
+        }
+    }
+
+    #[test]
+    fn system_print_streams_are_real_heap_objects() {
+        let jvm = JVM::new();
+        let state = jvm.state.lock();
+
+        let stdout_ref = static_object_ref(&state, "java/lang/System.out:Ljava/io/PrintStream;");
+        let stderr_ref = static_object_ref(&state, "java/lang/System.err:Ljava/io/PrintStream;");
+
+        assert_ne!(stdout_ref, 999);
+        assert_ne!(stderr_ref, 999);
+
+        for stream_ref in [stdout_ref, stderr_ref] {
+            match state.heap.get(stream_ref as usize) {
+                Some(HeapObject::Instance(obj)) => {
+                    assert_eq!(obj.class_name, "java/io/PrintStream");
+                }
+                value => panic!("expected PrintStream heap instance, found {:?}", value),
+            }
+        }
+    }
+
+    #[test]
+    fn class_get_resource_as_stream_returns_stream_or_null() {
+        let jvm = JVM::new();
+        {
+            let mut state = jvm.state.lock();
+            state
+                .resources
+                .insert("pkg/data.bin".to_string(), vec![1, 2, 3]);
+        }
+
+        let class_ref = JVM::allocate_class_object(&jvm, "pkg/Foo".to_string());
+        let found = JVM::handle_class_fns(
+            &class_ref,
+            "getResourceAsStream",
+            "(Ljava/lang/String;)Ljava/io/InputStream;",
+            &[JvmStackValue::String("data.bin".to_string())],
+            &jvm,
+        )
+        .expect("getResourceAsStream should not fail");
+
+        let stream_ref = match found {
+            Some(JvmStackValue::ObjectRef(id)) => id,
+            value => panic!("expected stream object ref, found {:?}", value),
+        };
+
+        {
+            let state = jvm.state.lock();
+            match state.heap.get(stream_ref as usize) {
+                Some(HeapObject::Instance(obj)) => {
+                    assert_eq!(obj.class_name, "java/io/ByteArrayInputStream");
+                    assert_eq!(
+                        obj.fields.get("jvm_res"),
+                        Some(&JvmStackValue::String("pkg/data.bin".to_string()))
+                    );
+                }
+                value => panic!("expected ByteArrayInputStream instance, found {:?}", value),
+            }
+        }
+
+        let missing = JVM::handle_class_fns(
+            &class_ref,
+            "getResourceAsStream",
+            "(Ljava/lang/String;)Ljava/io/InputStream;",
+            &[JvmStackValue::String("missing.bin".to_string())],
+            &jvm,
+        )
+        .expect("missing resource should return null, not fail");
+
+        assert_eq!(missing, Some(JvmStackValue::Null));
+    }
+}
+
 #[derive(Debug)]
 struct PauseControl {
     state: StdMutex<PauseState>,
@@ -548,29 +632,39 @@ impl JVM {
             method_resolution_cache: HashMap::new(),
         };
 
-        state.static_fields.insert(
-            "java/lang/System.out:Ljava/io/PrintStream;".to_string(),
-            JvmStackValue::ObjectRef(999),
-        );
-        state.static_fields.insert(
-            "java/lang/System.err:Ljava/io/PrintStream;".to_string(),
-            JvmStackValue::ObjectRef(999),
-        );
-        state.static_fields.insert(
-            "java/lang/System.in:Ljava/io/InputStream;".to_string(),
-            JvmStackValue::Null,
-        );
-
-        // creating java/lang/runtime instance
-
         let runtime_instance = JvmObject {
             class_name: "java/lang/Runtime".to_string(),
             fields: HashMap::new(),
         };
         state.heap.push(HeapObject::Instance(runtime_instance));
+        let runtime_ref = (state.heap.len() - 1) as u32;
+
+        let stdout_ref = JVM::allocate_internal(
+            &mut state,
+            "java/io/PrintStream".to_string(),
+            HashMap::new(),
+        );
+        let stderr_ref = JVM::allocate_internal(
+            &mut state,
+            "java/io/PrintStream".to_string(),
+            HashMap::new(),
+        );
+
+        state.static_fields.insert(
+            "java/lang/System.out:Ljava/io/PrintStream;".to_string(),
+            JvmStackValue::ObjectRef(stdout_ref),
+        );
+        state.static_fields.insert(
+            "java/lang/System.err:Ljava/io/PrintStream;".to_string(),
+            JvmStackValue::ObjectRef(stderr_ref),
+        );
+        state.static_fields.insert(
+            "java/lang/System.in:Ljava/io/InputStream;".to_string(),
+            JvmStackValue::Null,
+        );
         state.static_fields.insert(
             "java/lang/Runtime.getRuntime:()Ljava/lang/Runtime;".to_string(),
-            JvmStackValue::ObjectRef(0),
+            JvmStackValue::ObjectRef(runtime_ref),
         );
 
         JVM {
@@ -2459,38 +2553,6 @@ impl JVM {
                                 &mut stack,
                             )?;
                             continue;
-                        }
-                    } else if let JvmStackValue::ObjectRef(999) = objectref {
-                        let return_value = match JVM::handle_native_printstream(
-                            &objectref,
-                            &method_name,
-                            &descriptor,
-                            &args,
-                            jvm,
-                        ) {
-                            Ok(return_value) => return_value,
-                            Err(e) => {
-                                let error = JVM::append_invoke_context(
-                                    e,
-                                    "invokevirtual",
-                                    "java/io/PrintStream",
-                                    &method_name,
-                                    &descriptor,
-                                    pc,
-                                );
-                                pc = JVM::handle_exception_in_current_frame(
-                                    error,
-                                    pc,
-                                    exception_table,
-                                    cp,
-                                    jvm,
-                                    &mut stack,
-                                )?;
-                                continue;
-                            }
-                        };
-                        if let Some(val) = return_value {
-                            stack.push(val);
                         }
                     } else if class_name == "java/lang/StringBuffer"
                         || class_name == "java/lang/StringBuilder"
@@ -4606,6 +4668,18 @@ impl JVM {
         }
     }
 
+    fn is_final_object_native_method(method: &str, descriptor: &str) -> bool {
+        matches!(
+            (method, descriptor),
+            ("getClass", "()Ljava/lang/Class;")
+                | ("wait", "()V")
+                | ("wait", "(J)V")
+                | ("wait", "(JI)V")
+                | ("notify", "()V")
+                | ("notifyAll", "()V")
+        )
+    }
+
     fn substring_by_char_range(value: &str, start: i32, end: i32) -> Result<String, String> {
         if start < 0 || end < start {
             return Err(format!(
@@ -4787,6 +4861,18 @@ impl JVM {
             descriptor,
             args
         );
+
+        if JVM::is_final_object_native_method(method_name, descriptor) {
+            let return_value =
+                JVM::handle_object_fns(&objectref, method_name, descriptor, args, jvm)?;
+
+            if let Some(val) = return_value {
+                caller_stack.push(val);
+            }
+
+            return Ok(());
+        }
+
         if class_name.starts_with("javax/microedition") {
             if class_name == image::CLASS_NAME {
                 let return_value =
@@ -5157,7 +5243,7 @@ impl JVM {
 
             return Ok(());
         } else if class_name == "java/lang/Class" {
-            let res = JVM::handle_class_fns(method_name, descriptor, args, jvm);
+            let res = JVM::handle_class_fns(&objectref, method_name, descriptor, args, jvm);
             if let Err(e) = res {
                 return Err(format!("Error handling Class method: {}", e).into());
             }
@@ -8233,33 +8319,28 @@ impl JVM {
     }
 
     fn handle_class_fns(
+        objectref: &JvmStackValue,
         method_name: &str,
         descriptor: &str,
-        _args: &[JvmStackValue],
+        args: &[JvmStackValue],
         jvm: &JVM,
     ) -> Result<Option<JvmStackValue>, String> {
         match (method_name, descriptor) {
             ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;") => {
-                let name = match _args.get(0) {
+                let name = match args.get(0) {
                     Some(JvmStackValue::String(s)) => s,
                     _ => return Err("Class.getResourceAsStream: expected String argument".into()),
                 };
 
-                let resource_path = if name.starts_with('/') {
-                    name[1..].to_string()
-                } else {
-                    name.clone()
-                };
-
                 let mut state = jvm.state.lock();
-                let _data = if let Some(_data) = state.resources.get(&resource_path) {
-                } else {
-                    // Resource not found, return null
-                    return Err(format!("Resource not found {}", resource_path).into());
-                };
+                let resource_path =
+                    JVM::resolve_class_resource_path(&state, objectref, name.as_str())?;
+
+                if !state.resources.contains_key(&resource_path) {
+                    return Ok(Some(JvmStackValue::Null));
+                }
 
                 let mut fields = HashMap::new();
-
                 fields.insert(
                     "jvm_res".to_string(),
                     JvmStackValue::String(resource_path.clone()),
@@ -8275,11 +8356,76 @@ impl JVM {
 
                 Ok(Some(JvmStackValue::ObjectRef(stream_ref)))
             }
+            ("getName", "()Ljava/lang/String;") => {
+                let state = jvm.state.lock();
+                let class_name = JVM::class_name_from_class_object(&state, objectref)?;
+                Ok(Some(JvmStackValue::String(class_name.replace('/', "."))))
+            }
+            ("toString", "()Ljava/lang/String;") => {
+                let state = jvm.state.lock();
+                let class_name = JVM::class_name_from_class_object(&state, objectref)?;
+                Ok(Some(JvmStackValue::String(format!(
+                    "class {}",
+                    class_name.replace('/', ".")
+                ))))
+            }
             _ => Err(format!(
                 "Unsupported Class method: {}{}",
                 method_name, descriptor
             )),
         }
+    }
+
+    fn class_name_from_class_object(
+        state: &JvmState,
+        objectref: &JvmStackValue,
+    ) -> Result<String, String> {
+        let class_ref = match objectref {
+            JvmStackValue::ObjectRef(id) => *id as usize,
+            JvmStackValue::Null => return Err("Class method: NullPointerException".into()),
+            value => {
+                return Err(format!(
+                    "Class method: expected Class object reference, found {:?}",
+                    value
+                ));
+            }
+        };
+
+        match state.heap.get(class_ref) {
+            Some(HeapObject::Instance(obj)) if obj.class_name == "java/lang/Class" => {
+                match obj.fields.get("name") {
+                    Some(JvmStackValue::String(name)) => Ok(name.clone()),
+                    Some(value) => Err(format!("Class object has invalid name field: {:?}", value)),
+                    None => Err("Class object missing name field".into()),
+                }
+            }
+            Some(HeapObject::Instance(obj)) => Err(format!(
+                "Class method called on non-Class instance {}",
+                obj.class_name
+            )),
+            Some(_) => Err("Class method called on non-instance object".into()),
+            None => Err(format!("Invalid Class object reference {}", class_ref)),
+        }
+    }
+
+    fn resolve_class_resource_path(
+        state: &JvmState,
+        objectref: &JvmStackValue,
+        name: &str,
+    ) -> Result<String, String> {
+        if name.starts_with('/') {
+            return Ok(name.trim_start_matches('/').to_string());
+        }
+
+        let class_name = JVM::class_name_from_class_object(state, objectref)?;
+        if let Some((package, _)) = class_name.rsplit_once('/') {
+            let package_relative = format!("{}/{}", package, name);
+            if state.resources.contains_key(&package_relative) {
+                return Ok(package_relative);
+            }
+        }
+
+        Ok(name.to_string())
     }
 
     fn allocate_byte_array(jvm: &JVM, bytes: &[u8]) -> JvmStackValue {

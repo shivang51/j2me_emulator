@@ -1,4 +1,5 @@
 mod app;
+mod input;
 mod jvm;
 mod profile;
 mod services;

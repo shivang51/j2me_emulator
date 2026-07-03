@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use egui_winit::{egui, winit};
 use parking_lot::Mutex;
 use pixels::{wgpu, Pixels, SurfaceTexture};
 
+use crate::input::{KeyBindings, MidpKey, INPUT_STATE};
 use crate::jvm::javax::lcdui::game::game_canvas;
 use crate::jvm::javax::lcdui::image as lcdui_image;
 use crate::jvm::JVM;
@@ -24,32 +26,6 @@ pub struct DrawState {
     pub width: u32,
     pub height: u32,
 }
-
-pub struct InputState {
-    pub space_pressed: bool,
-    pub up_pressed: bool,
-    pub down_pressed: bool,
-    pub left_pressed: bool,
-    pub right_pressed: bool,
-    pub a_pressed: bool,
-    pub b_pressed: bool,
-    pub c_pressed: bool,
-    pub d_pressed: bool,
-}
-
-pub static INPUT_STATE: LazyLock<Mutex<InputState>> = LazyLock::new(|| {
-    Mutex::new(InputState {
-        space_pressed: false,
-        up_pressed: false,
-        down_pressed: false,
-        left_pressed: false,
-        right_pressed: false,
-        a_pressed: false,
-        b_pressed: false,
-        c_pressed: false,
-        d_pressed: false,
-    })
-});
 
 pub static DRAW_STATE: LazyLock<Mutex<DrawState>> = LazyLock::new(|| {
     Mutex::new(DrawState {
@@ -70,6 +46,8 @@ pub struct App {
     jar_path_input: String,
     open_jar_dialog: bool,
     status_message: Option<String>,
+    active_physical_keys: HashMap<KeyCode, MidpKey>,
+    pub key_bindings: KeyBindings,
 }
 
 enum UiAction {
@@ -123,24 +101,21 @@ impl App {
     }
 
     fn reset_input_state() {
-        let mut input = INPUT_STATE.lock();
-        input.space_pressed = false;
-        input.up_pressed = false;
-        input.down_pressed = false;
-        input.left_pressed = false;
-        input.right_pressed = false;
-        input.a_pressed = false;
-        input.b_pressed = false;
-        input.c_pressed = false;
-        input.d_pressed = false;
+        INPUT_STATE.lock().clear();
     }
 
-    fn dispatch_key_event(&self, keycode: i32, is_pressed: bool) {
+    fn dispatch_key_event(&self, key: MidpKey, is_pressed: bool) {
         if let Some(jvm) = &self.jvm {
+            let keycode = key.keycode().raw();
             if let Err(err) = jvm.handle_key_event(keycode, is_pressed) {
                 eprintln!("[App] key event {} failed: {}", keycode, err);
             }
         }
+    }
+
+    fn dispatch_midp_key_event(&self, key: MidpKey, is_pressed: bool) {
+        INPUT_STATE.lock().set_pressed(key, is_pressed);
+        self.dispatch_key_event(key, is_pressed);
     }
 
     fn resize_draw_buffer(width: i32, height: i32) {
@@ -193,6 +168,7 @@ impl App {
         }
         self.game_texture = None;
         Self::reset_input_state();
+        self.active_physical_keys.clear();
         self.update_window_title();
         Ok(())
     }
@@ -696,6 +672,10 @@ impl ApplicationHandler for App {
                     window.request_redraw();
                 }
             }
+            WindowEvent::Focused(false) => {
+                Self::reset_input_state();
+                self.active_physical_keys.clear();
+            }
             WindowEvent::DroppedFile(path) => {
                 if path
                     .extension()
@@ -718,91 +698,22 @@ impl ApplicationHandler for App {
 
                 let is_pressed = event.state == winit::event::ElementState::Pressed;
 
-                match keycode {
-                    KeyCode::Space => {
-                        INPUT_STATE.lock().space_pressed = is_pressed;
-                        self.dispatch_key_event(-5, is_pressed);
+                if keycode == KeyCode::KeyP && is_pressed && !event.repeat {
+                    self.toggle_emulation_pause();
+                    return;
+                }
+
+                if is_pressed {
+                    if let Some(midp_key) = self.key_bindings.key_for_event(&event, keycode) {
+                        self.active_physical_keys.insert(keycode, midp_key);
+                        self.dispatch_midp_key_event(midp_key, true);
                     }
-                    KeyCode::Enter | KeyCode::NumpadEnter => {
-                        self.dispatch_key_event(-5, is_pressed);
-                    }
-                    KeyCode::ArrowUp => {
-                        INPUT_STATE.lock().up_pressed = is_pressed;
-                        self.dispatch_key_event(-1, is_pressed);
-                    }
-                    KeyCode::ArrowDown => {
-                        INPUT_STATE.lock().down_pressed = is_pressed;
-                        self.dispatch_key_event(-2, is_pressed);
-                    }
-                    KeyCode::ArrowLeft => {
-                        INPUT_STATE.lock().left_pressed = is_pressed;
-                        self.dispatch_key_event(-3, is_pressed);
-                    }
-                    KeyCode::ArrowRight => {
-                        INPUT_STATE.lock().right_pressed = is_pressed;
-                        self.dispatch_key_event(-4, is_pressed);
-                    }
-                    KeyCode::KeyA => {
-                        INPUT_STATE.lock().a_pressed = is_pressed;
-                        self.dispatch_key_event(49, is_pressed);
-                    }
-                    KeyCode::KeyS => {
-                        INPUT_STATE.lock().b_pressed = is_pressed;
-                        self.dispatch_key_event(51, is_pressed);
-                    }
-                    KeyCode::KeyD => {
-                        INPUT_STATE.lock().c_pressed = is_pressed;
-                        self.dispatch_key_event(55, is_pressed);
-                    }
-                    KeyCode::KeyF => {
-                        INPUT_STATE.lock().d_pressed = is_pressed;
-                        self.dispatch_key_event(57, is_pressed);
-                    }
-                    KeyCode::Digit0 | KeyCode::Numpad0 => {
-                        self.dispatch_key_event(48, is_pressed);
-                    }
-                    KeyCode::Digit1 | KeyCode::Numpad1 => {
-                        self.dispatch_key_event(49, is_pressed);
-                    }
-                    KeyCode::Digit2 | KeyCode::Numpad2 => {
-                        self.dispatch_key_event(50, is_pressed);
-                    }
-                    KeyCode::Digit3 | KeyCode::Numpad3 => {
-                        self.dispatch_key_event(51, is_pressed);
-                    }
-                    KeyCode::Digit4 | KeyCode::Numpad4 => {
-                        self.dispatch_key_event(52, is_pressed);
-                    }
-                    KeyCode::Digit5 | KeyCode::Numpad5 => {
-                        self.dispatch_key_event(53, is_pressed);
-                    }
-                    KeyCode::Digit6 | KeyCode::Numpad6 => {
-                        self.dispatch_key_event(54, is_pressed);
-                    }
-                    KeyCode::Digit7 | KeyCode::Numpad7 => {
-                        self.dispatch_key_event(55, is_pressed);
-                    }
-                    KeyCode::Digit8 | KeyCode::Numpad8 => {
-                        self.dispatch_key_event(56, is_pressed);
-                    }
-                    KeyCode::Digit9 | KeyCode::Numpad9 => {
-                        self.dispatch_key_event(57, is_pressed);
-                    }
-                    KeyCode::KeyQ => {
-                        self.dispatch_key_event(-6, is_pressed);
-                    }
-                    KeyCode::KeyE => {
-                        self.dispatch_key_event(-7, is_pressed);
-                    }
-                    KeyCode::Escape | KeyCode::Backspace => {
-                        self.dispatch_key_event(-8, is_pressed);
-                    }
-                    KeyCode::KeyP => {
-                        if is_pressed && !event.repeat {
-                            self.toggle_emulation_pause();
-                        }
-                    }
-                    _ => {}
+                } else if let Some(midp_key) = self
+                    .active_physical_keys
+                    .remove(&keycode)
+                    .or_else(|| self.key_bindings.key_for_event(&event, keycode))
+                {
+                    self.dispatch_midp_key_event(midp_key, false);
                 }
             }
             _ => {}

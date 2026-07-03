@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    app::INPUT_STATE,
+    input::{game_action_for_keycode, MidpKeyCode, INPUT_STATE},
     jvm::{
         javax::lcdui::{display, graphics, image},
         jvm_core::{HeapObject, JvmStackValue, JVM},
@@ -24,26 +24,6 @@ const BUFFER_IMAGE_FIELD: &str =
     "javax/microedition/lcdui/game/GameCanvas.bufferImage:Ljavax/microedition/lcdui/Image;";
 const BUFFER_GRAPHICS_FIELD: &str =
     "javax/microedition/lcdui/game/GameCanvas.bufferGraphics:Ljavax/microedition/lcdui/Graphics;";
-
-pub static DOWN_PRESSED: i32 = 64;
-pub static FIRE_PRESSED: i32 = 256;
-pub static GAME_A_PRESSED: i32 = 512;
-pub static GAME_B_PRESSED: i32 = 1024;
-pub static GAME_C_PRESSED: i32 = 2048;
-pub static GAME_D_PRESSED: i32 = 4096;
-pub static LEFT_PRESSED: i32 = 4;
-pub static RIGHT_PRESSED: i32 = 32;
-pub static UP_PRESSED: i32 = 2;
-
-const ACTION_UP: i32 = 1;
-const ACTION_LEFT: i32 = 2;
-const ACTION_RIGHT: i32 = 5;
-const ACTION_DOWN: i32 = 6;
-const ACTION_FIRE: i32 = 8;
-const ACTION_GAME_A: i32 = 9;
-const ACTION_GAME_B: i32 = 10;
-const ACTION_GAME_C: i32 = 11;
-const ACTION_GAME_D: i32 = 12;
 
 pub fn canvas_size() -> (i32, i32) {
     (
@@ -459,52 +439,13 @@ pub fn handle_virtual_method(
                 return Err("Canvas.getGameAction: expected int keycode".into());
             };
 
-            let action = match *keycode {
-                -1 | 50 => ACTION_UP,
-                -2 | 56 => ACTION_DOWN,
-                -3 | 52 => ACTION_LEFT,
-                -4 | 54 => ACTION_RIGHT,
-                -5 | 53 => ACTION_FIRE,
-                49 => ACTION_GAME_A,
-                51 => ACTION_GAME_B,
-                55 => ACTION_GAME_C,
-                57 => ACTION_GAME_D,
-                _ => 0,
-            };
-
-            Ok(Some(JvmStackValue::Int(action)))
+            Ok(Some(JvmStackValue::Int(game_action_for_keycode(
+                MidpKeyCode::from_raw(*keycode),
+            ))))
         }
         ("getKeyStates", "()I") => {
-            let mut state = 0;
             let input_state = INPUT_STATE.lock();
-            if input_state.space_pressed {
-                state |= FIRE_PRESSED;
-            }
-            if input_state.up_pressed {
-                state |= UP_PRESSED;
-            }
-            if input_state.down_pressed {
-                state |= DOWN_PRESSED;
-            }
-            if input_state.left_pressed {
-                state |= LEFT_PRESSED;
-            }
-            if input_state.right_pressed {
-                state |= RIGHT_PRESSED;
-            }
-            if input_state.a_pressed {
-                state |= GAME_A_PRESSED;
-            }
-            if input_state.b_pressed {
-                state |= GAME_B_PRESSED;
-            }
-            if input_state.c_pressed {
-                state |= GAME_C_PRESSED;
-            }
-            if input_state.d_pressed {
-                state |= GAME_D_PRESSED;
-            }
-            return Ok(Some(JvmStackValue::Int(state)));
+            Ok(Some(JvmStackValue::Int(input_state.key_state_mask())))
         }
         ("hasPointerEvents", "()Z") => Ok(Some(JvmStackValue::Int(1))),
         ("hasPointerMotionEvents", "()Z") => Ok(Some(JvmStackValue::Int(1))),
