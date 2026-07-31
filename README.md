@@ -11,6 +11,7 @@ A simple emulator intended to run J2ME games on desktop.
 
 ### Screenshots
 ![Screenshot 1](screenshots/ss1.png)
+![Screenshot 2](screenshots/ss2.png)
 
 
 ### Build and Run
